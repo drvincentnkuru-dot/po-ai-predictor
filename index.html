@@ -1,126 +1,123 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b1020">
-  <title>PO AI Predictor</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PO AI Predictor V2</title>
   <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
-  <main class="app">
 
-    <header class="top">
-      <div>
-        <span class="eyebrow">PO-AI-PREDICTOR</span>
-        <h1>Pocket Option AI Predictor</h1>
-        <p>Statistical market assistant — not a guaranteed signal.</p>
-      </div>
+  <div class="app">
+
+    <header>
+      <h1>PO AI Predictor</h1>
+      <p>Market analysis & signal tracker</p>
     </header>
 
     <section class="card">
-      <div class="row">
-        <label for="pair">Currency Pair</label>
 
-        <select id="pair">
-          <option>EUR/USD</option>
-          <option>GBP/USD</option>
-          <option>USD/JPY</option>
-          <option>EUR/JPY</option>
-          <option>AUD/USD</option>
-          <option>BTC/USD</option>
-        </select>
-      </div>
+      <label>Market Type</label>
+      <select id="marketType">
+        <option value="live">LIVE MARKET</option>
+        <option value="otc">OTC MARKET</option>
+      </select>
 
-      <div class="row">
-        <label for="expiry">Expiry</label>
+      <label>Currency Pair</label>
+      <select id="pair"></select>
 
-        <select id="expiry">
-          <option value="1">1 Minute</option>
-          <option value="3">3 Minutes</option>
-          <option value="5">5 Minutes</option>
-        </select>
-      </div>
+      <label>Expire Time</label>
+      <select id="expiry">
+        <option value="1">1 Minute</option>
+        <option value="2">2 Minutes</option>
+        <option value="3">3 Minutes</option>
+        <option value="5">5 Minutes</option>
+      </select>
 
-      <h3>Recent Candle Results</h3>
+      <button id="analyzeBtn">ANALYZE MARKET</button>
 
-      <p class="hint">
-        Tap a box for UP. Long-press/right-click for DOWN.
-        Enter at least 10 recent candles.
-      </p>
-
-      <div id="sequence" class="sequence"></div>
-
-      <div class="actions">
-        <button id="clear" class="secondary">CLEAR</button>
-        <button id="predict" class="primary">ANALYZE</button>
-      </div>
     </section>
 
-    <section id="result" class="card result hidden">
+    <section class="signal-card">
 
-      <div class="result-head">
-        <span>AI Analysis</span>
-        <span id="confidence" class="badge">—</span>
+      <h2>AI SIGNAL</h2>
+
+      <div id="signal" class="signal neutral">
+        WAITING
       </div>
 
-      <div id="direction" class="direction">
-        WAIT
-      </div>
-
-      <p id="reason" class="reason">
-        Add recent candle data and tap ANALYZE.
-      </p>
-
-      <div class="stats">
-
+      <div class="info">
         <div>
-          <b id="upPct">—</b>
-          <span>UP rate</span>
+          <span>Confidence</span>
+          <strong id="confidence">--%</strong>
         </div>
 
         <div>
-          <b id="downPct">—</b>
-          <span>DOWN rate</span>
+          <span>Entry Time</span>
+          <strong id="entryTime">--:--:--</strong>
         </div>
 
         <div>
-          <b id="sample">0</b>
-          <span>Sample</span>
+          <span>Expiry</span>
+          <strong id="expiryTime">--:--:--</strong>
         </div>
-
       </div>
+
+      <div class="countdown">
+        <span>Countdown</span>
+        <strong id="countdown">--</strong>
+      </div>
+
     </section>
 
     <section class="card">
 
-      <h3>About the Predictor</h3>
+      <h2>Market Data</h2>
 
-      <p>
-        The predictor analyzes recent candle frequency,
-        short-term momentum and transition patterns.
-      </p>
+      <div class="data-row">
+        <span>Market</span>
+        <strong id="marketLabel">LIVE</strong>
+      </div>
 
-      <p class="warning">
-        IMPORTANT: This is an experimental analytical tool.
-        It does not guarantee 95% or 100% accuracy and does not
-        guarantee profit.
-      </p>
+      <div class="data-row">
+        <span>Pair</span>
+        <strong id="pairLabel">--</strong>
+      </div>
 
-      <p>
-        Never enter your Pocket Option password, SSID,
-        session ID or other private credentials into this website.
-      </p>
+      <div class="data-row">
+        <span>Data status</span>
+        <strong id="dataStatus">WAITING</strong>
+      </div>
+
+    </section>
+
+    <section class="card">
+
+      <h2>Signal History</h2>
+
+      <div id="history">
+        <p class="empty">No signals yet.</p>
+      </div>
+
+      <div class="stats">
+        <span>Total: <b id="total">0</b></span>
+        <span>Wins: <b id="wins">0</b></span>
+        <span>Losses: <b id="losses">0</b></span>
+        <span>Win rate: <b id="winRate">0%</b></span>
+      </div>
 
     </section>
 
     <footer>
-      PO AI Predictor • GitHub Pages
+      <p>
+        ⚠️ Signals are analytical estimates, not guaranteed trading results.
+      </p>
     </footer>
 
-  </main>
+  </div>
 
   <script src="script.js"></script>
+
 </body>
 </html>
