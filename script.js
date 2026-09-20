@@ -1,325 +1,270 @@
-const sequenceEl = document.getElementById("sequence");
-const resultEl = document.getElementById("result");
+const livePairs = [
+  "EUR/USD",
+  "GBP/USD",
+  "USD/JPY",
+  "USD/CHF",
+  "AUD/USD",
+  "USD/CAD",
+  "NZD/USD",
+  "EUR/GBP",
+  "EUR/JPY",
+  "GBP/JPY"
+];
 
-const directionEl = document.getElementById("direction");
-const reasonEl = document.getElementById("reason");
-const confidenceEl = document.getElementById("confidence");
+const otcPairs = [
+  "EUR/USD OTC",
+  "GBP/USD OTC",
+  "USD/JPY OTC",
+  "USD/CHF OTC",
+  "AUD/USD OTC",
+  "USD/CAD OTC",
+  "NZD/USD OTC",
+  "EUR/GBP OTC",
+  "EUR/JPY OTC",
+  "GBP/JPY OTC"
+];
 
-const upPctEl = document.getElementById("upPct");
-const downPctEl = document.getElementById("downPct");
-const sampleEl = document.getElementById("sample");
+const marketType = document.getElementById("marketType");
+const pair = document.getElementById("pair");
+const expiry = document.getElementById("expiry");
+const analyzeBtn = document.getElementById("analyzeBtn");
 
-const predictBtn = document.getElementById("predict");
-const clearBtn = document.getElementById("clear");
+const signal = document.getElementById("signal");
+const confidence = document.getElementById("confidence");
+const entryTime = document.getElementById("entryTime");
+const expiryTime = document.getElementById("expiryTime");
+const countdown = document.getElementById("countdown");
 
-let candles = [];
+const marketLabel = document.getElementById("marketLabel");
+const pairLabel = document.getElementById("pairLabel");
+const dataStatus = document.getElementById("dataStatus");
 
-/* --------------------------------
-   DRAW CANDLE INPUT BUTTONS
--------------------------------- */
+const history = document.getElementById("history");
+const total = document.getElementById("total");
+const wins = document.getElementById("wins");
+const losses = document.getElementById("losses");
+const winRate = document.getElementById("winRate");
 
-function renderCandles() {
-  sequenceEl.innerHTML = "";
+let countdownTimer = null;
+let currentSignal = null;
 
-  for (let i = 0; i < 20; i++) {
+function loadPairs() {
+  const list = marketType.value === "otc" ? otcPairs : livePairs;
 
-    const button = document.createElement("button");
+  pair.innerHTML = "";
 
-    button.className = "candle";
+  list.forEach(item => {
+    const option = document.createElement("option");
+    option.value = item;
+    option.textContent = item;
+    pair.appendChild(option);
+  });
 
-    if (candles[i] === "up") {
-      button.classList.add("up");
-      button.textContent = "UP";
-    }
-
-    else if (candles[i] === "down") {
-      button.classList.add("down");
-      button.textContent = "DN";
-    }
-
-    else {
-      button.textContent = "•";
-    }
-
-    /* TAP = UP */
-
-    button.addEventListener("click", function () {
-
-      if (candles[i] === "up") {
-        candles.splice(i, 1);
-      }
-
-      else {
-        candles[i] = "up";
-      }
-
-      renderCandles();
-    });
-
-
-    /* LONG PRESS = DOWN */
-
-    let timer;
-
-    button.addEventListener("touchstart", function () {
-
-      timer = setTimeout(function () {
-
-        candles[i] = "down";
-
-        renderCandles();
-
-      }, 550);
-
-    }, { passive: true });
-
-
-    button.addEventListener("touchend", function () {
-      clearTimeout(timer);
-    });
-
-
-    /* RIGHT CLICK = DOWN */
-
-    button.addEventListener("contextmenu", function (event) {
-
-      event.preventDefault();
-
-      candles[i] = "down";
-
-      renderCandles();
-
-    });
-
-
-    sequenceEl.appendChild(button);
-  }
+  updateLabels();
 }
 
-
-/* --------------------------------
-   ANALYSIS ENGINE
--------------------------------- */
-
-function analyzeMarket() {
-
-  const data = candles.filter(Boolean);
-
-  /* Minimum data */
-
-  if (data.length < 10) {
-
-    alert(
-      "Please enter at least 10 recent candle results before analysis."
-    );
-
-    return;
-  }
-
-
-  /* --------------------------------
-     BASIC FREQUENCY
-  -------------------------------- */
-
-  const upCount =
-    data.filter(x => x === "up").length;
-
-  const downCount =
-    data.filter(x => x === "down").length;
-
-
-  const total = data.length;
-
-
-  const upRate =
-    upCount / total;
-
-  const downRate =
-    downCount / total;
-
-
-  /* --------------------------------
-     RECENT MOMENTUM
-  -------------------------------- */
-
-  const recent =
-    data.slice(-5);
-
-  const recentUp =
-    recent.filter(x => x === "up").length;
-
-  const recentDown =
-    recent.filter(x => x === "down").length;
-
-
-  const momentum =
-    (recentUp - recentDown) / recent.length;
-
-
-  /* --------------------------------
-     TRANSITION ANALYSIS
-  -------------------------------- */
-
-  let upTransitions = 0;
-  let downTransitions = 0;
-
-  for (let i = 1; i < data.length; i++) {
-
-    if (data[i - 1] !== data[i]) {
-
-      if (data[i] === "up") {
-        upTransitions++;
-      }
-
-      else {
-        downTransitions++;
-      }
-    }
-  }
-
-
-  let transitionScore = 0;
-
-  const transitions =
-    upTransitions + downTransitions;
-
-  if (transitions > 0) {
-
-    transitionScore =
-      (upTransitions - downTransitions) /
-      transitions;
-  }
-
-
-  /* --------------------------------
-     COMBINED MODEL SCORE
-  -------------------------------- */
-
-  const frequencyScore =
-    (upRate - downRate);
-
-  const score =
-    (frequencyScore * 0.55) +
-    (momentum * 0.25) +
-    (transitionScore * 0.20);
-
-
-  /* --------------------------------
-     SIGNAL DECISION
-  -------------------------------- */
-
-  let signal = "WAIT";
-
-  if (score > 0.10) {
-    signal = "UP";
-  }
-
-  else if (score < -0.10) {
-    signal = "DOWN";
-  }
-
-
-  /* --------------------------------
-     MODEL CONFIDENCE
-  -------------------------------- */
-
-  let confidence =
-    50 + Math.abs(score) * 45;
-
-
-  confidence =
-    Math.round(
-      Math.min(92, confidence)
-    );
-
-
-  /* --------------------------------
-     DISPLAY RESULTS
-  -------------------------------- */
-
-  directionEl.textContent = signal;
-
-  confidenceEl.textContent =
-    confidence + "% model confidence";
-
-
-  upPctEl.textContent =
-    Math.round(upRate * 100) + "%";
-
-
-  downPctEl.textContent =
-    Math.round(downRate * 100) + "%";
-
-
-  sampleEl.textContent =
-    total;
-
-
-  /* --------------------------------
-     EXPLANATION
-  -------------------------------- */
-
-  if (signal === "UP") {
-
-    reasonEl.textContent =
-      "Recent frequency, momentum and transition patterns currently lean UP.";
-
-  }
-
-  else if (signal === "DOWN") {
-
-    reasonEl.textContent =
-      "Recent frequency, momentum and transition patterns currently lean DOWN.";
-
-  }
-
-  else {
-
-    reasonEl.textContent =
-      "The available signals are mixed. Waiting for stronger confirmation.";
-
-  }
-
-
-  resultEl.classList.remove("hidden");
-
-
-  /* Scroll result into view on Android */
-
-  resultEl.scrollIntoView({
-    behavior: "smooth",
-    block: "center"
+function updateLabels() {
+  marketLabel.textContent =
+    marketType.value === "otc" ? "OTC MARKET" : "LIVE MARKET";
+
+  pairLabel.textContent = pair.value;
+
+  /*
+    IMPORTANT:
+    This version does NOT pretend to receive live Pocket Option
+    candles. The status clearly shows that external market data
+    still needs to be connected.
+  */
+  dataStatus.textContent = "DATA ADAPTER REQUIRED";
+}
+
+function getTimeString(date) {
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
   });
 }
 
+function analyzeMarket() {
+  clearInterval(countdownTimer);
 
-/* --------------------------------
-   CLEAR BUTTON
--------------------------------- */
+  const now = new Date();
+  const duration = Number(expiry.value);
 
-clearBtn.addEventListener("click", function () {
+  /*
+    DEMO ANALYSIS ONLY.
 
-  candles = [];
+    This generates an example signal so that the interface can
+    be tested. It is NOT a live Pocket Option prediction.
+  */
 
-  resultEl.classList.add("hidden");
+  const randomValue = Math.random();
 
-  renderCandles();
+  let direction;
+  let confidenceValue;
 
-});
+  if (randomValue < 0.45) {
+    direction = "CALL";
+    confidenceValue = 62 + Math.floor(Math.random() * 16);
+  } else if (randomValue < 0.90) {
+    direction = "PUT";
+    confidenceValue = 62 + Math.floor(Math.random() * 16);
+  } else {
+    direction = "NO TRADE";
+    confidenceValue = 50;
+  }
 
+  const end = new Date(
+    now.getTime() + duration * 60 * 1000
+  );
 
-/* --------------------------------
-   ANALYZE BUTTON
--------------------------------- */
+  currentSignal = {
+    id: Date.now(),
+    market: marketType.value,
+    pair: pair.value,
+    direction: direction,
+    confidence: confidenceValue,
+    entry: getTimeString(now),
+    expiry: getTimeString(end),
+    result: "PENDING"
+  };
 
-predictBtn.addEventListener(
-  "click",
-  analyzeMarket
-);
+  showSignal(currentSignal);
+  saveSignal(currentSignal);
+  startCountdown(end);
+}
 
+function showSignal(item) {
+  signal.textContent = item.direction;
 
-/* --------------------------------
-   START APPLICATION
--------------------------------- */
+  signal.className = "signal";
 
-renderCandles();
+  if (item.direction === "CALL") {
+    signal.classList.add("call");
+  } else if (item.direction === "PUT") {
+    signal.classList.add("put");
+  } else {
+    signal.classList.add("neutral");
+  }
+
+  confidence.textContent = item.confidence + "%";
+  entryTime.textContent = item.entry;
+  expiryTime.textContent = item.expiry;
+}
+
+function startCountdown(endTime) {
+  function update() {
+    const remaining = endTime.getTime() - Date.now();
+
+    if (remaining <= 0) {
+      countdown.textContent = "EXPIRED";
+      clearInterval(countdownTimer);
+      return;
+    }
+
+    const seconds = Math.ceil(remaining / 1000);
+
+    const minutes = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+
+    countdown.textContent =
+      minutes + ":" + String(secs).padStart(2, "0");
+  }
+
+  update();
+  countdownTimer = setInterval(update, 1000);
+}
+
+function getHistory() {
+  try {
+    return JSON.parse(
+      localStorage.getItem("po_ai_history") || "[]"
+    );
+  } catch {
+    return [];
+  }
+}
+
+function saveSignal(item) {
+  const list = getHistory();
+
+  list.unshift(item);
+
+  localStorage.setItem(
+    "po_ai_history",
+    JSON.stringify(list.slice(0, 50))
+  );
+
+  renderHistory();
+}
+
+function renderHistory() {
+  const list = getHistory();
+
+  if (!list.length) {
+    history.innerHTML =
+      '<p class="empty">No signals yet.</p>';
+  } else {
+    history.innerHTML = "";
+
+    list.forEach(item => {
+      const div = document.createElement("div");
+
+      div.className = "history-item";
+
+      div.innerHTML = `
+        <div class="top">
+          <strong>${item.pair}</strong>
+          <strong>${item.direction}</strong>
+        </div>
+
+        <div class="bottom">
+          ${item.market.toUpperCase()}
+          • ${item.entry}
+          • ${item.confidence}%
+          • <span class="pending">${item.result}</span>
+        </div>
+      `;
+
+      history.appendChild(div);
+    });
+  }
+
+  updateStats(list);
+}
+
+function updateStats(list) {
+  const completed = list.filter(
+    item => item.result === "WIN" || item.result === "LOSS"
+  );
+
+  const winCount = list.filter(
+    item => item.result === "WIN"
+  ).length;
+
+  const lossCount = list.filter(
+    item => item.result === "LOSS"
+  ).length;
+
+  total.textContent = completed.length;
+  wins.textContent = winCount;
+  losses.textContent = lossCount;
+
+  if (completed.length > 0) {
+    winRate.textContent =
+      Math.round((winCount / completed.length) * 100) + "%";
+  } else {
+    winRate.textContent = "0%";
+  }
+}
+
+marketType.addEventListener("change", loadPairs);
+
+pair.addEventListener("change", updateLabels);
+
+analyzeBtn.addEventListener("click", analyzeMarket);
+
+loadPairs();
+renderHistory();
