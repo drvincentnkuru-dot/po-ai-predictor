@@ -1,3 +1,5 @@
+const API_URL = "https://po-ai-predictor-api-onrender.com";
+
 const livePairs = [
   "EUR/USD",
   "GBP/USD",
@@ -49,14 +51,18 @@ let countdownTimer = null;
 let currentSignal = null;
 
 function loadPairs() {
-  const list = marketType.value === "otc" ? otcPairs : livePairs;
+  const list = marketType.value === "otc"
+    ? otcPairs
+    : livePairs;
 
   pair.innerHTML = "";
 
   list.forEach(item => {
     const option = document.createElement("option");
+
     option.value = item;
     option.textContent = item;
+
     pair.appendChild(option);
   });
 
@@ -65,17 +71,13 @@ function loadPairs() {
 
 function updateLabels() {
   marketLabel.textContent =
-    marketType.value === "otc" ? "OTC MARKET" : "LIVE MARKET";
+    marketType.value === "otc"
+      ? "OTC MARKET"
+      : "LIVE MARKET";
 
   pairLabel.textContent = pair.value;
 
-  /*
-    IMPORTANT:
-    This version does NOT pretend to receive live Pocket Option
-    candles. The status clearly shows that external market data
-    still needs to be connected.
-  */
-  dataStatus.textContent = "DATA ADAPTER REQUIRED";
+  dataStatus.textContent = "READY";
 }
 
 function getTimeString(date) {
@@ -87,53 +89,102 @@ function getTimeString(date) {
   });
 }
 
-function analyzeMarket() {
+async function analyzeMarket() {
   clearInterval(countdownTimer);
+
+  analyzeBtn.disabled = true;
+  dataStatus.textContent = "ANALYZING...";
+
+  signal.textContent = "ANALYZING";
+  signal.className = "signal neutral";
+
+  confidence.textContent = "--";
+  countdown.textContent = "--";
 
   const now = new Date();
   const duration = Number(expiry.value);
 
-  /*
-    DEMO ANALYSIS ONLY.
+  const selectedMarket = marketType.value;
+  const selectedPair = pair.value;
 
-    This generates an example signal so that the interface can
-    be tested. It is NOT a live Pocket Option prediction.
-  */
+  try {
+    const response = await fetch(`${API_URL}/analyze`, {
+      method: "POST",
 
-  const randomValue = Math.random();
+      headers: {
+        "Content-Type": "application/json"
+      },
 
-  let direction;
-  let confidenceValue;
+      body: JSON.stringify({
+        marketType: selectedMarket,
+        pair: selectedPair,
+        expiry: duration
+      })
+    });
 
-  if (randomValue < 0.45) {
-    direction = "CALL";
-    confidenceValue = 62 + Math.floor(Math.random() * 16);
-  } else if (randomValue < 0.90) {
-    direction = "PUT";
-    confidenceValue = 62 + Math.floor(Math.random() * 16);
-  } else {
-    direction = "NO TRADE";
-    confidenceValue = 50;
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    console.log("Render API response:", data);
+
+    const direction =
+      data.signal ||
+      data.analysis?.signal ||
+      "NO TRADE";
+
+    const confidenceValue =
+      Number(
+        data.confidence ??
+        data.analysis?.confidence ??
+        0
+      );
+
+    const end = new Date(
+      now.getTime() + duration * 60 * 1000
+    );
+
+    currentSignal = {
+      id: Date.now(),
+      market: selectedMarket,
+      pair: selectedPair,
+      direction: direction,
+      confidence: confidenceValue,
+      entry: getTimeString(now),
+      expiry: getTimeString(end),
+      result: "PENDING"
+    };
+
+    dataStatus.textContent = "LIVE DATA CONNECTED";
+
+    showSignal(currentSignal);
+
+    saveSignal(currentSignal);
+
+    startCountdown(end);
+
+  } catch (error) {
+
+    console.error("Analysis error:", error);
+
+    dataStatus.textContent = "API CONNECTION ERROR";
+
+    signal.textContent = "NO TRADE";
+    signal.className = "signal neutral";
+
+    confidence.textContent = "0%";
+    countdown.textContent = "--";
+
+    alert(
+      "Unable to connect to the analysis server. Please try again."
+    );
+
+  } finally {
+
+    analyzeBtn.disabled = false;
   }
-
-  const end = new Date(
-    now.getTime() + duration * 60 * 1000
-  );
-
-  currentSignal = {
-    id: Date.now(),
-    market: marketType.value,
-    pair: pair.value,
-    direction: direction,
-    confidence: confidenceValue,
-    entry: getTimeString(now),
-    expiry: getTimeString(end),
-    result: "PENDING"
-  };
-
-  showSignal(currentSignal);
-  saveSignal(currentSignal);
-  startCountdown(end);
 }
 
 function showSignal(item) {
@@ -143,8 +194,10 @@ function showSignal(item) {
 
   if (item.direction === "CALL") {
     signal.classList.add("call");
+
   } else if (item.direction === "PUT") {
     signal.classList.add("put");
+
   } else {
     signal.classList.add("neutral");
   }
@@ -155,8 +208,10 @@ function showSignal(item) {
 }
 
 function startCountdown(endTime) {
+
   function update() {
-    const remaining = endTime.getTime() - Date.now();
+    const remaining =
+      endTime.getTime() - Date.now();
 
     if (remaining <= 0) {
       countdown.textContent = "EXPIRED";
@@ -164,25 +219,34 @@ function startCountdown(endTime) {
       return;
     }
 
-    const seconds = Math.ceil(remaining / 1000);
+    const seconds =
+      Math.ceil(remaining / 1000);
 
-    const minutes = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const minutes =
+      Math.floor(seconds / 60);
+
+    const secs =
+      seconds % 60;
 
     countdown.textContent =
       minutes + ":" + String(secs).padStart(2, "0");
   }
 
   update();
-  countdownTimer = setInterval(update, 1000);
+
+  countdownTimer =
+    setInterval(update, 1000);
 }
 
 function getHistory() {
   try {
+
     return JSON.parse(
       localStorage.getItem("po_ai_history") || "[]"
     );
+
   } catch {
+
     return [];
   }
 }
@@ -204,15 +268,21 @@ function renderHistory() {
   const list = getHistory();
 
   if (!list.length) {
+
     history.innerHTML =
       '<p class="empty">No signals yet.</p>';
+
   } else {
+
     history.innerHTML = "";
 
     list.forEach(item => {
-      const div = document.createElement("div");
 
-      div.className = "history-item";
+      const div =
+        document.createElement("div");
+
+      div.className =
+        "history-item";
 
       div.innerHTML = `
         <div class="top">
@@ -236,35 +306,61 @@ function renderHistory() {
 }
 
 function updateStats(list) {
-  const completed = list.filter(
-    item => item.result === "WIN" || item.result === "LOSS"
-  );
 
-  const winCount = list.filter(
-    item => item.result === "WIN"
-  ).length;
+  const completed =
+    list.filter(
+      item =>
+        item.result === "WIN" ||
+        item.result === "LOSS"
+    );
 
-  const lossCount = list.filter(
-    item => item.result === "LOSS"
-  ).length;
+  const winCount =
+    list.filter(
+      item => item.result === "WIN"
+    ).length;
 
-  total.textContent = completed.length;
-  wins.textContent = winCount;
-  losses.textContent = lossCount;
+  const lossCount =
+    list.filter(
+      item => item.result === "LOSS"
+    ).length;
+
+  total.textContent =
+    completed.length;
+
+  wins.textContent =
+    winCount;
+
+  losses.textContent =
+    lossCount;
 
   if (completed.length > 0) {
+
     winRate.textContent =
-      Math.round((winCount / completed.length) * 100) + "%";
+      Math.round(
+        (winCount / completed.length) * 100
+      ) + "%";
+
   } else {
+
     winRate.textContent = "0%";
   }
 }
 
-marketType.addEventListener("change", loadPairs);
+marketType.addEventListener(
+  "change",
+  loadPairs
+);
 
-pair.addEventListener("change", updateLabels);
+pair.addEventListener(
+  "change",
+  updateLabels
+);
 
-analyzeBtn.addEventListener("click", analyzeMarket);
+analyzeBtn.addEventListener(
+  "click",
+  analyzeMarket
+);
 
 loadPairs();
+
 renderHistory();
