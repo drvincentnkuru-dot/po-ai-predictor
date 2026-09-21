@@ -658,9 +658,9 @@ app.listen(PORT, () => {
     `PO AI Predictor backend running on port ${PORT}`
   );
 
-  if (LIVE_DATA_URL) {
+  if (TWELVE_DATA_API_KEY) {
     console.log(
-      "Live data updater configured."
+      "Twelve Data live data updater configured."
     );
 
     // First update immediately
@@ -673,11 +673,11 @@ app.listen(PORT, () => {
     );
   } else {
     console.log(
-      "WARNING: LIVE_DATA_URL is not configured."
+      "WARNING: TWELVE_DATA_API_KEY is not configured."
     );
 
     console.log(
-      "Market analysis will remain NO TRADE until a verified live data source is connected."
+      "Market analysis will remain NO TRADE until Twelve Data is connected."
     );
   }
 });
