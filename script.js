@@ -1,29 +1,29 @@
-const API_URL = "https://po-ai-predictor-api-onrender.com";
+const API_URL = "https://po-ai-predictor-api.onrender.com";
 
 const livePairs = [
-  "EUR/USD",
-  "GBP/USD",
-  "USD/JPY",
-  "USD/CHF",
-  "AUD/USD",
-  "USD/CAD",
-  "NZD/USD",
-  "EUR/GBP",
-  "EUR/JPY",
-  "GBP/JPY"
+"EUR/USD",
+"GBP/USD",
+"USD/JPY",
+"USD/CHF",
+"AUD/USD",
+"USD/CAD",
+"NZD/USD",
+"EUR/GBP",
+"EUR/JPY",
+"GBP/JPY"
 ];
 
 const otcPairs = [
-  "EUR/USD OTC",
-  "GBP/USD OTC",
-  "USD/JPY OTC",
-  "USD/CHF OTC",
-  "AUD/USD OTC",
-  "USD/CAD OTC",
-  "NZD/USD OTC",
-  "EUR/GBP OTC",
-  "EUR/JPY OTC",
-  "GBP/JPY OTC"
+"EUR/USD OTC",
+"GBP/USD OTC",
+"USD/JPY OTC",
+"USD/CHF OTC",
+"AUD/USD OTC",
+"USD/CAD OTC",
+"NZD/USD OTC",
+"EUR/GBP OTC",
+"EUR/JPY OTC",
+"GBP/JPY OTC"
 ];
 
 const marketType = document.getElementById("marketType");
@@ -51,314 +51,377 @@ let countdownTimer = null;
 let currentSignal = null;
 
 function loadPairs() {
-  const list = marketType.value === "otc"
-    ? otcPairs
-    : livePairs;
+const list =
+marketType.value === "otc"
+? otcPairs
+: livePairs;
 
-  pair.innerHTML = "";
+pair.innerHTML = "";
 
-  list.forEach(item => {
-    const option = document.createElement("option");
+list.forEach((item) => {
+const option = document.createElement("option");
 
-    option.value = item;
-    option.textContent = item;
+option.value = item;
+option.textContent = item;
 
-    pair.appendChild(option);
-  });
+pair.appendChild(option);
 
-  updateLabels();
+});
+
+updateLabels();
 }
 
 function updateLabels() {
-  marketLabel.textContent =
-    marketType.value === "otc"
-      ? "OTC MARKET"
-      : "LIVE MARKET";
+marketLabel.textContent =
+marketType.value === "otc"
+? "OTC MARKET"
+: "LIVE MARKET";
 
-  pairLabel.textContent = pair.value;
+pairLabel.textContent =
+pair.value || "--";
 
-  dataStatus.textContent = "READY";
+dataStatus.textContent = "READY";
 }
 
 function getTimeString(date) {
-  return date.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  });
+return date.toLocaleTimeString([], {
+hour: "2-digit",
+minute: "2-digit",
+second: "2-digit",
+hour12: false
+});
 }
 
 async function analyzeMarket() {
-  clearInterval(countdownTimer);
+clearInterval(countdownTimer);
 
-  analyzeBtn.disabled = true;
-  dataStatus.textContent = "ANALYZING...";
+analyzeBtn.disabled = true;
 
-  signal.textContent = "ANALYZING";
-  signal.className = "signal neutral";
+dataStatus.textContent =
+"CONNECTING TO LIVE DATA...";
 
-  confidence.textContent = "--";
-  countdown.textContent = "--";
+signal.textContent = "ANALYZING";
+signal.className = "signal neutral";
 
-  const now = new Date();
-  const duration = Number(expiry.value);
+confidence.textContent = "--";
+countdown.textContent = "--";
 
-  const selectedMarket = marketType.value;
-  const selectedPair = pair.value;
+const selectedMarket = marketType.value;
+const selectedPair = pair.value;
+const duration = Number(expiry.value);
 
-  try {
-    const response = await fetch(`${API_URL}/analyze`, {
-      method: "POST",
+const now = new Date();
 
-      headers: {
-        "Content-Type": "application/json"
-      },
+try {
+const response = await fetch(
+"${API_URL}/api/signal",
+{
+method: "POST",
 
-      body: JSON.stringify({
-        marketType: selectedMarket,
-        pair: selectedPair,
-        expiry: duration
-      })
-    });
+    headers: {
+      "Content-Type": "application/json"
+    },
 
-    if (!response.ok) {
-      throw new Error(`API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    console.log("Render API response:", data);
-
-    const direction =
-      data.signal ||
-      data.analysis?.signal ||
-      "NO TRADE";
-
-    const confidenceValue =
-      Number(
-        data.confidence ??
-        data.analysis?.confidence ??
-        0
-      );
-
-    const end = new Date(
-      now.getTime() + duration * 60 * 1000
-    );
-
-    currentSignal = {
-      id: Date.now(),
-      market: selectedMarket,
+    body: JSON.stringify({
+      marketType: selectedMarket,
       pair: selectedPair,
-      direction: direction,
-      confidence: confidenceValue,
-      entry: getTimeString(now),
-      expiry: getTimeString(end),
-      result: "PENDING"
-    };
-
-    dataStatus.textContent = "LIVE DATA CONNECTED";
-
-    showSignal(currentSignal);
-
-    saveSignal(currentSignal);
-
-    startCountdown(end);
-
-  } catch (error) {
-
-    console.error("Analysis error:", error);
-
-    dataStatus.textContent = "API CONNECTION ERROR";
-
-    signal.textContent = "NO TRADE";
-    signal.className = "signal neutral";
-
-    confidence.textContent = "0%";
-    countdown.textContent = "--";
-
-    alert(
-      "Unable to connect to the analysis server. Please try again."
-    );
-
-  } finally {
-
-    analyzeBtn.disabled = false;
+      expiry: duration
+    })
   }
+);
+
+if (!response.ok) {
+  throw new Error(
+    `API error: ${response.status}`
+  );
+}
+
+const data = await response.json();
+
+console.log(
+  "Render API response:",
+  data
+);
+
+const direction =
+  data.signal ||
+  data.analysis?.signal ||
+  "NO TRADE";
+
+let confidenceValue =
+  Number(
+    data.confidence ??
+    data.analysis?.confidence ??
+    0
+  );
+
+if (Number.isNaN(confidenceValue)) {
+  confidenceValue = 0;
+}
+
+const end = new Date(
+  now.getTime() +
+  duration * 60 * 1000
+);
+
+currentSignal = {
+  id: Date.now(),
+
+  market: selectedMarket,
+
+  pair: selectedPair,
+
+  direction: direction,
+
+  confidence: confidenceValue,
+
+  entry: getTimeString(now),
+
+  expiry: getTimeString(end),
+
+  result: "PENDING"
+};
+
+dataStatus.textContent =
+  "LIVE DATA CONNECTED";
+
+showSignal(currentSignal);
+
+saveSignal(currentSignal);
+
+startCountdown(end);
+
+} catch (error) {
+console.error(
+"Analysis error:",
+error
+);
+
+dataStatus.textContent =
+  "API CONNECTION ERROR";
+
+signal.textContent =
+  "NO TRADE";
+
+signal.className =
+  "signal neutral";
+
+confidence.textContent =
+  "0%";
+
+countdown.textContent =
+  "--";
+
+alert(
+  "Unable to connect to the Render analysis server. Please try again."
+);
+
+} finally {
+analyzeBtn.disabled = false;
+}
 }
 
 function showSignal(item) {
-  signal.textContent = item.direction;
+signal.textContent =
+item.direction;
 
-  signal.className = "signal";
+signal.className =
+"signal";
 
-  if (item.direction === "CALL") {
-    signal.classList.add("call");
+if (item.direction === "CALL") {
+signal.classList.add("call");
 
-  } else if (item.direction === "PUT") {
-    signal.classList.add("put");
+} else if (item.direction === "PUT") {
+signal.classList.add("put");
 
-  } else {
-    signal.classList.add("neutral");
-  }
+} else {
+signal.classList.add("neutral");
+}
 
-  confidence.textContent = item.confidence + "%";
-  entryTime.textContent = item.entry;
-  expiryTime.textContent = item.expiry;
+confidence.textContent =
+item.confidence + "%";
+
+entryTime.textContent =
+item.entry;
+
+expiryTime.textContent =
+item.expiry;
 }
 
 function startCountdown(endTime) {
+function update() {
+const remaining =
+endTime.getTime() -
+Date.now();
 
-  function update() {
-    const remaining =
-      endTime.getTime() - Date.now();
+if (remaining <= 0) {
+  countdown.textContent =
+    "EXPIRED";
 
-    if (remaining <= 0) {
-      countdown.textContent = "EXPIRED";
-      clearInterval(countdownTimer);
-      return;
-    }
+  clearInterval(countdownTimer);
 
-    const seconds =
-      Math.ceil(remaining / 1000);
+  return;
+}
 
-    const minutes =
-      Math.floor(seconds / 60);
+const seconds =
+  Math.ceil(
+    remaining / 1000
+  );
 
-    const secs =
-      seconds % 60;
+const minutes =
+  Math.floor(
+    seconds / 60
+  );
 
-    countdown.textContent =
-      minutes + ":" + String(secs).padStart(2, "0");
-  }
+const secs =
+  seconds % 60;
 
-  update();
+countdown.textContent =
+  minutes +
+  ":" +
+  String(secs).padStart(
+    2,
+    "0"
+  );
 
-  countdownTimer =
-    setInterval(update, 1000);
+}
+
+update();
+
+countdownTimer =
+setInterval(
+update,
+1000
+);
 }
 
 function getHistory() {
-  try {
+try {
+return JSON.parse(
+localStorage.getItem(
+"po_ai_history"
+) || "[]"
+);
 
-    return JSON.parse(
-      localStorage.getItem("po_ai_history") || "[]"
-    );
-
-  } catch {
-
-    return [];
-  }
+} catch {
+return [];
+}
 }
 
 function saveSignal(item) {
-  const list = getHistory();
+const list =
+getHistory();
 
-  list.unshift(item);
+list.unshift(item);
 
-  localStorage.setItem(
-    "po_ai_history",
-    JSON.stringify(list.slice(0, 50))
-  );
+localStorage.setItem(
+"po_ai_history",
+JSON.stringify(
+list.slice(0, 50)
+)
+);
 
-  renderHistory();
+renderHistory();
 }
 
 function renderHistory() {
-  const list = getHistory();
+const list =
+getHistory();
 
-  if (!list.length) {
+if (!list.length) {
+history.innerHTML =
+'<p class="empty">No signals yet.</p>';
 
-    history.innerHTML =
-      '<p class="empty">No signals yet.</p>';
+} else {
+history.innerHTML = "";
 
-  } else {
+list.forEach((item) => {
+  const div =
+    document.createElement(
+      "div"
+    );
 
-    history.innerHTML = "";
+  div.className =
+    "history-item";
 
-    list.forEach(item => {
+  div.innerHTML = `
+    <div class="top">
+      <strong>${item.pair}</strong>
+      <strong>${item.direction}</strong>
+    </div>
 
-      const div =
-        document.createElement("div");
+    <div class="bottom">
+      ${item.market.toUpperCase()}
+      • ${item.entry}
+      • ${item.confidence}%
+      • <span class="pending">${item.result}</span>
+    </div>
+  `;
 
-      div.className =
-        "history-item";
+  history.appendChild(div);
+});
 
-      div.innerHTML = `
-        <div class="top">
-          <strong>${item.pair}</strong>
-          <strong>${item.direction}</strong>
-        </div>
+}
 
-        <div class="bottom">
-          ${item.market.toUpperCase()}
-          • ${item.entry}
-          • ${item.confidence}%
-          • <span class="pending">${item.result}</span>
-        </div>
-      `;
-
-      history.appendChild(div);
-    });
-  }
-
-  updateStats(list);
+updateStats(list);
 }
 
 function updateStats(list) {
+const completed =
+list.filter(
+(item) =>
+item.result === "WIN" ||
+item.result === "LOSS"
+);
 
-  const completed =
-    list.filter(
-      item =>
-        item.result === "WIN" ||
-        item.result === "LOSS"
-    );
+const winCount =
+list.filter(
+(item) =>
+item.result === "WIN"
+).length;
 
-  const winCount =
-    list.filter(
-      item => item.result === "WIN"
-    ).length;
+const lossCount =
+list.filter(
+(item) =>
+item.result === "LOSS"
+).length;
 
-  const lossCount =
-    list.filter(
-      item => item.result === "LOSS"
-    ).length;
+total.textContent =
+completed.length;
 
-  total.textContent =
-    completed.length;
+wins.textContent =
+winCount;
 
-  wins.textContent =
-    winCount;
+losses.textContent =
+lossCount;
 
-  losses.textContent =
-    lossCount;
+if (completed.length > 0) {
+winRate.textContent =
+Math.round(
+(winCount /
+completed.length) *
+100
+) + "%";
 
-  if (completed.length > 0) {
-
-    winRate.textContent =
-      Math.round(
-        (winCount / completed.length) * 100
-      ) + "%";
-
-  } else {
-
-    winRate.textContent = "0%";
-  }
+} else {
+winRate.textContent =
+"0%";
+}
 }
 
 marketType.addEventListener(
-  "change",
-  loadPairs
+"change",
+loadPairs
 );
 
 pair.addEventListener(
-  "change",
-  updateLabels
+"change",
+updateLabels
 );
 
 analyzeBtn.addEventListener(
-  "click",
-  analyzeMarket
+"click",
+analyzeMarket
 );
 
 loadPairs();
