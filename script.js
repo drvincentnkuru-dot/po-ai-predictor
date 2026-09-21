@@ -89,7 +89,8 @@ function updateLabels() {
   pairLabel.textContent =
     pair.value || "--";
 
-  dataStatus.textContent = "READY";
+  dataStatus.textContent =
+    "READY";
 }
 
 
@@ -119,55 +120,125 @@ async function analyzeMarket() {
   dataStatus.textContent =
     "CONNECTING TO LIVE DATA...";
 
-  signal.textContent = "ANALYZING";
-  signal.className = "signal neutral";
+  signal.textContent =
+    "ANALYZING";
 
-  confidence.textContent = "--";
-  countdown.textContent = "--";
+  signal.className =
+    "signal neutral";
 
-  const selectedMarket = marketType.value;
-  const selectedPair = pair.value;
-  const duration = Number(expiry.value);
+  confidence.textContent =
+    "--";
 
-  const now = new Date();
+  entryTime.textContent =
+    "--";
+
+  expiryTime.textContent =
+    "--";
+
+  countdown.textContent =
+    "--";
+
+  const selectedMarket =
+    marketType.value;
+
+  const selectedPair =
+    pair.value;
+
+  const duration =
+    Number(expiry.value);
+
+  const now =
+    new Date();
+
+  /*
+    OTC is not supported by the live-data
+    backend architecture.
+
+    Therefore OTC selections are prevented
+    from pretending to be live signals.
+  */
+
+  if (selectedMarket === "otc") {
+    dataStatus.textContent =
+      "OTC LIVE DATA NOT AVAILABLE";
+
+    signal.textContent =
+      "NO TRADE";
+
+    signal.className =
+      "signal neutral";
+
+    confidence.textContent =
+      "0%";
+
+    analyzeBtn.disabled = false;
+
+    alert(
+      "OTC market is not connected to the live-data backend. Please select LIVE MARKET."
+    );
+
+    return;
+  }
+
+  /*
+    Remove OTC suffix just in case it exists.
+  */
+
+  const symbol =
+    selectedPair.replace(
+      " OTC",
+      ""
+    );
 
   try {
     /*
-      IMPORTANT:
-      Backend /api/signal uses GET.
-      Therefore we must NOT send POST here.
+      The backend accepts the symbol
+      through the query parameter.
+
+      Example:
+      /api/signal?symbol=EUR%2FUSD
     */
 
-    const response = await fetch(
-      `${API_URL}/api/signal`,
-      {
+    const url =
+      `${API_URL}/api/signal?symbol=${encodeURIComponent(symbol)}`;
+
+    const response =
+      await fetch(url, {
         method: "GET",
         headers: {
           Accept: "application/json"
-        }
-      }
-    );
+        },
+        cache: "no-store"
+      });
 
-    const data = await response.json();
+    let data;
+
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error(
+        "Backend returned an invalid JSON response."
+      );
+    }
 
     console.log(
-      "Render API response:",
+      "PO AI Predictor API:",
       data
     );
-
-    /*
-      If backend says live data is unavailable,
-      do not create a fake CALL/PUT signal.
-    */
 
     if (!response.ok) {
       throw new Error(
         data.message ||
+        data.error ||
         `API error: ${response.status}`
       );
     }
 
-    const direction =
+    /*
+      Check backend/live-data status.
+    */
+
+    const backendSignal =
       data.signal ||
       data.analysis?.signal ||
       "NO TRADE";
@@ -179,75 +250,144 @@ async function analyzeMarket() {
         0
       );
 
-    if (Number.isNaN(confidenceValue)) {
+    if (
+      Number.isNaN(
+        confidenceValue
+      )
+    ) {
       confidenceValue = 0;
     }
 
     /*
-      Safety:
-      If confidence is zero, force NO TRADE.
+      Keep confidence inside 0-100.
     */
 
-    if (confidenceValue <= 0) {
+    confidenceValue =
+      Math.max(
+        0,
+        Math.min(
+          100,
+          confidenceValue
+        )
+      );
+
+    /*
+      Normalize signal.
+    */
+
+    let direction =
+      String(
+        backendSignal
+      ).toUpperCase();
+
+    if (
+      direction !== "CALL" &&
+      direction !== "PUT"
+    ) {
+      direction =
+        "NO TRADE";
+    }
+
+    /*
+      Safety:
+      Zero confidence or NO TRADE
+      must never become CALL/PUT.
+    */
+
+    if (
+      confidenceValue <= 0 ||
+      direction === "NO TRADE"
+    ) {
       currentSignal = {
         id: Date.now(),
 
-        market: selectedMarket,
+        market:
+          selectedMarket,
 
-        pair: selectedPair,
+        pair:
+          symbol,
 
-        direction: "NO TRADE",
+        direction:
+          "NO TRADE",
 
-        confidence: 0,
+        confidence:
+          0,
 
-        entry: getTimeString(now),
+        entry:
+          getTimeString(now),
 
-        expiry: "--",
+        expiry:
+          "--",
 
-        result: "PENDING"
+        result:
+          "PENDING"
       };
 
       dataStatus.textContent =
         "LIVE DATA CONNECTED — NO TRADE";
 
-      showSignal(currentSignal);
+      showSignal(
+        currentSignal
+      );
 
-      saveSignal(currentSignal);
+      saveSignal(
+        currentSignal
+      );
 
       return;
     }
 
-    const end = new Date(
-      now.getTime() +
-      duration * 60 * 1000
-    );
+    /*
+      Create expiry time.
+    */
+
+    const end =
+      new Date(
+        now.getTime() +
+        duration *
+          60 *
+          1000
+      );
 
     currentSignal = {
       id: Date.now(),
 
-      market: selectedMarket,
+      market:
+        selectedMarket,
 
-      pair: selectedPair,
+      pair:
+        symbol,
 
-      direction: direction,
+      direction:
+        direction,
 
-      confidence: confidenceValue,
+      confidence:
+        confidenceValue,
 
-      entry: getTimeString(now),
+      entry:
+        getTimeString(now),
 
-      expiry: getTimeString(end),
+      expiry:
+        getTimeString(end),
 
-      result: "PENDING"
+      result:
+        "PENDING"
     };
 
     dataStatus.textContent =
       "LIVE DATA CONNECTED";
 
-    showSignal(currentSignal);
+    showSignal(
+      currentSignal
+    );
 
-    saveSignal(currentSignal);
+    saveSignal(
+      currentSignal
+    );
 
-    startCountdown(end);
+    startCountdown(
+      end
+    );
 
   } catch (error) {
     console.error(
@@ -276,14 +416,16 @@ async function analyzeMarket() {
     countdown.textContent =
       "--";
 
-    currentSignal = null;
+    currentSignal =
+      null;
 
     alert(
       "Unable to connect to the Render analysis server. Please try again."
     );
 
   } finally {
-    analyzeBtn.disabled = false;
+    analyzeBtn.disabled =
+      false;
   }
 }
 
@@ -299,18 +441,30 @@ function showSignal(item) {
   signal.className =
     "signal";
 
-  if (item.direction === "CALL") {
-    signal.classList.add("call");
+  if (
+    item.direction ===
+    "CALL"
+  ) {
+    signal.classList.add(
+      "call"
+    );
 
-  } else if (item.direction === "PUT") {
-    signal.classList.add("put");
+  } else if (
+    item.direction ===
+    "PUT"
+  ) {
+    signal.classList.add(
+      "put"
+    );
 
   } else {
-    signal.classList.add("neutral");
+    signal.classList.add(
+      "neutral"
+    );
   }
 
   confidence.textContent =
-    item.confidence + "%";
+    `${item.confidence}%`;
 
   entryTime.textContent =
     item.entry;
@@ -324,13 +478,21 @@ function showSignal(item) {
    COUNTDOWN
    ============================================================ */
 
-function startCountdown(endTime) {
+function startCountdown(
+  endTime
+) {
+  clearInterval(
+    countdownTimer
+  );
+
   function update() {
     const remaining =
       endTime.getTime() -
       Date.now();
 
-    if (remaining <= 0) {
+    if (
+      remaining <= 0
+    ) {
       countdown.textContent =
         "EXPIRED";
 
@@ -343,24 +505,27 @@ function startCountdown(endTime) {
 
     const seconds =
       Math.ceil(
-        remaining / 1000
+        remaining /
+          1000
       );
 
     const minutes =
       Math.floor(
-        seconds / 60
+        seconds /
+          60
       );
 
     const secs =
-      seconds % 60;
+      seconds %
+      60;
 
     countdown.textContent =
-      minutes +
-      ":" +
-      String(secs).padStart(
+      `${minutes}:${String(
+        secs
+      ).padStart(
         2,
         "0"
-      );
+      )}`;
   }
 
   update();
@@ -395,16 +560,23 @@ function getHistory() {
    SAVE SIGNAL
    ============================================================ */
 
-function saveSignal(item) {
+function saveSignal(
+  item
+) {
   const list =
     getHistory();
 
-  list.unshift(item);
+  list.unshift(
+    item
+  );
 
   localStorage.setItem(
     "po_ai_history",
     JSON.stringify(
-      list.slice(0, 50)
+      list.slice(
+        0,
+        50
+      )
     )
   );
 
@@ -420,41 +592,50 @@ function renderHistory() {
   const list =
     getHistory();
 
-  if (!list.length) {
+  if (
+    !list.length
+  ) {
     history.innerHTML =
       '<p class="empty">No signals yet.</p>';
 
   } else {
-    history.innerHTML = "";
+    history.innerHTML =
+      "";
 
-    list.forEach((item) => {
-      const div =
-        document.createElement(
-          "div"
+    list.forEach(
+      (item) => {
+        const div =
+          document.createElement(
+            "div"
+          );
+
+        div.className =
+          "history-item";
+
+        div.innerHTML = `
+          <div class="top">
+            <strong>${item.pair}</strong>
+            <strong>${item.direction}</strong>
+          </div>
+
+          <div class="bottom">
+            ${String(item.market).toUpperCase()}
+            • ${item.entry}
+            • ${item.confidence}%
+            • <span class="pending">${item.result}</span>
+          </div>
+        `;
+
+        history.appendChild(
+          div
         );
-
-      div.className =
-        "history-item";
-
-      div.innerHTML = `
-        <div class="top">
-          <strong>${item.pair}</strong>
-          <strong>${item.direction}</strong>
-        </div>
-
-        <div class="bottom">
-          ${item.market.toUpperCase()}
-          • ${item.entry}
-          • ${item.confidence}%
-          • <span class="pending">${item.result}</span>
-        </div>
-      `;
-
-      history.appendChild(div);
-    });
+      }
+    );
   }
 
-  updateStats(list);
+  updateStats(
+    list
+  );
 }
 
 
@@ -462,24 +643,30 @@ function renderHistory() {
    STATISTICS
    ============================================================ */
 
-function updateStats(list) {
+function updateStats(
+  list
+) {
   const completed =
     list.filter(
       (item) =>
-        item.result === "WIN" ||
-        item.result === "LOSS"
+        item.result ===
+          "WIN" ||
+        item.result ===
+          "LOSS"
     );
 
   const winCount =
     list.filter(
       (item) =>
-        item.result === "WIN"
+        item.result ===
+        "WIN"
     ).length;
 
   const lossCount =
     list.filter(
       (item) =>
-        item.result === "LOSS"
+        item.result ===
+        "LOSS"
     ).length;
 
   total.textContent =
@@ -491,11 +678,16 @@ function updateStats(list) {
   losses.textContent =
     lossCount;
 
-  if (completed.length > 0) {
+  if (
+    completed.length >
+    0
+  ) {
     winRate.textContent =
       Math.round(
-        (winCount /
-          completed.length) *
+        (
+          winCount /
+          completed.length
+        ) *
           100
       ) + "%";
 
