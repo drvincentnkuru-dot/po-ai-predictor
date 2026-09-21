@@ -8,57 +8,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-/*
-  ============================================================
-  PO AI PREDICTOR BACKEND V4
-  ============================================================
+/* ============================================================
+   PO AI PREDICTOR BACKEND V4
+   ============================================================ */
 
-  READ-ONLY MARKET ANALYSIS ARCHITECTURE
-
-  This backend:
-  - Does NOT log in to Pocket Option
-  - Does NOT place trades
-  - Does NOT store trading passwords
-  - Does NOT claim guaranteed predictions
-  - Uses verified market candle data when available
-  - Returns NO TRADE when data is missing or insufficient
-
-  Required environment variable for live data:
-
-      LIVE_DATA_URL=https://your-live-data-source.example/api/candles
-
-  Optional:
-
-      LIVE_DATA_INTERVAL=5000
-
-  Expected live-data response can be either:
-
-  1. Array:
-     [
-       {
-         "time": 1234567890,
-         "open": 1.1000,
-         "high": 1.1010,
-         "low": 1.0990,
-         "close": 1.1005
-       }
-     ]
-
-  2. Object:
-     {
-       "candles": [
-         {
-           "time": 1234567890,
-           "open": 1.1000,
-           "high": 1.1010,
-           "low": 1.0990,
-           "close": 1.1005
-         }
-       ]
-     }
-
-  ============================================================
-*/
 const TWELVE_DATA_API_KEY =
   process.env.TWELVE_DATA_API_KEY || "";
 
@@ -71,11 +24,8 @@ const TWELVE_DATA_INTERVAL =
 const LIVE_DATA_INTERVAL =
   Number(process.env.LIVE_DATA_INTERVAL) || 60000;
 
-
-// Maximum number of candles stored in memory
 const MAX_CANDLES = 200;
 
-// In-memory market data
 let marketData = {
   candles: [],
   status: "data_updater_required",
@@ -86,7 +36,7 @@ let marketData = {
 
 
 /* ============================================================
-   BASIC HELPERS
+   HELPERS
    ============================================================ */
 
 function number(value) {
@@ -100,25 +50,10 @@ function normalizeCandle(candle) {
     return null;
   }
 
-  const open = number(
-    candle.open ??
-    candle.o
-  );
-
-  const high = number(
-    candle.high ??
-    candle.h
-  );
-
-  const low = number(
-    candle.low ??
-    candle.l
-  );
-
-  const close = number(
-    candle.close ??
-    candle.c
-  );
+  const open = number(candle.open ?? candle.o);
+  const high = number(candle.high ?? candle.h);
+  const low = number(candle.low ?? candle.l);
+  const close = number(candle.close ?? candle.c);
 
   const time =
     candle.time ??
@@ -146,18 +81,27 @@ function normalizeCandle(candle) {
 
 
 /* ============================================================
-   LIVE DATA FETCHER
+   TWELVE DATA LIVE DATA
    ============================================================ */
 
 async function fetchLiveCandles() {
+
   if (!TWELVE_DATA_API_KEY) {
+
     marketData.status = "data_updater_required";
+
     marketData.error =
       "TWELVE_DATA_API_KEY is not configured.";
+
+    console.log(
+      "[TWELVE DATA] API key is missing."
+    );
+
     return;
   }
 
   try {
+
     const url =
       "https://api.twelvedata.com/time_series" +
       `?symbol=${encodeURIComponent(TWELVE_DATA_SYMBOL)}` +
@@ -183,7 +127,8 @@ async function fetchLiveCandles() {
 
     if (payload.status === "error") {
       throw new Error(
-        payload.message || "Twelve Data API error."
+        payload.message ||
+        "Twelve Data API error."
       );
     }
 
@@ -226,6 +171,7 @@ async function fetchLiveCandles() {
     );
 
   } catch (error) {
+
     marketData.status = "data_error";
     marketData.error = error.message;
 
@@ -242,6 +188,7 @@ async function fetchLiveCandles() {
    ============================================================ */
 
 function calculateEMA(values, period) {
+
   if (values.length < period) {
     return null;
   }
@@ -251,12 +198,21 @@ function calculateEMA(values, period) {
   let ema =
     values
       .slice(0, period)
-      .reduce((sum, value) => sum + value, 0) /
-    period;
+      .reduce(
+        (sum, value) => sum + value,
+        0
+      ) / period;
 
-  for (let i = period; i < values.length; i++) {
+  for (
+    let i = period;
+    i < values.length;
+    i++
+  ) {
+
     ema =
-      (values[i] - ema) * multiplier + ema;
+      (values[i] - ema) *
+      multiplier +
+      ema;
   }
 
   return ema;
@@ -264,6 +220,7 @@ function calculateEMA(values, period) {
 
 
 function calculateRSI(values, period = 14) {
+
   if (values.length <= period) {
     return null;
   }
@@ -271,7 +228,12 @@ function calculateRSI(values, period = 14) {
   let gains = 0;
   let losses = 0;
 
-  for (let i = 1; i <= period; i++) {
+  for (
+    let i = 1;
+    i <= period;
+    i++
+  ) {
+
     const difference =
       values[i] - values[i - 1];
 
@@ -285,7 +247,12 @@ function calculateRSI(values, period = 14) {
   let averageGain = gains / period;
   let averageLoss = losses / period;
 
-  for (let i = period + 1; i < values.length; i++) {
+  for (
+    let i = period + 1;
+    i < values.length;
+    i++
+  ) {
+
     const difference =
       values[i] - values[i - 1];
 
@@ -293,15 +260,21 @@ function calculateRSI(values, period = 14) {
       difference > 0 ? difference : 0;
 
     const loss =
-      difference < 0 ? Math.abs(difference) : 0;
+      difference < 0
+        ? Math.abs(difference)
+        : 0;
 
     averageGain =
-      (averageGain * (period - 1) + gain) /
-      period;
+      (
+        averageGain * (period - 1) +
+        gain
+      ) / period;
 
     averageLoss =
-      (averageLoss * (period - 1) + loss) /
-      period;
+      (
+        averageLoss * (period - 1) +
+        loss
+      ) / period;
   }
 
   if (averageLoss === 0) {
@@ -318,7 +291,11 @@ function calculateRSI(values, period = 14) {
 }
 
 
-function calculateMomentum(values, period = 5) {
+function calculateMomentum(
+  values,
+  period = 5
+) {
+
   if (values.length <= period) {
     return null;
   }
@@ -335,17 +312,15 @@ function calculateMomentum(values, period = 5) {
    ============================================================ */
 
 function analyzeMarket() {
+
   const candles = marketData.candles;
 
-  /*
-    We require enough candles before producing
-    an analysis.
-  */
-
   if (marketData.status !== "live") {
+
     return {
       status: marketData.status,
       signal: "NO TRADE",
+      confidence: 0,
       reason:
         "Verified live market data is not available.",
       dataRequired: true
@@ -353,9 +328,11 @@ function analyzeMarket() {
   }
 
   if (candles.length < 30) {
+
     return {
       status: "insufficient_data",
       signal: "NO TRADE",
+      confidence: 0,
       reason:
         "At least 30 valid candles are required for analysis.",
       candlesAvailable: candles.length
@@ -366,10 +343,25 @@ function analyzeMarket() {
     candle => candle.close
   );
 
-  const ema9 = calculateEMA(closes, 9);
-  const ema21 = calculateEMA(closes, 21);
-  const rsi14 = calculateRSI(closes, 14);
-  const momentum = calculateMomentum(closes, 5);
+  const ema9 = calculateEMA(
+    closes,
+    9
+  );
+
+  const ema21 = calculateEMA(
+    closes,
+    21
+  );
+
+  const rsi14 = calculateRSI(
+    closes,
+    14
+  );
+
+  const momentum = calculateMomentum(
+    closes,
+    5
+  );
 
   const currentPrice =
     closes[closes.length - 1];
@@ -380,25 +372,22 @@ function analyzeMarket() {
     rsi14 === null ||
     momentum === null
   ) {
+
     return {
       status: "insufficient_data",
       signal: "NO TRADE",
+      confidence: 0,
       reason:
         "Technical indicators could not be calculated."
     };
   }
 
-  /*
-    Conservative rule-based analysis.
-
-    This is NOT a guaranteed prediction model.
-    It only interprets the available market data.
-  */
-
   let bullishScore = 0;
   let bearishScore = 0;
 
-  // EMA trend
+
+  /* EMA */
+
   if (ema9 > ema21) {
     bullishScore++;
   }
@@ -407,16 +396,26 @@ function analyzeMarket() {
     bearishScore++;
   }
 
-  // RSI
-  if (rsi14 > 50 && rsi14 < 70) {
+
+  /* RSI */
+
+  if (
+    rsi14 > 50 &&
+    rsi14 < 70
+  ) {
     bullishScore++;
   }
 
-  if (rsi14 < 50 && rsi14 > 30) {
+  if (
+    rsi14 < 50 &&
+    rsi14 > 30
+  ) {
     bearishScore++;
   }
 
-  // Momentum
+
+  /* MOMENTUM */
+
   if (momentum > 0) {
     bullishScore++;
   }
@@ -425,12 +424,8 @@ function analyzeMarket() {
     bearishScore++;
   }
 
-  let signal = "NO TRADE";
 
-  /*
-    Require a clear majority before producing
-    CALL or PUT.
-  */
+  let signal = "NO TRADE";
 
   if (
     bullishScore >= 3 &&
@@ -446,19 +441,22 @@ function analyzeMarket() {
     signal = "PUT";
   }
 
+
   const confidence =
     signal === "NO TRADE"
       ? 0
       : Math.round(
-          (Math.max(
-            bullishScore,
-            bearishScore
-          ) /
-            3) *
-            100
+          (
+            Math.max(
+              bullishScore,
+              bearishScore
+            ) / 3
+          ) * 100
         );
 
+
   return {
+
     status: "analyzed",
 
     signal,
@@ -468,14 +466,26 @@ function analyzeMarket() {
     market: {
       currentPrice,
       candles: candles.length,
-      lastUpdate: marketData.lastUpdate
+      lastUpdate: marketData.lastUpdate,
+      source: marketData.source
     },
 
     indicators: {
-      ema9: Number(ema9.toFixed(8)),
-      ema21: Number(ema21.toFixed(8)),
-      rsi14: Number(rsi14.toFixed(2)),
-      momentum: Number(momentum.toFixed(8))
+      ema9: Number(
+        ema9.toFixed(8)
+      ),
+
+      ema21: Number(
+        ema21.toFixed(8)
+      ),
+
+      rsi14: Number(
+        rsi14.toFixed(2)
+      ),
+
+      momentum: Number(
+        momentum.toFixed(8)
+      )
     },
 
     scores: {
@@ -497,187 +507,368 @@ function analyzeMarket() {
    API: HEALTH
    ============================================================ */
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "PO AI Predictor Backend",
-    version: "4.0.0",
-    liveDataConfigured: Boolean(LIVE_DATA_URL),
-    marketDataStatus: marketData.status,
-    timestamp: new Date().toISOString()
-  });
-});
+app.get(
+  "/api/health",
+  (req, res) => {
+
+    res.json({
+
+      status: "ok",
+
+      service:
+        "PO AI Predictor Backend",
+
+      version:
+        "4.0.0",
+
+      liveDataConfigured:
+        Boolean(
+          TWELVE_DATA_API_KEY
+        ),
+
+      marketDataStatus:
+        marketData.status,
+
+      source:
+        marketData.source,
+
+      lastUpdate:
+        marketData.lastUpdate,
+
+      timestamp:
+        new Date().toISOString()
+    });
+  }
+);
 
 
 /* ============================================================
    API: CANDLES
    ============================================================ */
 
-app.get("/api/candles", (req, res) => {
-  if (marketData.status !== "live") {
-    return res.status(503).json({
-      status: marketData.status,
-      candles: [],
-      message:
-        marketData.error ||
-        "Verified live candle data is not available."
+app.get(
+  "/api/candles",
+  (req, res) => {
+
+    if (
+      marketData.status !== "live"
+    ) {
+
+      return res.status(503).json({
+
+        status:
+          marketData.status,
+
+        candles: [],
+
+        message:
+          marketData.error ||
+          "Verified live candle data is not available."
+      });
+    }
+
+    res.json({
+
+      status: "live",
+
+      count:
+        marketData.candles.length,
+
+      lastUpdate:
+        marketData.lastUpdate,
+
+      source:
+        marketData.source,
+
+      candles:
+        marketData.candles
     });
   }
+);
 
-  res.json({
-    status: "live",
-    count: marketData.candles.length,
-    lastUpdate: marketData.lastUpdate,
-    candles: marketData.candles
-  });
-});
+
+/* ============================================================
+   API: ANALYZE
+   ============================================================ */
+
+app.post(
+  "/analyze",
+  (req, res) => {
+
+    const analysis =
+      analyzeMarket();
+
+    if (
+      analysis.status !== "analyzed"
+    ) {
+
+      return res.status(503).json({
+
+        status:
+          analysis.status,
+
+        signal:
+          "NO TRADE",
+
+        confidence:
+          0,
+
+        timestamp:
+          new Date().toISOString(),
+
+        message:
+          analysis.reason ||
+          "Live market data is not available."
+      });
+    }
+
+    res.json({
+
+      status:
+        "ready",
+
+      signal:
+        analysis.signal,
+
+      confidence:
+        analysis.confidence,
+
+      timestamp:
+        new Date().toISOString(),
+
+      analysis
+    });
+  }
+);
 
 
 /* ============================================================
    API: MARKET ANALYSIS
    ============================================================ */
 
-app.get("/api/market-analysis", (req, res) => {
-  const analysis = analyzeMarket();
+app.get(
+  "/api/market-analysis",
+  (req, res) => {
 
-  if (
-    analysis.signal === "NO TRADE" &&
-    analysis.dataRequired
-  ) {
-    return res.status(503).json(analysis);
+    const analysis =
+      analyzeMarket();
+
+    if (
+      analysis.signal === "NO TRADE" &&
+      analysis.dataRequired
+    ) {
+
+      return res.status(503).json(
+        analysis
+      );
+    }
+
+    res.json(
+      analysis
+    );
   }
-
-  res.json(analysis);
-});
+);
 
 
 /* ============================================================
    API: SIGNAL
    ============================================================ */
 
-app.get("/api/signal", (req, res) => {
-  const analysis = analyzeMarket();
+app.get(
+  "/api/signal",
+  (req, res) => {
 
-  /*
-    Never expose CALL/PUT when live data is missing.
-  */
+    const analysis =
+      analyzeMarket();
 
-  if (
-    analysis.status !== "analyzed"
-  ) {
-    return res.status(503).json({
-      status: analysis.status,
-      signal: "NO TRADE",
-      message:
-        analysis.reason ||
-        "Signal disabled until valid market data is available."
+    if (
+      analysis.status !== "analyzed"
+    ) {
+
+      return res.status(503).json({
+
+        status:
+          analysis.status,
+
+        signal:
+          "NO TRADE",
+
+        confidence:
+          0,
+
+        message:
+          analysis.reason ||
+          "Signal disabled until valid market data is available."
+      });
+    }
+
+    res.json({
+
+      status:
+        "ready",
+
+      signal:
+        analysis.signal,
+
+      confidence:
+        analysis.confidence,
+
+      timestamp:
+        new Date().toISOString(),
+
+      analysis
     });
   }
-
-  res.json({
-    status: "ready",
-    signal: analysis.signal,
-    confidence: analysis.confidence,
-    timestamp: new Date().toISOString(),
-    analysis
-  });
-});
+);
 
 
 /* ============================================================
    API: RESULT
    ============================================================ */
 
-app.post("/api/result", (req, res) => {
-  const {
-    signal,
-    result,
-    timestamp
-  } = req.body || {};
+app.post(
+  "/api/result",
+  (req, res) => {
 
-  res.json({
-    status: "received",
-    signal: signal || null,
-    result: result || null,
-    timestamp:
-      timestamp ||
-      new Date().toISOString(),
+    const {
+      signal,
+      result,
+      timestamp
+    } = req.body || {};
 
-    message:
-      "Result received. Persistent performance storage is not enabled."
-  });
-});
+    res.json({
+
+      status:
+        "received",
+
+      signal:
+        signal || null,
+
+      result:
+        result || null,
+
+      timestamp:
+        timestamp ||
+        new Date().toISOString(),
+
+      message:
+        "Result received. Persistent performance storage is not enabled."
+    });
+  }
+);
 
 
 /* ============================================================
    API: STATISTICS
    ============================================================ */
 
-app.get("/api/statistics", (req, res) => {
-  res.json({
-    total: 0,
-    wins: 0,
-    losses: 0,
-    winRate: 0,
-    status:
-      "Statistics storage is not enabled."
-  });
-});
+app.get(
+  "/api/statistics",
+  (req, res) => {
+
+    res.json({
+
+      total: 0,
+
+      wins: 0,
+
+      losses: 0,
+
+      winRate: 0,
+
+      status:
+        "Statistics storage is not enabled."
+    });
+  }
+);
 
 
 /* ============================================================
    ROOT
    ============================================================ */
 
-app.get("/", (req, res) => {
-  res.json({
-    service: "PO AI Predictor Backend",
-    version: "4.0.0",
-    status: "online",
+app.get(
+  "/",
+  (req, res) => {
 
-    endpoints: {
-      health: "/api/health",
-      candles: "/api/candles",
-      marketAnalysis: "/api/market-analysis",
-      signal: "/api/signal",
-      statistics: "/api/statistics"
-    },
+    res.json({
 
-    marketDataStatus:
-      marketData.status
-  });
-});
+      service:
+        "PO AI Predictor Backend",
+
+      version:
+        "4.0.0",
+
+      status:
+        "online",
+
+      endpoints: {
+
+        health:
+          "/api/health",
+
+        candles:
+          "/api/candles",
+
+        analyze:
+          "/analyze",
+
+        marketAnalysis:
+          "/api/market-analysis",
+
+        signal:
+          "/api/signal",
+
+        statistics:
+          "/api/statistics"
+      },
+
+      marketDataStatus:
+        marketData.status,
+
+      source:
+        marketData.source
+    });
+  }
+);
 
 
 /* ============================================================
    START SERVER
    ============================================================ */
 
-app.listen(PORT, () => {
-  console.log(
-    `PO AI Predictor backend running on port ${PORT}`
-  );
-
-  if (TWELVE_DATA_API_KEY) {
-    console.log(
-      "Twelve Data live data updater configured."
-    );
-
-    // First update immediately
-    fetchLiveCandles();
-
-    // Continue updating
-    setInterval(
-      fetchLiveCandles,
-      LIVE_DATA_INTERVAL
-    );
-  } else {
-    console.log(
-      "WARNING: TWELVE_DATA_API_KEY is not configured."
-    );
+app.listen(
+  PORT,
+  () => {
 
     console.log(
-      "Market analysis will remain NO TRADE until Twelve Data is connected."
+      `PO AI Predictor backend running on port ${PORT}`
     );
+
+    if (
+      TWELVE_DATA_API_KEY
+    ) {
+
+      console.log(
+        "Twelve Data live data updater configured."
+      );
+
+      fetchLiveCandles();
+
+      setInterval(
+        fetchLiveCandles,
+        LIVE_DATA_INTERVAL
+      );
+
+    } else {
+
+      console.log(
+        "WARNING: TWELVE_DATA_API_KEY is not configured."
+      );
+
+      console.log(
+        "Market analysis will remain NO TRADE until Twelve Data is connected."
+      );
+    }
   }
-});
+);
