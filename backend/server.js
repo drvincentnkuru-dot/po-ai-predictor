@@ -59,10 +59,18 @@ const PORT = process.env.PORT || 3000;
 
   ============================================================
 */
+const TWELVE_DATA_API_KEY =
+  process.env.TWELVE_DATA_API_KEY || "";
 
-const LIVE_DATA_URL = process.env.LIVE_DATA_URL || "";
+const TWELVE_DATA_SYMBOL =
+  process.env.TWELVE_DATA_SYMBOL || "EUR/USD";
+
+const TWELVE_DATA_INTERVAL =
+  process.env.TWELVE_DATA_INTERVAL || "1min";
+
 const LIVE_DATA_INTERVAL =
-  Number(process.env.LIVE_DATA_INTERVAL) || 5000;
+  Number(process.env.LIVE_DATA_INTERVAL) || 60000;
+
 
 // Maximum number of candles stored in memory
 const MAX_CANDLES = 200;
@@ -142,14 +150,23 @@ function normalizeCandle(candle) {
    ============================================================ */
 
 async function fetchLiveCandles() {
-  if (!LIVE_DATA_URL) {
+  if (!TWELVE_DATA_API_KEY) {
     marketData.status = "data_updater_required";
-    marketData.error = "LIVE_DATA_URL is not configured.";
+    marketData.error =
+      "TWELVE_DATA_API_KEY is not configured.";
     return;
   }
 
   try {
-    const response = await fetch(LIVE_DATA_URL, {
+    const url =
+      "https://api.twelvedata.com/time_series" +
+      `?symbol=${encodeURIComponent(TWELVE_DATA_SYMBOL)}` +
+      `&interval=${encodeURIComponent(TWELVE_DATA_INTERVAL)}` +
+      "&outputsize=100" +
+      "&timezone=UTC" +
+      `&apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
+
+    const response = await fetch(url, {
       method: "GET",
       headers: {
         Accept: "application/json"
@@ -158,34 +175,41 @@ async function fetchLiveCandles() {
 
     if (!response.ok) {
       throw new Error(
-        `Live data source returned HTTP ${response.status}`
+        `Twelve Data returned HTTP ${response.status}`
       );
     }
 
     const payload = await response.json();
 
-    let rawCandles = [];
-
-    if (Array.isArray(payload)) {
-      rawCandles = payload;
-    } else if (Array.isArray(payload.candles)) {
-      rawCandles = payload.candles;
-    } else if (Array.isArray(payload.data)) {
-      rawCandles = payload.data;
-    } else {
+    if (payload.status === "error") {
       throw new Error(
-        "Live data response does not contain a recognized candle array."
+        payload.message || "Twelve Data API error."
       );
     }
 
-    const normalized = rawCandles
-      .map(normalizeCandle)
+    if (!Array.isArray(payload.values)) {
+      throw new Error(
+        "Twelve Data response does not contain values."
+      );
+    }
+
+    const normalized = payload.values
+      .map(candle =>
+        normalizeCandle({
+          time: candle.datetime,
+          open: candle.open,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close
+        })
+      )
       .filter(Boolean)
+      .reverse()
       .slice(-MAX_CANDLES);
 
     if (normalized.length === 0) {
       throw new Error(
-        "Live data source returned no valid candles."
+        "Twelve Data returned no valid candles."
       );
     }
 
@@ -193,12 +217,12 @@ async function fetchLiveCandles() {
       candles: normalized,
       status: "live",
       lastUpdate: new Date().toISOString(),
-      source: LIVE_DATA_URL,
+      source: "Twelve Data",
       error: null
     };
 
     console.log(
-      `[LIVE DATA] Updated ${normalized.length} candles`
+      `[TWELVE DATA] Updated ${normalized.length} candles for ${TWELVE_DATA_SYMBOL}`
     );
 
   } catch (error) {
@@ -206,7 +230,7 @@ async function fetchLiveCandles() {
     marketData.error = error.message;
 
     console.error(
-      "[LIVE DATA ERROR]",
+      "[TWELVE DATA ERROR]",
       error.message
     );
   }
