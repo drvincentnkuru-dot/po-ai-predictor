@@ -10,18 +10,19 @@ const PORT = process.env.PORT || 3000;
 
 /*
   =========================================================
-  PO AI PREDICTOR BACKEND V5.2
-  LIVE + OTC MARKET DATA ARCHITECTURE
+  PO AI PREDICTOR BACKEND V5.3
+  LIVE + OTC MARKET DATA
 
   LIVE DATA:
   Twelve Data
 
   OTC DATA:
-  Configurable external OTC data source
+  OTCharts
 
   IMPORTANT:
-  No demo/random OTC candles are generated.
-  OTC requires a real configured data source.
+  - No random/demo OTC candles
+  - OTC uses OTCHARTS_API_KEY
+  - API keys remain in Render Environment Variables
   =========================================================
 */
 
@@ -43,54 +44,23 @@ const LIVE_DATA_INTERVAL =
   Number(process.env.LIVE_DATA_INTERVAL) || 60000;
 
 
-/*
-  OTC DATA SOURCE
+/* =========================================================
+   OTCHARTS CONFIGURATION
+========================================================= */
 
-  Example:
+const OTCHARTS_API_KEY =
+  process.env.OTCHARTS_API_KEY || "";
 
-  OTC_DATA_URL=https://your-otc-provider.com/api/candles
+const OTCHARTS_VENUE =
+  process.env.OTCHARTS_VENUE || "otc";
 
-  OTC_DATA_API_KEY=your_key
+const OTCHARTS_TIMEFRAME =
+  Number(process.env.OTCHARTS_TIMEFRAME) || 60;
 
-  The OTC provider should return candles in one of
-  these forms:
 
-  {
-    "values": [
-      {
-        "datetime": "...",
-        "open": "...",
-        "high": "...",
-        "low": "...",
-        "close": "..."
-      }
-    ]
-  }
-
-  OR:
-
-  {
-    "candles": [
-      {
-        "time": "...",
-        "open": "...",
-        "high": "...",
-        "low": "...",
-        "close": "..."
-      }
-    ]
-  }
-*/
-
-const OTC_DATA_URL =
-  process.env.OTC_DATA_URL || "";
-
-const OTC_DATA_API_KEY =
-  process.env.OTC_DATA_API_KEY || "";
-
-const OTC_DATA_INTERVAL =
-  process.env.OTC_DATA_INTERVAL || "1min";
-
+/* =========================================================
+   GENERAL CONFIGURATION
+========================================================= */
 
 const MAX_CANDLES = 200;
 
@@ -116,12 +86,6 @@ const SUPPORTED_LIVE_PAIRS = new Set([
 ]);
 
 
-/*
-  OTC frontend pairs.
-
-  These are the same currency pairs but with OTC suffix.
-*/
-
 const SUPPORTED_OTC_PAIRS = new Set([
   "EUR/USD",
   "GBP/USD",
@@ -136,14 +100,9 @@ const SUPPORTED_OTC_PAIRS = new Set([
 ]);
 
 
-/*
-  Separate storage for LIVE and OTC.
-
-  Example:
-
-  LIVE:EUR/USD
-  OTC:EUR/USD
-*/
+/* =========================================================
+   MARKET DATA STORAGE
+========================================================= */
 
 const marketData = new Map();
 
@@ -162,17 +121,6 @@ function number(value) {
 }
 
 
-/*
-  IMPORTANT:
-
-  We preserve the space before OTC.
-
-  EUR/USD OTC
-  EUR/USD
-
-  are handled correctly.
-*/
-
 function normalizeSymbol(value) {
 
   if (!value) {
@@ -186,16 +134,6 @@ function normalizeSymbol(value) {
 }
 
 
-/*
-  Detect OTC.
-
-  Supports:
-
-  EUR/USD OTC
-  EUR/USDOTC
-  eur/usd otc
-*/
-
 function isOTCPair(symbol) {
 
   return /OTC$/i.test(
@@ -203,10 +141,6 @@ function isOTCPair(symbol) {
   );
 }
 
-
-/*
-  Remove OTC suffix safely.
-*/
 
 function cleanPair(symbol) {
 
@@ -218,12 +152,6 @@ function cleanPair(symbol) {
 }
 
 
-/*
-  Convert:
-
-  EUR/USD OTC -> EUR/USD
-*/
-
 function getMarketType(symbol) {
 
   return isOTCPair(symbol)
@@ -231,18 +159,6 @@ function getMarketType(symbol) {
     : "LIVE";
 }
 
-
-/*
-  Unique storage key.
-
-  This prevents:
-
-  LIVE EUR/USD
-
-  from sharing candles with:
-
-  OTC EUR/USD
-*/
 
 function getStorageKey(symbol) {
 
@@ -416,10 +332,10 @@ function normalizeCandle(candle) {
 
 
 /* =========================================================
-   NORMALIZE API RESPONSE
+   TWELVE DATA RESPONSE NORMALIZATION
 ========================================================= */
 
-function normalizeProviderCandles(payload) {
+function normalizeTwelveDataCandles(payload) {
 
   if (
     !payload ||
@@ -430,67 +346,58 @@ function normalizeProviderCandles(payload) {
   }
 
 
-  /*
-    Provider format #1
-
-    {
-      values: [...]
-    }
-  */
-
-  let rawCandles =
-    Array.isArray(payload.values)
-      ? payload.values
-      : null;
-
-
-  /*
-    Provider format #2
-
-    {
-      candles: [...]
-    }
-  */
-
-  if (!rawCandles) {
-
-    rawCandles =
-      Array.isArray(payload.candles)
-        ? payload.candles
-        : null;
-  }
-
-
-  /*
-    Provider format #3
-
-    {
-      data: [...]
-    }
-  */
-
-  if (!rawCandles) {
-
-    rawCandles =
-      Array.isArray(payload.data)
-        ? payload.data
-        : null;
-  }
-
-
-  if (!rawCandles) {
+  if (
+    !Array.isArray(
+      payload.values
+    )
+  ) {
 
     return [];
   }
 
 
-  return rawCandles
+  return payload.values
     .map(
       candle =>
         normalizeCandle(candle)
     )
     .filter(Boolean)
     .reverse()
+    .slice(-MAX_CANDLES);
+}
+
+
+/* =========================================================
+   OTCHARTS RESPONSE NORMALIZATION
+========================================================= */
+
+function normalizeOTChartsCandles(payload) {
+
+  if (
+    !payload ||
+    typeof payload !== "object"
+  ) {
+
+    return [];
+  }
+
+
+  if (
+    !Array.isArray(
+      payload.candles
+    )
+  ) {
+
+    return [];
+  }
+
+
+  return payload.candles
+    .map(
+      candle =>
+        normalizeCandle(candle)
+    )
+    .filter(Boolean)
     .slice(-MAX_CANDLES);
 }
 
@@ -515,6 +422,9 @@ async function fetchLiveCandles(symbol) {
 
     data.error =
       "TWELVE_DATA_API_KEY is not configured.";
+
+    data.source =
+      null;
 
     return data;
   }
@@ -585,7 +495,7 @@ async function fetchLiveCandles(symbol) {
 
 
     const normalized =
-      normalizeProviderCandles(
+      normalizeTwelveDataCandles(
         payload
       );
 
@@ -650,7 +560,7 @@ async function fetchLiveCandles(symbol) {
 
 
 /* =========================================================
-   OTC DATA
+   OTC DATA - OTCHARTS
 ========================================================= */
 
 async function fetchOTCCandles(symbol) {
@@ -661,10 +571,6 @@ async function fetchOTCCandles(symbol) {
   const data =
     getMarketData(symbol);
 
-
-  /*
-    Check supported OTC pair.
-  */
 
   if (
     !isSupportedOTCPair(
@@ -682,19 +588,13 @@ async function fetchOTCCandles(symbol) {
   }
 
 
-  /*
-    OTC source must be configured.
-
-    We do NOT generate demo/random candles.
-  */
-
-  if (!OTC_DATA_URL) {
+  if (!OTCHARTS_API_KEY) {
 
     data.status =
       "data_updater_required";
 
     data.error =
-      "OTC_DATA_URL is not configured.";
+      "OTCHARTS_API_KEY is not configured.";
 
     data.source =
       null;
@@ -706,95 +606,33 @@ async function fetchOTCCandles(symbol) {
   try {
 
     /*
-      Allow the provider URL to contain:
+      Convert:
 
-      {symbol}
-      {interval}
+      EUR/USD
 
-      Example:
+      into:
 
-      https://provider.com/candles/{symbol}?interval={interval}
+      EURUSD_otc
     */
 
-    let url =
-      OTC_DATA_URL
-        .replace(
-          "{symbol}",
-          encodeURIComponent(
-            cleanSymbol
-          )
-        )
-        .replace(
-          "{interval}",
-          encodeURIComponent(
-            OTC_DATA_INTERVAL
-          )
-        );
+    const otcSymbol =
+      cleanSymbol.replace(
+        "/",
+        ""
+      ) + "_otc";
 
 
-    /*
-      If placeholders were not used,
-      append normal query parameters.
-    */
-
-    if (
-      !OTC_DATA_URL.includes(
-        "{symbol}"
-      )
-    ) {
-
-      const separator =
-        url.includes("?")
-          ? "&"
-          : "?";
-
-      url +=
-        `${separator}symbol=${encodeURIComponent(cleanSymbol)}`;
-    }
+    const url =
+      "https://otcharts.com/v1/candles" +
+      `?venue=${encodeURIComponent(OTCHARTS_VENUE)}` +
+      `&symbol=${encodeURIComponent(otcSymbol)}` +
+      `&tf=${encodeURIComponent(OTCHARTS_TIMEFRAME)}` +
+      "&limit=100";
 
 
-    if (
-      !OTC_DATA_URL.includes(
-        "{interval}"
-      )
-    ) {
-
-      const separator =
-        url.includes("?")
-          ? "&"
-          : "?";
-
-      url +=
-        `${separator}interval=${encodeURIComponent(OTC_DATA_INTERVAL)}`;
-    }
-
-
-    /*
-      API key is optional.
-
-      If configured, send it as:
-
-      x-api-key
-      and Authorization Bearer
-
-      This supports common provider formats.
-    */
-
-    const headers = {
-
-      Accept:
-        "application/json"
-    };
-
-
-    if (OTC_DATA_API_KEY) {
-
-      headers["x-api-key"] =
-        OTC_DATA_API_KEY;
-
-      headers["Authorization"] =
-        `Bearer ${OTC_DATA_API_KEY}`;
-    }
+    console.log(
+      `[OTCHARTS REQUEST] ${cleanSymbol} -> ${otcSymbol}`
+    );
 
 
     const response =
@@ -802,15 +640,59 @@ async function fetchOTCCandles(symbol) {
         url,
         {
           method: "GET",
-          headers
+
+          headers: {
+
+            Accept:
+              "application/json",
+
+            Authorization:
+              `Bearer ${OTCHARTS_API_KEY}`,
+
+            "User-Agent":
+              "PO-AI-Predictor/5.3"
+          }
         }
       );
 
 
     if (!response.ok) {
 
+      let errorMessage =
+        `OTCharts returned HTTP ${response.status}`;
+
+
+      try {
+
+        const errorPayload =
+          await response.json();
+
+
+        if (
+          errorPayload?.error
+        ) {
+
+          errorMessage =
+            `${errorMessage}: ${errorPayload.error}`;
+        }
+
+
+        if (
+          errorPayload?.message
+        ) {
+
+          errorMessage =
+            `${errorMessage}: ${errorPayload.message}`;
+        }
+
+      } catch (_) {
+
+        // Ignore non-JSON error response.
+      }
+
+
       throw new Error(
-        `OTC data source returned HTTP ${response.status}`
+        errorMessage
       );
     }
 
@@ -819,23 +701,8 @@ async function fetchOTCCandles(symbol) {
       await response.json();
 
 
-    /*
-      Check common provider errors.
-    */
-
-    if (
-      payload.status === "error"
-    ) {
-
-      throw new Error(
-        payload.message ||
-        "OTC provider returned an error."
-      );
-    }
-
-
     const normalized =
-      normalizeProviderCandles(
+      normalizeOTChartsCandles(
         payload
       );
 
@@ -845,7 +712,7 @@ async function fetchOTCCandles(symbol) {
     ) {
 
       throw new Error(
-        "OTC provider returned no valid candles."
+        "OTCharts returned no valid candles."
       );
     }
 
@@ -860,7 +727,7 @@ async function fetchOTCCandles(symbol) {
       new Date().toISOString();
 
     data.source =
-      "Configured OTC Data Source";
+      "OTCharts";
 
     data.type =
       "OTC";
@@ -873,7 +740,7 @@ async function fetchOTCCandles(symbol) {
 
 
     console.log(
-      `[OTC DATA] ${cleanSymbol} updated: ${normalized.length} candles`
+      `[OTCHARTS] ${cleanSymbol}: ${normalized.length} candles`
     );
 
 
@@ -889,7 +756,7 @@ async function fetchOTCCandles(symbol) {
 
 
     console.error(
-      `[OTC DATA ERROR] ${cleanSymbol}:`,
+      `[OTCHARTS ERROR] ${cleanSymbol}:`,
       error.message
     );
 
@@ -905,16 +772,9 @@ async function fetchOTCCandles(symbol) {
 
 async function getFreshMarketData(symbol) {
 
-  const cleanSymbol =
-    cleanPair(symbol);
-
   const data =
     getMarketData(symbol);
 
-
-  /*
-    Use cache if still fresh.
-  */
 
   if (
     data.status === "live" &&
@@ -937,10 +797,6 @@ async function getFreshMarketData(symbol) {
   }
 
 
-  /*
-    OTC
-  */
-
   if (
     isOTCPair(symbol)
   ) {
@@ -950,10 +806,6 @@ async function getFreshMarketData(symbol) {
     );
   }
 
-
-  /*
-    LIVE
-  */
 
   return await fetchLiveCandles(
     symbol
@@ -1213,10 +1065,6 @@ function analyzeMarket(symbol) {
     getMarketData(symbol);
 
 
-  /*
-    Pair validation
-  */
-
   if (
     marketType === "LIVE" &&
     !isSupportedLivePair(
@@ -1271,10 +1119,6 @@ function analyzeMarket(symbol) {
   }
 
 
-  /*
-    Live / OTC data validation
-  */
-
   if (
     data.status !== "live"
   ) {
@@ -1316,10 +1160,6 @@ function analyzeMarket(symbol) {
     data.candles;
 
 
-  /*
-    Minimum candles
-  */
-
   if (
     candles.length < 30
   ) {
@@ -1359,10 +1199,6 @@ function analyzeMarket(symbol) {
         candle.close
     );
 
-
-  /*
-    Indicators
-  */
 
   const ema9 =
     calculateEMA(
@@ -1411,10 +1247,6 @@ function analyzeMarket(symbol) {
     );
 
 
-  /*
-    Indicator validation
-  */
-
   if (
     ema9 === null ||
     ema21 === null ||
@@ -1450,10 +1282,6 @@ function analyzeMarket(symbol) {
   const reasons = [];
 
 
-  /*
-    EMA
-  */
-
   if (
     ema9 > ema21
   ) {
@@ -1475,10 +1303,6 @@ function analyzeMarket(symbol) {
     );
   }
 
-
-  /*
-    RSI
-  */
 
   if (
     rsi14 >= 52 &&
@@ -1503,10 +1327,6 @@ function analyzeMarket(symbol) {
     );
   }
 
-
-  /*
-    Momentum
-  */
 
   const momentumThreshold =
     0.003;
@@ -1547,10 +1367,6 @@ function analyzeMarket(symbol) {
     0;
 
 
-  /*
-    3 / 3
-  */
-
   if (
     bullishScore === 3 &&
     bearishScore === 0
@@ -1572,14 +1388,8 @@ function analyzeMarket(symbol) {
 
     confidence =
       90;
-  }
 
-
-  /*
-    2 / 3
-  */
-
-  else if (
+  } else if (
     bullishScore === 2 &&
     bearishScore === 0
   ) {
@@ -1600,14 +1410,8 @@ function analyzeMarket(symbol) {
 
     confidence =
       70;
-  }
 
-
-  /*
-    Mixed
-  */
-
-  else {
+  } else {
 
     signal =
       "NO TRADE";
@@ -1646,10 +1450,6 @@ function analyzeMarket(symbol) {
         : "Moderate bearish alignment: 2 of 3 indicators agree.";
   }
 
-
-  /* =======================================================
-     RETURN
-  ======================================================= */
 
   return {
 
@@ -1793,7 +1593,7 @@ app.get(
         "PO AI Predictor Backend",
 
       version:
-        "5.2.0",
+        "5.3.0",
 
       liveDataConfigured:
         Boolean(
@@ -1802,8 +1602,11 @@ app.get(
 
       otcDataConfigured:
         Boolean(
-          OTC_DATA_URL
+          OTCHARTS_API_KEY
         ),
+
+      otcProvider:
+        "OTCharts",
 
       defaultSymbol:
         DEFAULT_SYMBOL,
@@ -1811,8 +1614,11 @@ app.get(
       liveInterval:
         TWELVE_DATA_INTERVAL,
 
-      otcInterval:
-        OTC_DATA_INTERVAL,
+      otcVenue:
+        OTCHARTS_VENUE,
+
+      otcTimeframe:
+        OTCHARTS_TIMEFRAME,
 
       symbols,
 
@@ -2051,14 +1857,6 @@ app.get(
     );
 
 
-    /*
-      Get either:
-
-      LIVE data
-      OR
-      OTC data
-    */
-
     await getFreshMarketData(
       requestedPair
     );
@@ -2200,7 +1998,7 @@ app.get(
         "PO AI Predictor Backend",
 
       version:
-        "5.2.0",
+        "5.3.0",
 
       status:
         "online",
@@ -2245,15 +2043,29 @@ app.get(
           SUPPORTED_OTC_PAIRS
         ),
 
-      otcDataConfigured:
+      liveDataConfigured:
         Boolean(
-          OTC_DATA_URL
+          TWELVE_DATA_API_KEY
         ),
 
+      otcDataConfigured:
+        Boolean(
+          OTCHARTS_API_KEY
+        ),
+
+      otcProvider:
+        "OTCharts",
+
+      otcVenue:
+        OTCHARTS_VENUE,
+
+      otcTimeframe:
+        OTCHARTS_TIMEFRAME,
+
       otcMessage:
-        OTC_DATA_URL
-          ? "OTC data source configured."
-          : "OTC_DATA_URL is not configured. OTC signals remain NO TRADE."
+        OTCHARTS_API_KEY
+          ? "OTCharts OTC data source configured."
+          : "OTCHARTS_API_KEY is not configured. OTC signals remain NO TRADE."
     });
   }
 );
@@ -2292,7 +2104,7 @@ app.listen(
   async () => {
 
     console.log(
-      `PO AI Predictor Backend V5.2 running on port ${PORT}`
+      `PO AI Predictor Backend V5.3 running on port ${PORT}`
     );
 
 
@@ -2306,9 +2118,15 @@ app.listen(
     );
 
 
-    /*
-      LIVE
-    */
+    console.log(
+      `OTCharts venue: ${OTCHARTS_VENUE}`
+    );
+
+
+    console.log(
+      `OTCharts timeframe: ${OTCHARTS_TIMEFRAME} seconds`
+    );
+
 
     if (
       TWELVE_DATA_API_KEY
@@ -2339,26 +2157,22 @@ app.listen(
     }
 
 
-    /*
-      OTC
-    */
-
     if (
-      OTC_DATA_URL
+      OTCHARTS_API_KEY
     ) {
 
       console.log(
-        "OTC data source configured."
+        "OTCharts OTC data source configured."
       );
 
     } else {
 
       console.log(
-        "OTC_DATA_URL is not configured."
+        "WARNING: OTCHARTS_API_KEY is not configured."
       );
 
       console.log(
-        "OTC signals will remain NO TRADE until a real OTC data source is connected."
+        "OTC signals will remain NO TRADE until the API key is configured."
       );
     }
   }
