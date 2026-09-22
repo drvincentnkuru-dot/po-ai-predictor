@@ -1,1 +1,86 @@
+# ============================================================
+# PO AI PREDICTOR
+# Docker build for LIVE Twelve Data + Pocket Option OTC
+# ============================================================
 
+FROM node:20-bookworm AS builder
+
+# ------------------------------------------------------------
+# System dependencies required to build the Rust/N-API addon
+# ------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       git \
+       curl \
+       build-essential \
+       pkg-config \
+       libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------
+# Install Rust toolchain
+# ------------------------------------------------------------
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ------------------------------------------------------------
+# Clone BinaryOptionsTools-v2
+# ------------------------------------------------------------
+WORKDIR /opt
+
+RUN git clone --depth 1 \
+    https://github.com/ChipaDevTeam/BinaryOptionsTools-v2.git
+
+# ------------------------------------------------------------
+# Build Node.js native addon
+# ------------------------------------------------------------
+WORKDIR /opt/BinaryOptionsTools-v2/nodejs
+
+RUN npm run build
+
+# ------------------------------------------------------------
+# Install PO AI Predictor dependencies
+# ------------------------------------------------------------
+WORKDIR /app
+
+COPY backend/package*.json ./backend/
+
+WORKDIR /app/backend
+
+RUN npm install --omit=dev
+
+# ------------------------------------------------------------
+# Copy the complete built Pocket Option Node.js binding
+# ------------------------------------------------------------
+RUN mkdir -p /app/backend/node_modules/binary-options-tools
+
+RUN cp -R /opt/BinaryOptionsTools-v2/nodejs/. \
+    /app/backend/node_modules/binary-options-tools/
+
+# ------------------------------------------------------------
+# Runtime image
+# ------------------------------------------------------------
+FROM node:20-bookworm-slim AS runtime
+
+ENV NODE_ENV=production
+
+WORKDIR /app
+
+# ------------------------------------------------------------
+# Copy installed backend
+# ------------------------------------------------------------
+COPY --from=builder /app/backend ./backend
+
+# ------------------------------------------------------------
+# Render provides PORT dynamically
+# ------------------------------------------------------------
+ENV PORT=10000
+
+EXPOSE 10000
+
+# ------------------------------------------------------------
+# Start PO AI Predictor backend
+# ------------------------------------------------------------
+CMD ["node", "backend/server.js"]
