@@ -10,65 +10,71 @@ const PORT = process.env.PORT || 3000;
 
 /*
 =========================================================
-PO AI PREDICTOR BACKEND V6
+PO AI PREDICTOR BACKEND V6.1
 LIVE + OTC MARKET DATA
 =========================================================
 
-LIVE DATA
----------
-Provider: Twelve Data
+LIVE DATA:
+  Twelve Data
 
-OTC DATA
---------
-Provider: OTCharts
+OTC DATA:
+  OTCharts
 
-OTCharts authentication:
-Authorization: Bearer <OTCHARTS_API_KEY>
+OTCharts official API:
+  https://otcharts.com/v1/venues
+  https://otcharts.com/v1/symbols
+  https://otcharts.com/v1/candles
+  https://otcharts.com/v1/usage
 
 IMPORTANT:
-Do NOT put API keys directly in this file.
-
-Render Environment Variables:
-
-TWELVE_DATA_API_KEY
-OTCHARTS_API_KEY
+  - OTCharts OTC venue = Pocket Option OTC book
+  - OTC symbols are discovered from /v1/symbols
+  - 1-minute candles use tf=60
+  - Authorization = Bearer OTCHARTS_API_KEY
+  - OTC candles are NOT polled every minute
 =========================================================
 */
 
 
-/* ======================================================
-   CONFIGURATION
-====================================================== */
+// =======================================================
+// CONFIGURATION
+// =======================================================
 
-const TWELVE_DATA_API_KEY =
-  process.env.TWELVE_DATA_API_KEY || "";
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || "";
+const OTCHARTS_API_KEY = process.env.OTCHARTS_API_KEY || "";
 
-const OTCHARTS_API_KEY =
-  process.env.OTCHARTS_API_KEY || "";
+const TWELVE_DATA_BASE_URL = "https://api.twelvedata.com";
+const OTCHARTS_BASE_URL = "https://otcharts.com";
 
-const TWELVE_DATA_BASE_URL =
-  "https://api.twelvedata.com";
+const LIVE_INTERVAL = process.env.LIVE_INTERVAL || "1min";
+const OTC_TIMEFRAME_SECONDS = Number(
+  process.env.OTC_TIMEFRAME_SECONDS || 60
+);
 
-const OTCHARTS_BASE_URL =
-  "https://otcharts.com";
+const MAX_CANDLES = Math.min(
+  Number(process.env.MAX_CANDLES || 200),
+  500
+);
 
-const DEFAULT_INTERVAL = "1min";
+// Cache times
+const LIVE_CACHE_MS = Number(
+  process.env.LIVE_CACHE_MS || 30000
+);
 
-const LIVE_DATA_INTERVAL =
-  Number(process.env.LIVE_DATA_INTERVAL || 60000);
+const OTC_CACHE_MS = Number(
+  process.env.OTC_CACHE_MS || 30000
+);
 
-const OTC_DATA_INTERVAL =
-  Number(process.env.OTC_DATA_INTERVAL || 60000);
-
-const MAX_CANDLES =
-  Number(process.env.MAX_CANDLES || 200);
+const SYMBOL_CACHE_MS = Number(
+  process.env.OTC_SYMBOL_CACHE_MS || 300000
+);
 
 
-/* ======================================================
-   SUPPORTED PAIRS
-====================================================== */
+// =======================================================
+// SUPPORTED LIVE PAIRS
+// =======================================================
 
-const LIVE_PAIRS = [
+const livePairs = [
   "EUR/USD",
   "GBP/USD",
   "USD/JPY",
@@ -81,7 +87,12 @@ const LIVE_PAIRS = [
   "GBP/JPY"
 ];
 
-const OTC_PAIRS = [
+
+// =======================================================
+// FRONTEND OTC PAIR NAMES
+// =======================================================
+
+const otcPairs = [
   "EUR/USD OTC",
   "GBP/USD OTC",
   "USD/JPY OTC",
@@ -95,78 +106,63 @@ const OTC_PAIRS = [
 ];
 
 
-/* ======================================================
-   OTC PAIR MAPPING
-====================================================== */
+// =======================================================
+// OTC NAME NORMALIZATION
+// =======================================================
 
-const OTC_SYMBOL_MAP = {
-  "EUR/USD OTC": "EURUSD_otc",
-  "GBP/USD OTC": "GBPUSD_otc",
-  "USD/JPY OTC": "USDJPY_otc",
-  "USD/CHF OTC": "USDCHF_otc",
-  "AUD/USD OTC": "AUDUSD_otc",
-  "USD/CAD OTC": "USDCAD_otc",
-  "NZD/USD OTC": "NZDUSD_otc",
-  "EUR/GBP OTC": "EURGBP_otc",
-  "EUR/JPY OTC": "EURJPY_otc",
-  "GBP/JPY OTC": "GBPJPY_otc"
+function normalizeOTCName(pair) {
+  return String(pair || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toUpperCase();
+}
+
+
+function pairWithoutOTC(pair) {
+  return normalizeOTCName(pair)
+    .replace(/\s+OTC$/, "")
+    .trim();
+}
+
+
+function compactPair(pair) {
+  return pairWithoutOTC(pair)
+    .replace("/", "")
+    .replace(/\s/g, "");
+}
+
+
+// =======================================================
+// STATE / CACHE
+// =======================================================
+
+const liveCache = new Map();
+const otcCache = new Map();
+
+let otcSymbolsCache = {
+  timestamp: 0,
+  symbols: []
+};
+
+let otcVenuesCache = {
+  timestamp: 0,
+  venues: []
 };
 
 
-/* ======================================================
-   DATA CACHE
-====================================================== */
-
-const liveCache = {};
-const otcCache = {};
-
-
-/* ======================================================
-   UTILITY FUNCTIONS
-====================================================== */
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-
-function isLivePair(pair) {
-  return LIVE_PAIRS.includes(pair);
-}
-
-
-function isOTCPair(pair) {
-  return OTC_PAIRS.includes(pair);
-}
-
-
-function isSupportedPair(pair) {
-  return isLivePair(pair) || isOTCPair(pair);
-}
-
-
-function clamp(value, min, max) {
-  return Math.min(Math.max(value, min), max);
-}
-
-
-function round(value, decimals = 6) {
-  if (!Number.isFinite(value)) {
-    return null;
-  }
-
-  const factor = Math.pow(10, decimals);
-
-  return Math.round(value * factor) / factor;
-}
-
-
-/* ======================================================
-   HTTP JSON HELPER
-====================================================== */
+// =======================================================
+// FETCH HELPER
+// =======================================================
 
 async function fetchJSON(url, options = {}) {
-  const response = await fetch(url, options);
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "PO-AI-Predictor/6.1",
+      ...(options.headers || {})
+    }
+  });
 
   const text = await response.text();
 
@@ -174,292 +170,384 @@ async function fetchJSON(url, options = {}) {
 
   try {
     data = JSON.parse(text);
-  } catch (error) {
-    throw new Error(
-      `Invalid JSON response (${response.status}): ${text.slice(0, 500)}`
-    );
+  } catch {
+    data = {
+      raw: text
+    };
   }
 
   if (!response.ok) {
-    const message =
-      data?.error?.message ||
+    const errorMessage =
       data?.error ||
       data?.message ||
+      data?.raw ||
       `HTTP ${response.status}`;
 
-    throw new Error(message);
+    const error = new Error(errorMessage);
+    error.status = response.status;
+    error.body = data;
+
+    throw error;
   }
 
   return data;
 }
 
 
-/* ======================================================
-   NORMALIZE CANDLE
-====================================================== */
-
-function normalizeCandle(candle) {
-  if (!candle || typeof candle !== "object") {
-    return null;
-  }
-
-  const timestamp =
-    candle.timestamp ??
-    candle.time ??
-    candle.datetime ??
-    candle.date ??
-    candle.t;
-
-  const open =
-    candle.open ??
-    candle.o;
-
-  const high =
-    candle.high ??
-    candle.h;
-
-  const low =
-    candle.low ??
-    candle.l;
-
-  const close =
-    candle.close ??
-    candle.c;
-
-  const volume =
-    candle.volume ??
-    candle.v ??
-    0;
-
-  const parsedTimestamp =
-    typeof timestamp === "number"
-      ? timestamp
-      : Date.parse(timestamp);
-
-  const parsedOpen = Number(open);
-  const parsedHigh = Number(high);
-  const parsedLow = Number(low);
-  const parsedClose = Number(close);
-  const parsedVolume = Number(volume);
-
-  if (
-    !Number.isFinite(parsedTimestamp) ||
-    !Number.isFinite(parsedOpen) ||
-    !Number.isFinite(parsedHigh) ||
-    !Number.isFinite(parsedLow) ||
-    !Number.isFinite(parsedClose)
-  ) {
-    return null;
-  }
-
-  return {
-    timestamp: parsedTimestamp,
-    datetime: new Date(parsedTimestamp).toISOString(),
-    open: parsedOpen,
-    high: parsedHigh,
-    low: parsedLow,
-    close: parsedClose,
-    volume: Number.isFinite(parsedVolume)
-      ? parsedVolume
-      : 0
-  };
-}
-
-
-/* ======================================================
-   NORMALIZE CANDLE ARRAY
-====================================================== */
-
-function normalizeCandles(rawData) {
-  let candles = [];
-
-  if (Array.isArray(rawData)) {
-    candles = rawData;
-  } else if (Array.isArray(rawData?.values)) {
-    candles = rawData.values;
-  } else if (Array.isArray(rawData?.data)) {
-    candles = rawData.data;
-  } else if (Array.isArray(rawData?.candles)) {
-    candles = rawData.candles;
-  } else if (Array.isArray(rawData?.result)) {
-    candles = rawData.result;
-  } else if (Array.isArray(rawData?.data?.candles)) {
-    candles = rawData.data.candles;
-  } else if (Array.isArray(rawData?.data?.values)) {
-    candles = rawData.data.values;
-  }
-
-  const normalized = candles
-    .map(normalizeCandle)
-    .filter(Boolean);
-
-  normalized.sort(
-    (a, b) => a.timestamp - b.timestamp
-  );
-
-  return normalized.slice(-MAX_CANDLES);
-}
-
-
-/* ======================================================
-   TWELVE DATA - LIVE MARKET
-====================================================== */
+// =======================================================
+// LIVE DATA - TWELVE DATA
+// =======================================================
 
 async function fetchLiveCandles(pair) {
   if (!TWELVE_DATA_API_KEY) {
-    throw new Error(
-      "TWELVE_DATA_API_KEY is not configured"
-    );
+    throw new Error("TWELVE_DATA_API_KEY is not configured");
+  }
+
+  const now = Date.now();
+
+  const cached = liveCache.get(pair);
+
+  if (
+    cached &&
+    cached.candles &&
+    now - cached.timestamp < LIVE_CACHE_MS
+  ) {
+    return cached.candles;
   }
 
   const url =
     `${TWELVE_DATA_BASE_URL}/time_series` +
     `?symbol=${encodeURIComponent(pair)}` +
-    `&interval=${encodeURIComponent(DEFAULT_INTERVAL)}` +
+    `&interval=${encodeURIComponent(LIVE_INTERVAL)}` +
     `&outputsize=${MAX_CANDLES}` +
     `&apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
 
   const data = await fetchJSON(url);
 
-  if (data?.status === "error") {
+  if (data.status === "error") {
     throw new Error(
-      data?.message || "Twelve Data returned an error"
+      data.message || "Twelve Data returned an error"
     );
   }
 
-  const candles = normalizeCandles(data);
+  if (!Array.isArray(data.values)) {
+    throw new Error(
+      "Twelve Data did not return candle data"
+    );
+  }
+
+  const candles = data.values
+    .map(item => ({
+      time: item.datetime,
+      open: Number(item.open),
+      high: Number(item.high),
+      low: Number(item.low),
+      close: Number(item.close),
+      volume: Number(item.volume || 0)
+    }))
+    .filter(c =>
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    )
+    .reverse();
 
   if (candles.length < 30) {
     throw new Error(
-      `Insufficient LIVE candles: ${candles.length}`
+      `Not enough LIVE candles: ${candles.length}`
     );
   }
 
-  liveCache[pair] = {
-    pair,
-    status: "live",
-    source: "Twelve Data",
-    lastUpdate: nowISO(),
-    candles,
-    error: null
-  };
+  liveCache.set(pair, {
+    timestamp: now,
+    candles
+  });
+
+  console.log(
+    `[TWELVE DATA] Updated ${candles.length} candles for ${pair}`
+  );
 
   return candles;
 }
 
 
-/* ======================================================
-   OTCHARTS - OTC MARKET
-====================================================== */
+// =======================================================
+// OTCHARTS - VENUES
+// =======================================================
 
-async function fetchOTCCandles(pair) {
+async function fetchOTCVenues() {
   if (!OTCHARTS_API_KEY) {
-    throw new Error(
-      "OTCHARTS_API_KEY is not configured"
-    );
+    throw new Error("OTCHARTS_API_KEY is not configured");
   }
 
-  const otcSymbol = OTC_SYMBOL_MAP[pair];
+  const now = Date.now();
 
-  if (!otcSymbol) {
-    throw new Error(
-      `Unsupported OTC pair: ${pair}`
-    );
+  if (
+    otcVenuesCache.venues.length > 0 &&
+    now - otcVenuesCache.timestamp < SYMBOL_CACHE_MS
+  ) {
+    return otcVenuesCache.venues;
   }
-
-  /*
-    OTCharts endpoint:
-
-    /v1/candles
-      venue=otc
-      symbol=AUDUSD_otc
-      timeframe=1m
-      limit=200
-  */
-
-  const params = new URLSearchParams({
-    venue: "otc",
-    symbol: otcSymbol,
-    timeframe: "1m",
-    limit: String(MAX_CANDLES)
-  });
 
   const url =
-    `${OTCHARTS_BASE_URL}/v1/candles?${params.toString()}`;
+    `${OTCHARTS_BASE_URL}/v1/venues`;
 
   const data = await fetchJSON(url, {
-    method: "GET",
     headers: {
-      "Accept": "application/json",
       "Authorization": `Bearer ${OTCHARTS_API_KEY}`
     }
   });
 
-  /*
-    Keep the raw response only in memory if needed for debugging.
-    Never expose the API key.
-  */
-
-  const candles = normalizeCandles(data);
-
-  if (candles.length < 30) {
+  if (!Array.isArray(data.venues)) {
     throw new Error(
-      `Insufficient OTC candles from OTCharts for ${pair}: ${candles.length}`
+      "OTCharts /v1/venues did not return venues"
     );
   }
 
-  otcCache[pair] = {
-    pair,
-    otcSymbol,
-    status: "live",
-    source: "OTCharts",
-    lastUpdate: nowISO(),
-    candles,
-    error: null
+  otcVenuesCache = {
+    timestamp: now,
+    venues: data.venues
   };
+
+  return data.venues;
+}
+
+
+// =======================================================
+// OTCHARTS - SYMBOL CATALOGUE
+// =======================================================
+
+async function fetchOTCSymbols() {
+  if (!OTCHARTS_API_KEY) {
+    throw new Error("OTCHARTS_API_KEY is not configured");
+  }
+
+  const now = Date.now();
+
+  if (
+    otcSymbolsCache.symbols.length > 0 &&
+    now - otcSymbolsCache.timestamp < SYMBOL_CACHE_MS
+  ) {
+    return otcSymbolsCache.symbols;
+  }
+
+  const url =
+    `${OTCHARTS_BASE_URL}/v1/symbols` +
+    `?venue=otc`;
+
+  const data = await fetchJSON(url, {
+    headers: {
+      "Authorization": `Bearer ${OTCHARTS_API_KEY}`
+    }
+  });
+
+  if (!Array.isArray(data.symbols)) {
+    throw new Error(
+      "OTCharts /v1/symbols did not return symbols"
+    );
+  }
+
+  otcSymbolsCache = {
+    timestamp: now,
+    symbols: data.symbols
+  };
+
+  console.log(
+    `[OTCHARTS] Loaded ${data.symbols.length} OTC symbols`
+  );
+
+  return data.symbols;
+}
+
+
+// =======================================================
+// FIND OTC SYMBOL
+// =======================================================
+
+function findOTCSymbolFromCatalogue(pair, symbols) {
+  const wanted = normalizeOTCName(pair);
+  const base = compactPair(pair);
+
+  // First: exact display name
+  const exactName = symbols.find(item =>
+    normalizeOTCName(item.name) === wanted
+  );
+
+  if (exactName) {
+    return exactName.symbol;
+  }
+
+  // Second: compare compact pair
+  const compactMatch = symbols.find(item => {
+    const symbol = String(item.symbol || "")
+      .toUpperCase()
+      .replace("_OTC", "")
+      .replace("-OTC", "")
+      .replace("/", "");
+
+    return symbol === base;
+  });
+
+  if (compactMatch) {
+    return compactMatch.symbol;
+  }
+
+  return null;
+}
+
+
+// =======================================================
+// OTCHARTS - CANDLES
+// =======================================================
+
+async function fetchOTCCandles(pair) {
+  if (!OTCHARTS_API_KEY) {
+    throw new Error("OTCHARTS_API_KEY is not configured");
+  }
+
+  const now = Date.now();
+
+  const cached = otcCache.get(pair);
+
+  if (
+    cached &&
+    cached.candles &&
+    now - cached.timestamp < OTC_CACHE_MS
+  ) {
+    return cached.candles;
+  }
+
+  // -----------------------------------------------------
+  // Confirm that OTC book is available
+  // -----------------------------------------------------
+
+  const venues = await fetchOTCVenues();
+
+  const otcVenue = venues.find(
+    venue => venue.id === "otc"
+  );
+
+  if (!otcVenue) {
+    throw new Error(
+      "OTCharts did not return the otc venue"
+    );
+  }
+
+  if (otcVenue.open !== true) {
+    throw new Error(
+      "OTCharts OTC/Pocket Option book is not open for this API key"
+    );
+  }
+
+  // -----------------------------------------------------
+  // Discover exact OTC symbol
+  // -----------------------------------------------------
+
+  const symbols = await fetchOTCSymbols();
+
+  const otcSymbol =
+    findOTCSymbolFromCatalogue(pair, symbols);
+
+  if (!otcSymbol) {
+    throw new Error(
+      `${pair} is not available in the OTCharts OTC catalogue for this API key`
+    );
+  }
+
+  // -----------------------------------------------------
+  // Request historical candles
+  // -----------------------------------------------------
+
+  const url =
+    `${OTCHARTS_BASE_URL}/v1/candles` +
+    `?venue=otc` +
+    `&symbol=${encodeURIComponent(otcSymbol)}` +
+    `&tf=${OTC_TIMEFRAME_SECONDS}` +
+    `&limit=${MAX_CANDLES}`;
+
+  const data = await fetchJSON(url, {
+    headers: {
+      "Authorization": `Bearer ${OTCHARTS_API_KEY}`
+    }
+  });
+
+  if (!Array.isArray(data.candles)) {
+    throw new Error(
+      "OTCharts did not return candles"
+    );
+  }
+
+  if (data.candles.length < 30) {
+    throw new Error(
+      `Not enough OTC candles for ${pair}: ${data.candles.length}`
+    );
+  }
+
+  // -----------------------------------------------------
+  // Convert OTCharts candles to our internal format
+  // -----------------------------------------------------
+
+  const candles = data.candles
+    .map(item => ({
+      time: item.time,
+      open: Number(item.open),
+      high: Number(item.high),
+      low: Number(item.low),
+      close: Number(item.close),
+      volume: Number(item.volume || 0)
+    }))
+    .filter(c =>
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    )
+    .sort((a, b) => {
+      return Number(a.time) - Number(b.time);
+    });
+
+  if (candles.length < 30) {
+    throw new Error(
+      `OTCharts returned insufficient valid candles for ${pair}`
+    );
+  }
+
+  // -----------------------------------------------------
+  // Cache
+  // -----------------------------------------------------
+
+  otcCache.set(pair, {
+    timestamp: now,
+    candles,
+    otcSymbol,
+    gaps: data.gaps || null
+  });
+
+  console.log(
+    `[OTCHARTS] Updated ${candles.length} candles for ${pair} using ${otcSymbol}`
+  );
 
   return candles;
 }
 
 
-/* ======================================================
-   GET CANDLES
-====================================================== */
-
-async function getCandles(pair) {
-  if (isLivePair(pair)) {
-    return fetchLiveCandles(pair);
-  }
-
-  if (isOTCPair(pair)) {
-    return fetchOTCCandles(pair);
-  }
-
-  throw new Error(
-    `Unsupported pair: ${pair}`
-  );
-}
-
-
-/* ======================================================
-   EMA
-====================================================== */
+// =======================================================
+// EMA
+// =======================================================
 
 function calculateEMA(values, period) {
   if (!Array.isArray(values) || values.length < period) {
     return null;
   }
 
-  const multiplier =
-    2 / (period + 1);
+  const multiplier = 2 / (period + 1);
 
-  let ema = 0;
-
-  for (let i = 0; i < period; i++) {
-    ema += values[i];
-  }
-
-  ema /= period;
+  let ema =
+    values
+      .slice(0, period)
+      .reduce((sum, value) => sum + value, 0) /
+    period;
 
   for (let i = period; i < values.length; i++) {
     ema =
@@ -471,9 +559,9 @@ function calculateEMA(values, period) {
 }
 
 
-/* ======================================================
-   RSI
-====================================================== */
+// =======================================================
+// RSI
+// =======================================================
 
 function calculateRSI(values, period = 14) {
   if (!Array.isArray(values) || values.length <= period) {
@@ -484,8 +572,7 @@ function calculateRSI(values, period = 14) {
   let losses = 0;
 
   for (let i = 1; i <= period; i++) {
-    const change =
-      values[i] - values[i - 1];
+    const change = values[i] - values[i - 1];
 
     if (change > 0) {
       gains += change;
@@ -494,25 +581,14 @@ function calculateRSI(values, period = 14) {
     }
   }
 
-  let averageGain =
-    gains / period;
+  let averageGain = gains / period;
+  let averageLoss = losses / period;
 
-  let averageLoss =
-    losses / period;
+  for (let i = period + 1; i < values.length; i++) {
+    const change = values[i] - values[i - 1];
 
-  for (
-    let i = period + 1;
-    i < values.length;
-    i++
-  ) {
-    const change =
-      values[i] - values[i - 1];
-
-    const gain =
-      change > 0 ? change : 0;
-
-    const loss =
-      change < 0 ? Math.abs(change) : 0;
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? Math.abs(change) : 0;
 
     averageGain =
       ((averageGain * (period - 1)) + gain) /
@@ -527,22 +603,20 @@ function calculateRSI(values, period = 14) {
     return 100;
   }
 
-  const rs =
+  const relativeStrength =
     averageGain / averageLoss;
 
-  return 100 - (100 / (1 + rs));
+  return 100 -
+    (100 / (1 + relativeStrength));
 }
 
 
-/* ======================================================
-   MOMENTUM
-====================================================== */
+// =======================================================
+// MOMENTUM
+// =======================================================
 
 function calculateMomentum(values, lookback = 5) {
-  if (
-    !Array.isArray(values) ||
-    values.length <= lookback
-  ) {
+  if (!Array.isArray(values) || values.length <= lookback) {
     return null;
   }
 
@@ -556,59 +630,23 @@ function calculateMomentum(values, lookback = 5) {
 }
 
 
-/* ======================================================
-   ATR-LIKE VOLATILITY
-====================================================== */
+// =======================================================
+// MARKET ANALYSIS
+// =======================================================
 
-function calculateAverageRange(candles, period = 14) {
-  if (
-    !Array.isArray(candles) ||
-    candles.length < period + 1
-  ) {
-    return null;
-  }
-
-  const ranges = candles
-    .slice(-(period + 1))
-    .map(candle =>
-      candle.high - candle.low
-    );
-
-  const validRanges =
-    ranges.filter(Number.isFinite);
-
-  if (!validRanges.length) {
-    return null;
-  }
-
-  return (
-    validRanges.reduce(
-      (sum, value) => sum + value,
-      0
-    ) / validRanges.length
-  );
-}
-
-
-/* ======================================================
-   MARKET ANALYSIS
-====================================================== */
-
-function analyzeMarket(candles) {
-  if (
-    !Array.isArray(candles) ||
-    candles.length < 30
-  ) {
+function analyzeCandles(candles) {
+  if (!Array.isArray(candles) || candles.length < 30) {
     return {
       signal: "NO TRADE",
       confidence: 0,
       reason: "Not enough market data",
-      indicators: null
+      indicators: {}
     };
   }
 
-  const closes =
-    candles.map(c => c.close);
+  const closes = candles.map(
+    candle => Number(candle.close)
+  );
 
   const currentPrice =
     closes[closes.length - 1];
@@ -625,478 +663,305 @@ function analyzeMarket(candles) {
   const momentum =
     calculateMomentum(closes, 5);
 
-  const averageRange =
-    calculateAverageRange(candles, 14);
-
   if (
-    !Number.isFinite(currentPrice) ||
-    !Number.isFinite(ema9) ||
-    !Number.isFinite(ema21) ||
-    !Number.isFinite(rsi14) ||
-    !Number.isFinite(momentum)
+    ema9 === null ||
+    ema21 === null ||
+    rsi14 === null ||
+    momentum === null
   ) {
     return {
       signal: "NO TRADE",
       confidence: 0,
       reason: "Indicators could not be calculated",
-      indicators: {
-        currentPrice,
-        ema9,
-        ema21,
-        rsi14,
-        momentum,
-        averageRange
-      }
+      indicators: {}
     };
   }
 
+  const bullish = [];
+  const bearish = [];
 
-  /* ====================================================
-     TREND
-  ==================================================== */
-
-  const bullishTrend =
-    ema9 > ema21;
-
-  const bearishTrend =
-    ema9 < ema21;
-
-
-  /* ====================================================
-     MOMENTUM
-  ==================================================== */
-
-  const bullishMomentum =
-    momentum > 0;
-
-  const bearishMomentum =
-    momentum < 0;
-
-
-  /* ====================================================
-     RSI
-  ==================================================== */
-
-  /*
-    Avoid buying when RSI is extremely overbought.
-    Avoid selling when RSI is extremely oversold.
-  */
-
-  const bullishRSI =
-    rsi14 >= 50 &&
-    rsi14 < 70;
-
-  const bearishRSI =
-    rsi14 <= 50 &&
-    rsi14 > 30;
-
-
-  /* ====================================================
-     SCORE
-  ==================================================== */
-
-  let bullishScore = 0;
-  let bearishScore = 0;
-
-  if (bullishTrend) {
-    bullishScore += 1;
+  // EMA direction
+  if (ema9 > ema21) {
+    bullish.push("EMA9_ABOVE_EMA21");
   }
 
-  if (bearishTrend) {
-    bearishScore += 1;
+  if (ema9 < ema21) {
+    bearish.push("EMA9_BELOW_EMA21");
   }
 
-  if (bullishMomentum) {
-    bullishScore += 1;
+  // RSI
+  if (rsi14 >= 50 && rsi14 <= 70) {
+    bullish.push("RSI_BULLISH");
   }
 
-  if (bearishMomentum) {
-    bearishScore += 1;
+  if (rsi14 <= 50 && rsi14 >= 30) {
+    bearish.push("RSI_BEARISH");
   }
 
-  if (bullishRSI) {
-    bullishScore += 1;
+  // Momentum
+  if (momentum > 0) {
+    bullish.push("MOMENTUM_UP");
   }
 
-  if (bearishRSI) {
-    bearishScore += 1;
+  if (momentum < 0) {
+    bearish.push("MOMENTUM_DOWN");
   }
-
-
-  /* ====================================================
-     SIGNAL DECISION
-  ==================================================== */
 
   let signal = "NO TRADE";
   let confidence = 0;
   let reason =
-    "Market conditions are not sufficiently aligned";
+    "Market conditions are not sufficiently aligned.";
 
-
-  /*
-    Require all three conditions to agree.
-
-    CALL:
-      EMA9 > EMA21
-      momentum > 0
-      RSI between 50 and 70
-
-    PUT:
-      EMA9 < EMA21
-      momentum < 0
-      RSI between 30 and 50
-  */
+  // -----------------------------------------------------
+  // CALL
+  // -----------------------------------------------------
 
   if (
-    bullishTrend &&
-    bullishMomentum &&
-    bullishRSI
+    ema9 > ema21 &&
+    rsi14 > 50 &&
+    rsi14 < 70 &&
+    momentum > 0
   ) {
     signal = "CALL";
 
-    confidence = 70;
+    confidence = Math.round(
+      65 +
+      Math.min(10, Math.abs(momentum) * 100000) +
+      Math.min(10, Math.abs(ema9 - ema21) * 100000)
+    );
+
+    confidence = Math.min(
+      90,
+      Math.max(65, confidence)
+    );
 
     reason =
-      "Bullish trend, positive momentum and supportive RSI";
+      "EMA9 is above EMA21, RSI is bullish, and momentum is positive.";
   }
 
+  // -----------------------------------------------------
+  // PUT
+  // -----------------------------------------------------
+
   else if (
-    bearishTrend &&
-    bearishMomentum &&
-    bearishRSI
+    ema9 < ema21 &&
+    rsi14 < 50 &&
+    rsi14 > 30 &&
+    momentum < 0
   ) {
     signal = "PUT";
 
-    confidence = 70;
+    confidence = Math.round(
+      65 +
+      Math.min(10, Math.abs(momentum) * 100000) +
+      Math.min(10, Math.abs(ema9 - ema21) * 100000)
+    );
+
+    confidence = Math.min(
+      90,
+      Math.max(65, confidence)
+    );
 
     reason =
-      "Bearish trend, negative momentum and supportive RSI";
+      "EMA9 is below EMA21, RSI is bearish, and momentum is negative.";
   }
-
-  /*
-    Stronger alignment.
-
-    If the trend and momentum are aligned very clearly,
-    increase confidence.
-  */
-
-  if (
-    signal === "CALL" &&
-    rsi14 >= 55 &&
-    ema9 > ema21 &&
-    momentum > 0
-  ) {
-    confidence = 80;
-  }
-
-  if (
-    signal === "PUT" &&
-    rsi14 <= 45 &&
-    ema9 < ema21 &&
-    momentum < 0
-  ) {
-    confidence = 80;
-  }
-
-
-  /*
-    Extremely strong alignment.
-  */
-
-  const emaDistance =
-    Math.abs(ema9 - ema21);
-
-  const normalizedMomentum =
-    currentPrice !== 0
-      ? Math.abs(momentum) / currentPrice
-      : 0;
-
-  if (
-    signal === "CALL" &&
-    rsi14 >= 55 &&
-    rsi14 < 68 &&
-    emaDistance > 0 &&
-    normalizedMomentum > 0
-  ) {
-    confidence = 90;
-  }
-
-  if (
-    signal === "PUT" &&
-    rsi14 <= 45 &&
-    rsi14 > 32 &&
-    emaDistance > 0 &&
-    normalizedMomentum > 0
-  ) {
-    confidence = 90;
-  }
-
-
-  /*
-    Safety:
-    Never report 100% confidence.
-
-    Market prediction cannot be guaranteed.
-  */
-
-  confidence =
-    clamp(confidence, 0, 90);
-
 
   return {
     signal,
     confidence,
     reason,
-    currentPrice: round(currentPrice, 6),
+
+    currentPrice,
+
     indicators: {
-      ema9: round(ema9, 8),
-      ema21: round(ema21, 8),
-      rsi14: round(rsi14, 2),
-      momentum: round(momentum, 8),
-      averageRange: round(averageRange, 8),
-      bullishScore,
-      bearishScore
+      ema9,
+      ema21,
+      rsi14,
+      momentum,
+
+      bullishSignals: bullish.length,
+      bearishSignals: bearish.length,
+
+      bullishFactors: bullish,
+      bearishFactors: bearish
     }
   };
 }
 
 
-/* ======================================================
-   HEALTH ENDPOINT
-====================================================== */
+// =======================================================
+// HEALTH
+// =======================================================
 
-app.get("/api/health", (req, res) => {
-  const liveStatus = {};
+app.get("/api/health", async (req, res) => {
+  const liveConfigured =
+    Boolean(TWELVE_DATA_API_KEY);
 
-  for (const pair of LIVE_PAIRS) {
-    const cached =
-      liveCache[pair];
+  const otcConfigured =
+    Boolean(OTCHARTS_API_KEY);
 
-    liveStatus[pair] = {
-      status:
-        cached?.status || "not_loaded",
-      lastUpdate:
-        cached?.lastUpdate || null,
-      source:
-        cached?.source || "Twelve Data",
-      candles:
-        cached?.candles?.length || 0,
-      error:
-        cached?.error || null
-    };
+  let otcStatus = {
+    configured: otcConfigured,
+    venueOpen: null,
+    symbolsAvailable: null,
+    error: null
+  };
+
+  if (otcConfigured) {
+    try {
+      const venues =
+        await fetchOTCVenues();
+
+      const otcVenue =
+        venues.find(
+          venue => venue.id === "otc"
+        );
+
+      otcStatus.venueOpen =
+        otcVenue?.open === true;
+
+      if (otcStatus.venueOpen) {
+        const symbols =
+          await fetchOTCSymbols();
+
+        otcStatus.symbolsAvailable =
+          symbols.length;
+      }
+    } catch (error) {
+      otcStatus.error =
+        error.message;
+    }
   }
-
-
-  const otcStatus = {};
-
-  for (const pair of OTC_PAIRS) {
-    const cached =
-      otcCache[pair];
-
-    otcStatus[pair] = {
-      status:
-        cached?.status || "not_loaded",
-      otcSymbol:
-        OTC_SYMBOL_MAP[pair],
-      lastUpdate:
-        cached?.lastUpdate || null,
-      source:
-        cached?.source || "OTCharts",
-      candles:
-        cached?.candles?.length || 0,
-      error:
-        cached?.error || null
-    };
-  }
-
 
   res.json({
     status: "ok",
-
-    service:
-      "PO AI Predictor Backend",
-
-    version:
-      "6.0.0",
+    service: "PO AI Predictor Backend",
+    version: "6.1.0",
 
     liveDataConfigured:
-      Boolean(TWELVE_DATA_API_KEY),
+      liveConfigured,
 
     otcDataConfigured:
-      Boolean(OTCHARTS_API_KEY),
+      otcConfigured,
 
-    defaultSymbol:
-      "EUR/USD",
+    liveSource:
+      "Twelve Data",
 
-    interval:
-      DEFAULT_INTERVAL,
+    otcSource:
+      "OTCharts",
 
-    sources: {
-      live:
-        "Twelve Data",
+    liveInterval:
+      LIVE_INTERVAL,
 
-      otc:
-        "OTCharts"
-    },
+    otcTimeframeSeconds:
+      OTC_TIMEFRAME_SECONDS,
 
-    live:
-      liveStatus,
+    livePairs,
+    otcPairs,
 
-    otc:
-      otcStatus,
+    otcStatus,
 
     timestamp:
-      nowISO()
+      new Date().toISOString()
   });
 });
 
 
-/* ======================================================
-   API CANDLES
-====================================================== */
+// =======================================================
+// OTC VENUES
+// =======================================================
 
-app.get("/api/candles", async (req, res) => {
+app.get("/api/otc-venues", async (req, res) => {
   try {
-    const pair =
-      String(
-        req.query.pair || "EUR/USD"
-      ).trim();
-
-    const count =
-      Math.min(
-        Math.max(
-          Number(req.query.count || 100),
-          1
-        ),
-        MAX_CANDLES
-      );
-
-    if (!isSupportedPair(pair)) {
-      return res.status(400).json({
-        status: "error",
-        error:
-          `Unsupported pair: ${pair}`,
-        supportedLivePairs:
-          LIVE_PAIRS,
-        supportedOTCPairs:
-          OTC_PAIRS
-      });
-    }
-
-    const candles =
-      await getCandles(pair);
-
-    const result =
-      candles.slice(-count);
-
-    const marketType =
-      isOTCPair(pair)
-        ? "OTC"
-        : "LIVE";
-
-    const source =
-      isOTCPair(pair)
-        ? "OTCharts"
-        : "Twelve Data";
+    const venues =
+      await fetchOTCVenues();
 
     res.json({
       status: "ok",
-      market: marketType,
-      pair,
-      source,
-      count: result.length,
-      candles: result
+      source: "OTCharts",
+      venues
     });
 
   } catch (error) {
 
-    const pair =
-      String(
-        req.query.pair || ""
-      ).trim();
-
-    if (isOTCPair(pair)) {
-      otcCache[pair] = {
-        ...(otcCache[pair] || {}),
-        status: "error",
-        error: error.message
-      };
-    }
-
-    res.status(500).json({
+    res.status(error.status || 500).json({
       status: "error",
-      market:
-        isOTCPair(pair)
-          ? "OTC"
-          : "LIVE",
-      pair,
-      error:
-        error.message
+      source: "OTCharts",
+      error: error.message
     });
   }
 });
 
 
-/* ======================================================
-   MARKET ANALYSIS
-====================================================== */
+// =======================================================
+// OTC SYMBOLS
+// =======================================================
 
-app.get("/api/market-analysis", async (req, res) => {
+app.get("/api/otc-symbols", async (req, res) => {
   try {
-    const pair =
-      String(
-        req.query.pair || "EUR/USD"
-      ).trim();
-
-    if (!isSupportedPair(pair)) {
-      return res.status(400).json({
-        status: "error",
-        error:
-          `Unsupported pair: ${pair}`
-      });
-    }
-
-    const candles =
-      await getCandles(pair);
-
-    const analysis =
-      analyzeMarket(candles);
-
-    const marketType =
-      isOTCPair(pair)
-        ? "OTC MARKET"
-        : "LIVE MARKET";
-
-    const source =
-      isOTCPair(pair)
-        ? "OTCharts"
-        : "Twelve Data";
+    const symbols =
+      await fetchOTCSymbols();
 
     res.json({
-      status: "ready",
-
-      market:
-        marketType,
-
-      pair,
-
-      source,
-
-      dataStatus:
-        isOTCPair(pair)
-          ? "OTC DATA CONNECTED"
-          : "LIVE DATA CONNECTED",
-
-      candles:
-        candles.length,
-
-      ...analysis,
-
-      timestamp:
-        nowISO()
+      status: "ok",
+      source: "OTCharts",
+      venue: "otc",
+      count: symbols.length,
+      symbols
     });
 
   } catch (error) {
+
+    res.status(error.status || 500).json({
+      status: "error",
+      source: "OTCharts",
+      error: error.message
+    });
+  }
+});
+
+
+// =======================================================
+// OTC USAGE
+// =======================================================
+
+app.get("/api/otc-usage", async (req, res) => {
+  try {
+
+    const data =
+      await fetchJSON(
+        `${OTCHARTS_BASE_URL}/v1/usage`,
+        {
+          headers: {
+            "Authorization":
+              `Bearer ${OTCHARTS_API_KEY}`
+          }
+        }
+      );
+
+    res.json({
+      status: "ok",
+      source: "OTCharts",
+      usage: data
+    });
+
+  } catch (error) {
+
+    res.status(error.status || 500).json({
+      status: "error",
+      source: "OTCharts",
+      error: error.message
+    });
+  }
+});
+
+
+// =======================================================
+// CANDLES
+// =======================================================
+
+app.get("/api/candles", async (req, res) => {
+  try {
 
     const pair =
       String(
@@ -1104,99 +969,284 @@ app.get("/api/market-analysis", async (req, res) => {
       ).trim();
 
     const isOTC =
-      isOTCPair(pair);
+      /OTC$/i.test(pair);
+
+    let candles;
 
     if (isOTC) {
-      otcCache[pair] = {
-        ...(otcCache[pair] || {}),
-        status: "error",
-        error: error.message
-      };
+
+      candles =
+        await fetchOTCCandles(pair);
+
+      res.json({
+        status: "ok",
+        market: "OTC MARKET",
+        pair,
+        source: "OTCharts",
+        dataStatus: "OTC DATA CONNECTED",
+        count: candles.length,
+        candles
+      });
+
+      return;
     }
 
-    res.status(500).json({
-      status: "error",
+    if (!livePairs.includes(pair)) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          `Unsupported LIVE pair: ${pair}`
+      });
+    }
 
-      market:
-        isOTC
-          ? "OTC MARKET"
-          : "LIVE MARKET",
+    candles =
+      await fetchLiveCandles(pair);
 
+    res.json({
+      status: "ok",
+      market: "LIVE MARKET",
       pair,
+      source: "Twelve Data",
+      dataStatus: "LIVE DATA CONNECTED",
+      count: candles.length,
+      candles
+    });
 
-      dataStatus:
-        isOTC
-          ? "OTC DATA NOT AVAILABLE"
-          : "LIVE DATA ERROR",
+  } catch (error) {
 
-      signal:
-        "NO TRADE",
-
-      confidence:
-        0,
-
-      error:
-        error.message,
-
-      timestamp:
-        nowISO()
+    res.status(error.status || 500).json({
+      status: "error",
+      message: error.message
     });
   }
 });
 
 
-/* ======================================================
-   SIGNAL ENDPOINT
-====================================================== */
+// =======================================================
+// MARKET ANALYSIS
+// =======================================================
+
+app.get(
+  "/api/market-analysis",
+  async (req, res) => {
+
+    try {
+
+      const pair =
+        String(
+          req.query.pair || "EUR/USD"
+        ).trim();
+
+      const isOTC =
+        /OTC$/i.test(pair);
+
+      let candles;
+      let source;
+      let market;
+      let dataStatus;
+      let otcSymbol = null;
+
+      if (isOTC) {
+
+        candles =
+          await fetchOTCCandles(pair);
+
+        source =
+          "OTCharts";
+
+        market =
+          "OTC MARKET";
+
+        dataStatus =
+          "OTC DATA CONNECTED";
+
+        const cached =
+          otcCache.get(pair);
+
+        otcSymbol =
+          cached?.otcSymbol || null;
+
+      } else {
+
+        if (!livePairs.includes(pair)) {
+          return res.status(400).json({
+            status: "error",
+            message:
+              `Unsupported LIVE pair: ${pair}`
+          });
+        }
+
+        candles =
+          await fetchLiveCandles(pair);
+
+        source =
+          "Twelve Data";
+
+        market =
+          "LIVE MARKET";
+
+        dataStatus =
+          "LIVE DATA CONNECTED";
+      }
+
+      const analysis =
+        analyzeCandles(candles);
+
+      res.json({
+        status: "ready",
+
+        market,
+        pair,
+
+        source,
+        dataStatus,
+
+        otcSymbol,
+
+        signal:
+          analysis.signal,
+
+        confidence:
+          analysis.confidence,
+
+        currentPrice:
+          analysis.currentPrice,
+
+        reason:
+          analysis.reason,
+
+        indicators:
+          analysis.indicators,
+
+        candles:
+          candles.length,
+
+        timestamp:
+          new Date().toISOString()
+      });
+
+    } catch (error) {
+
+      const isOTC =
+        /OTC$/i.test(
+          String(req.query.pair || "")
+        );
+
+      res.status(error.status || 500).json({
+
+        status: "error",
+
+        market:
+          isOTC
+            ? "OTC MARKET"
+            : "LIVE MARKET",
+
+        pair:
+          req.query.pair || null,
+
+        source:
+          isOTC
+            ? "OTCharts"
+            : "Twelve Data",
+
+        dataStatus:
+          isOTC
+            ? "OTC DATA NOT AVAILABLE"
+            : "LIVE DATA NOT AVAILABLE",
+
+        signal:
+          "NO TRADE",
+
+        confidence:
+          0,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+// =======================================================
+// SIGNAL ENDPOINT
+// =======================================================
 
 app.get("/api/signal", async (req, res) => {
+
   try {
+
     const pair =
       String(
         req.query.pair || "EUR/USD"
       ).trim();
 
-    if (!isSupportedPair(pair)) {
-      return res.status(400).json({
-        status: "error",
-        error:
-          `Unsupported pair: ${pair}`
-      });
+    const isOTC =
+      /OTC$/i.test(pair);
+
+    let candles;
+    let source;
+    let market;
+    let dataStatus;
+    let otcSymbol = null;
+
+    if (isOTC) {
+
+      candles =
+        await fetchOTCCandles(pair);
+
+      source =
+        "OTCharts";
+
+      market =
+        "OTC MARKET";
+
+      dataStatus =
+        "OTC DATA CONNECTED";
+
+      const cached =
+        otcCache.get(pair);
+
+      otcSymbol =
+        cached?.otcSymbol || null;
+
+    } else {
+
+      if (!livePairs.includes(pair)) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            `Unsupported LIVE pair: ${pair}`
+        });
+      }
+
+      candles =
+        await fetchLiveCandles(pair);
+
+      source =
+        "Twelve Data";
+
+      market =
+        "LIVE MARKET";
+
+      dataStatus =
+        "LIVE DATA CONNECTED";
     }
 
-    const candles =
-      await getCandles(pair);
-
     const analysis =
-      analyzeMarket(candles);
-
-    const isOTC =
-      isOTCPair(pair);
-
-    const marketType =
-      isOTC
-        ? "OTC MARKET"
-        : "LIVE MARKET";
-
-    const source =
-      isOTC
-        ? "OTCharts"
-        : "Twelve Data";
+      analyzeCandles(candles);
 
     res.json({
+
       status: "ready",
 
-      market:
-        marketType,
-
+      market,
       pair,
 
       source,
+      dataStatus,
 
-      dataStatus:
-        isOTC
-          ? "OTC DATA CONNECTED"
-          : "LIVE DATA CONNECTED",
+      otcSymbol,
 
       signal:
         analysis.signal,
@@ -1217,20 +1267,18 @@ app.get("/api/signal", async (req, res) => {
         candles.length,
 
       timestamp:
-        nowISO()
+        new Date().toISOString()
     });
 
   } catch (error) {
 
-    const pair =
-      String(
-        req.query.pair || "EUR/USD"
-      ).trim();
-
     const isOTC =
-      isOTCPair(pair);
+      /OTC$/i.test(
+        String(req.query.pair || "")
+      );
 
-    res.status(500).json({
+    res.status(error.status || 500).json({
+
       status: "error",
 
       market:
@@ -1238,7 +1286,8 @@ app.get("/api/signal", async (req, res) => {
           ? "OTC MARKET"
           : "LIVE MARKET",
 
-      pair,
+      pair:
+        req.query.pair || null,
 
       source:
         isOTC
@@ -1248,7 +1297,7 @@ app.get("/api/signal", async (req, res) => {
       dataStatus:
         isOTC
           ? "OTC DATA NOT AVAILABLE"
-          : "LIVE DATA ERROR",
+          : "LIVE DATA NOT AVAILABLE",
 
       signal:
         "NO TRADE",
@@ -1257,98 +1306,100 @@ app.get("/api/signal", async (req, res) => {
         0,
 
       error:
-        error.message,
-
-      timestamp:
-        nowISO()
+        error.message
     });
   }
 });
 
 
-/* ======================================================
-   ROOT
-====================================================== */
+// =======================================================
+// ROOT
+// =======================================================
 
 app.get("/", (req, res) => {
+
   res.json({
-    status: "ok",
 
     service:
       "PO AI Predictor Backend",
 
     version:
-      "6.0.0",
+      "6.1.0",
 
-    message:
-      "PO AI Predictor API is live",
+    status:
+      "online",
 
-    markets: {
-      live:
-        "Twelve Data",
+    live:
+      "Twelve Data",
 
-      otc:
-        "OTCharts"
-    },
-
-    otcAuthentication:
-      Boolean(OTCHARTS_API_KEY),
+    otc:
+      "OTCharts",
 
     endpoints: [
+
       "/api/health",
+
+      "/api/otc-venues",
+
+      "/api/otc-symbols",
+
+      "/api/otc-usage",
+
       "/api/candles?pair=EUR/USD",
+
       "/api/candles?pair=EUR/USD%20OTC",
+
       "/api/market-analysis?pair=EUR/USD",
+
       "/api/market-analysis?pair=EUR/USD%20OTC",
+
       "/api/signal?pair=EUR/USD",
+
       "/api/signal?pair=EUR/USD%20OTC"
     ]
+
   });
+
 });
 
 
-/* ======================================================
-   404
-====================================================== */
+// =======================================================
+// ERROR HANDLER
+// =======================================================
 
-app.use((req, res) => {
-  res.status(404).json({
-    status: "error",
-    error: "Endpoint not found",
-    path: req.path
-  });
-});
+app.use((err, req, res, next) => {
 
-
-/* ======================================================
-   GLOBAL ERROR HANDLER
-====================================================== */
-
-app.use((error, req, res, next) => {
   console.error(
-    "[GLOBAL ERROR]",
-    error
+    "[SERVER ERROR]",
+    err
   );
 
   res.status(500).json({
-    status: "error",
-    error:
+
+    status:
+      "error",
+
+    message:
+      err.message ||
       "Internal server error"
+
   });
+
 });
 
 
-/* ======================================================
-   START SERVER
-====================================================== */
+// =======================================================
+// START SERVER
+// =======================================================
 
 app.listen(PORT, () => {
+
   console.log(
     "================================================="
   );
 
   console.log(
-    "PO AI PREDICTOR BACKEND V6"
+    "PO AI PREDICTOR BACKEND V6.1"
   );
 
   console.log(
@@ -1380,99 +1431,11 @@ app.listen(PORT, () => {
   );
 
   console.log(
+    "OTC METHOD: /v1/candles + /v1/symbols"
+  );
+
+  console.log(
     "================================================="
   );
+
 });
-
-
-/* ======================================================
-   BACKGROUND LIVE REFRESH
-====================================================== */
-
-async function refreshLiveData() {
-  if (!TWELVE_DATA_API_KEY) {
-    return;
-  }
-
-  for (const pair of LIVE_PAIRS) {
-    try {
-      await fetchLiveCandles(pair);
-
-      console.log(
-        `[TWELVE DATA] Updated candles for ${pair}`
-      );
-
-    } catch (error) {
-
-      liveCache[pair] = {
-        ...(liveCache[pair] || {}),
-        status: "error",
-        error: error.message
-      };
-
-      console.error(
-        `[TWELVE DATA] ${pair}:`,
-        error.message
-      );
-    }
-  }
-}
-
-
-/* ======================================================
-   BACKGROUND OTC REFRESH
-====================================================== */
-
-async function refreshOTCData() {
-  if (!OTCHARTS_API_KEY) {
-    return;
-  }
-
-  for (const pair of OTC_PAIRS) {
-    try {
-      await fetchOTCCandles(pair);
-
-      console.log(
-        `[OTCHARTS] Updated candles for ${pair}`
-      );
-
-    } catch (error) {
-
-      otcCache[pair] = {
-        ...(otcCache[pair] || {}),
-        status: "error",
-        error: error.message
-      };
-
-      console.error(
-        `[OTCHARTS] ${pair}:`,
-        error.message
-      );
-    }
-  }
-}
-
-
-/* ======================================================
-   INITIAL DATA LOAD
-====================================================== */
-
-setTimeout(() => {
-  refreshLiveData();
-  refreshOTCData();
-}, 2000);
-
-
-/* ======================================================
-   PERIODIC DATA REFRESH
-====================================================== */
-
-setInterval(
-  refreshLiveData,
-  LIVE_DATA_INTERVAL
-);
-
-setInterval(
-  refreshOTCData,
-  OTC_DATA_INTERVAL
-);
