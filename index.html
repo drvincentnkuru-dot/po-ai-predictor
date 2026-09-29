@@ -1,125 +1,123 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
 
-  <title>PO AI Predictor V7.1</title>
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
 
-  <link rel="stylesheet" href="style.css">
+  <title>PO AI Predictor</title>
+
+  <link rel="stylesheet" href="style.css" />
 </head>
 
 <body>
 
-  <div class="app">
+  <div class="container">
 
-    <header>
-      <h1>PO AI Predictor</h1>
-      <p>LIVE Market Analysis & AI Signals</p>
+    <!-- HEADER -->
+    <header class="header">
+      <h1>PO AI PREDICTOR</h1>
+      <p>LIVE MARKET ANALYSIS</p>
     </header>
 
+
     <!-- CONTROL PANEL -->
-    <section class="card">
+    <section class="control-card">
 
-      <h2>Market Analysis</h2>
+      <!-- MARKET -->
+      <div class="control-group">
+        <label for="marketType">MARKET TYPE</label>
 
-      <label for="marketType">Market Type</label>
-
-      <select id="marketType">
-        <option value="live">LIVE MARKET</option>
-      </select>
-
-
-      <label for="pair">LIVE Currency Pair</label>
-
-      <select id="pair">
-
-        <option value="EUR/USD">EUR/USD</option>
-        <option value="GBP/USD">GBP/USD</option>
-        <option value="USD/JPY">USD/JPY</option>
-        <option value="USD/CHF">USD/CHF</option>
-
-        <option value="AUD/USD">AUD/USD</option>
-        <option value="USD/CAD">USD/CAD</option>
-        <option value="NZD/USD">NZD/USD</option>
-
-        <option value="EUR/GBP">EUR/GBP</option>
-        <option value="EUR/JPY">EUR/JPY</option>
-        <option value="GBP/JPY">GBP/JPY</option>
-
-        <option value="AUD/JPY">AUD/JPY</option>
-        <option value="CAD/JPY">CAD/JPY</option>
-        <option value="CHF/JPY">CHF/JPY</option>
-
-        <option value="EUR/AUD">EUR/AUD</option>
-        <option value="EUR/CAD">EUR/CAD</option>
-        <option value="EUR/CHF">EUR/CHF</option>
-
-        <option value="GBP/AUD">GBP/AUD</option>
-        <option value="GBP/CAD">GBP/CAD</option>
-        <option value="GBP/CHF">GBP/CHF</option>
-
-        <option value="NZD/JPY">NZD/JPY</option>
-        <option value="NZD/CAD">NZD/CAD</option>
-
-        <option value="AUD/CAD">AUD/CAD</option>
-        <option value="AUD/CHF">AUD/CHF</option>
-        <option value="CAD/CHF">CAD/CHF</option>
-
-      </select>
+        <select id="marketType">
+          <option value="live" selected>LIVE MARKET</option>
+        </select>
+      </div>
 
 
-      <button id="analyzeBtn">
+      <!-- CURRENCY PAIR -->
+      <div class="control-group">
+        <label for="pair">CURRENCY PAIR</label>
+
+        <select id="pair">
+          <option value="EUR/USD">EUR/USD LIVE</option>
+        </select>
+      </div>
+
+
+      <!-- TIMEFRAME -->
+      <div class="control-group">
+        <label for="timeframe">TIMEFRAME</label>
+
+        <select id="timeframe">
+
+          <option value="1" selected>
+            1 MINUTE
+          </option>
+
+          <option value="2">
+            2 MINUTES
+          </option>
+
+          <option value="3">
+            3 MINUTES
+          </option>
+
+        </select>
+      </div>
+
+
+      <!-- ANALYZE BUTTON -->
+      <button id="analyzeBtn" type="button">
         ANALYZE MARKET
       </button>
 
     </section>
 
 
-    <!-- CONNECTION STATUS -->
-    <section class="card">
+    <!-- STATUS -->
+    <section class="status-card">
 
-      <h2>System Status</h2>
+      <div class="status-row">
+        <span>BACKEND STATUS</span>
 
-      <div class="data-row">
-        <span>Backend</span>
-        <strong id="status">CHECKING...</strong>
+        <span id="status">
+          CHECKING...
+        </span>
       </div>
 
-      <div class="data-row">
-        <span>Data Source</span>
-        <strong>Twelve Data LIVE</strong>
-      </div>
+      <div class="status-row">
+        <span>DATA SOURCE</span>
 
-      <div class="data-row">
-        <span>Timeframe</span>
-        <strong>1 MIN / 2 MIN / 3 MIN</strong>
-      </div>
-
-      <div class="data-row">
-        <span>Current Pair</span>
-        <strong id="pairLabel">EUR/USD</strong>
+        <span id="dataStatus">
+          Twelve Data LIVE
+        </span>
       </div>
 
     </section>
 
 
-    <!-- RESULTS -->
-    <section class="card">
+    <!-- SELECTED MARKET -->
+    <section class="market-card">
 
-      <h2>AI SIGNALS</h2>
+      <h2>SELECTED MARKET</h2>
 
-      <div id="results">
+      <div class="market-info">
 
-        <div class="signal-card">
+        <div>
+          <span class="label">PAIR</span>
+          <strong id="pairLabel">
+            EUR/USD LIVE
+          </strong>
+        </div>
 
-          <h3>READY</h3>
-
-          <p>
-            Select a LIVE currency pair and press
-            <strong>ANALYZE MARKET</strong>.
-          </p>
-
+        <div>
+          <span class="label">TIMEFRAME</span>
+          <strong id="timeframeLabel">
+            1 MINUTE
+          </strong>
         </div>
 
       </div>
@@ -127,39 +125,32 @@
     </section>
 
 
-    <!-- MARKET DATA -->
-    <section class="card">
+    <!-- RESULT -->
+    <main id="results">
 
-      <h2>Market Data</h2>
+      <div class="empty-state">
 
-      <div class="data-row">
-        <span>Market</span>
-        <strong id="marketLabel">LIVE</strong>
+        <h2>READY TO ANALYZE</h2>
+
+        <p>
+          Select a currency pair and timeframe,
+          then press ANALYZE MARKET.
+        </p>
+
       </div>
 
-      <div class="data-row">
-        <span>Pair</span>
-        <strong id="pairLabel2">EUR/USD</strong>
-      </div>
-
-      <div class="data-row">
-        <span>Data Status</span>
-        <strong id="dataStatus">WAITING</strong>
-      </div>
-
-    </section>
+    </main>
 
 
     <!-- FOOTER -->
-    <footer>
+    <footer class="footer">
 
       <p>
-        ⚠️ Signals are analytical estimates and are not guaranteed
-        trading results.
+        PO AI Predictor • LIVE MARKET
       </p>
 
       <p>
-        PO AI Predictor V7.1 • Twelve Data LIVE
+        Signals are analytical estimates and are not guaranteed results.
       </p>
 
     </footer>
