@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PO AI Predictor V2</title>
+
+  <title>PO AI Predictor V7.1</title>
+
   <link rel="stylesheet" href="style.css">
 </head>
 
@@ -13,64 +15,119 @@
 
     <header>
       <h1>PO AI Predictor</h1>
-      <p>Market analysis & signal tracker</p>
+      <p>LIVE Market Analysis & AI Signals</p>
     </header>
 
+    <!-- CONTROL PANEL -->
     <section class="card">
 
-      <label>Market Type</label>
+      <h2>Market Analysis</h2>
+
+      <label for="marketType">Market Type</label>
+
       <select id="marketType">
         <option value="live">LIVE MARKET</option>
-        <option value="otc">OTC MARKET</option>
       </select>
 
-      <label>Currency Pair</label>
-      <select id="pair"></select>
 
-      <label>Expire Time</label>
-      <select id="expiry">
-        <option value="1">1 Minute</option>
-        <option value="2">2 Minutes</option>
-        <option value="3">3 Minutes</option>
-        <option value="5">5 Minutes</option>
+      <label for="pair">LIVE Currency Pair</label>
+
+      <select id="pair">
+
+        <option value="EUR/USD">EUR/USD</option>
+        <option value="GBP/USD">GBP/USD</option>
+        <option value="USD/JPY">USD/JPY</option>
+        <option value="USD/CHF">USD/CHF</option>
+
+        <option value="AUD/USD">AUD/USD</option>
+        <option value="USD/CAD">USD/CAD</option>
+        <option value="NZD/USD">NZD/USD</option>
+
+        <option value="EUR/GBP">EUR/GBP</option>
+        <option value="EUR/JPY">EUR/JPY</option>
+        <option value="GBP/JPY">GBP/JPY</option>
+
+        <option value="AUD/JPY">AUD/JPY</option>
+        <option value="CAD/JPY">CAD/JPY</option>
+        <option value="CHF/JPY">CHF/JPY</option>
+
+        <option value="EUR/AUD">EUR/AUD</option>
+        <option value="EUR/CAD">EUR/CAD</option>
+        <option value="EUR/CHF">EUR/CHF</option>
+
+        <option value="GBP/AUD">GBP/AUD</option>
+        <option value="GBP/CAD">GBP/CAD</option>
+        <option value="GBP/CHF">GBP/CHF</option>
+
+        <option value="NZD/JPY">NZD/JPY</option>
+        <option value="NZD/CAD">NZD/CAD</option>
+
+        <option value="AUD/CAD">AUD/CAD</option>
+        <option value="AUD/CHF">AUD/CHF</option>
+        <option value="CAD/CHF">CAD/CHF</option>
+
       </select>
 
-      <button id="analyzeBtn">ANALYZE MARKET</button>
+
+      <button id="analyzeBtn">
+        ANALYZE MARKET
+      </button>
 
     </section>
 
-    <section class="signal-card">
 
-      <h2>AI SIGNAL</h2>
+    <!-- CONNECTION STATUS -->
+    <section class="card">
 
-      <div id="signal" class="signal neutral">
-        WAITING
+      <h2>System Status</h2>
+
+      <div class="data-row">
+        <span>Backend</span>
+        <strong id="status">CHECKING...</strong>
       </div>
 
-      <div class="info">
-        <div>
-          <span>Confidence</span>
-          <strong id="confidence">--%</strong>
-        </div>
-
-        <div>
-          <span>Entry Time</span>
-          <strong id="entryTime">--:--:--</strong>
-        </div>
-
-        <div>
-          <span>Expiry</span>
-          <strong id="expiryTime">--:--:--</strong>
-        </div>
+      <div class="data-row">
+        <span>Data Source</span>
+        <strong>Twelve Data LIVE</strong>
       </div>
 
-      <div class="countdown">
-        <span>Countdown</span>
-        <strong id="countdown">--</strong>
+      <div class="data-row">
+        <span>Timeframe</span>
+        <strong>1 MIN / 2 MIN / 3 MIN</strong>
+      </div>
+
+      <div class="data-row">
+        <span>Current Pair</span>
+        <strong id="pairLabel">EUR/USD</strong>
       </div>
 
     </section>
 
+
+    <!-- RESULTS -->
+    <section class="card">
+
+      <h2>AI SIGNALS</h2>
+
+      <div id="results">
+
+        <div class="signal-card">
+
+          <h3>READY</h3>
+
+          <p>
+            Select a LIVE currency pair and press
+            <strong>ANALYZE MARKET</strong>.
+          </p>
+
+        </div>
+
+      </div>
+
+    </section>
+
+
+    <!-- MARKET DATA -->
     <section class="card">
 
       <h2>Market Data</h2>
@@ -82,40 +139,33 @@
 
       <div class="data-row">
         <span>Pair</span>
-        <strong id="pairLabel">--</strong>
+        <strong id="pairLabel2">EUR/USD</strong>
       </div>
 
       <div class="data-row">
-        <span>Data status</span>
+        <span>Data Status</span>
         <strong id="dataStatus">WAITING</strong>
       </div>
 
     </section>
 
-    <section class="card">
 
-      <h2>Signal History</h2>
-
-      <div id="history">
-        <p class="empty">No signals yet.</p>
-      </div>
-
-      <div class="stats">
-        <span>Total: <b id="total">0</b></span>
-        <span>Wins: <b id="wins">0</b></span>
-        <span>Losses: <b id="losses">0</b></span>
-        <span>Win rate: <b id="winRate">0%</b></span>
-      </div>
-
-    </section>
-
+    <!-- FOOTER -->
     <footer>
+
       <p>
-        ⚠️ Signals are analytical estimates, not guaranteed trading results.
+        ⚠️ Signals are analytical estimates and are not guaranteed
+        trading results.
       </p>
+
+      <p>
+        PO AI Predictor V7.1 • Twelve Data LIVE
+      </p>
+
     </footer>
 
   </div>
+
 
   <script src="script.js"></script>
 
