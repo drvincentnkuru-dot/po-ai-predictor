@@ -1,42 +1,3 @@
-/*
-=========================================================
- PO AI PREDICTOR BACKEND V7.0
- LIVE ONLY
- DATA SOURCE: TWELVE DATA
-
- FEATURES
- --------------------------------------------------------
- • Twelve Data LIVE market data
- • 1-minute candles
- • Local 2-minute candle aggregation
- • Local 3-minute candle aggregation
- • EMA 9 / EMA 21
- • RSI 14
- • MACD 12 / 26 / 9
- • Bollinger Bands 20 / 2
- • ATR 14
- • Stochastic 14 / 3 / 3
- • Support / Resistance
- • Momentum
- • Volatility filter
- • Market condition detection
- • Multi-factor signal scoring
- • CALL / PUT / NO TRADE
- • Confidence score
- • Signal reasons
- • Data cache
- • API retry
- • Health endpoint
- • Pair endpoint
- • Analysis endpoint
-
- IMPORTANT
- --------------------------------------------------------
- This is an analysis engine.
- It does NOT guarantee winning trades.
-=========================================================
-*/
-
 const express = require("express");
 const cors = require("cors");
 
@@ -47,152 +8,142 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-/* ======================================================
-   CONFIGURATION
-====================================================== */
+/*
+=========================================================
+ PO AI PREDICTOR BACKEND V7.1
+ LIVE MARKET DATA
+ Source: Twelve Data
 
-const VERSION = "V7.0";
+ TIMEFRAMES:
+ 1 MIN
+ 2 MIN
+ 3 MIN
 
-const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
+ INDICATORS:
+ EMA 9 / EMA 21
+ RSI 14
+ MACD 12 / 26 / 9
+ Bollinger Bands 20 / 2
+ ATR 14
+ Stochastic 14 / 3 / 3
+ Support / Resistance
+ Momentum
 
-const TWELVE_DATA_URL =
-  "https://api.twelvedata.com/time_series";
+ V7.1 IMPROVEMENTS:
+ - UTC candle handling
+ - Adaptive signal scoring
+ - Better trend/range handling
+ - Multi-timeframe confirmation
+ - More balanced signal generation
+ - Closed-candle protection
+=========================================================
+*/
+
+const API_KEY = process.env.TWELVE_DATA_API_KEY;
+
+const TWELVE_DATA_URL = "https://api.twelvedata.com/time_series";
 
 const INTERVAL = "1min";
-
-/*
-  Number of 1-minute candles downloaded.
-
-  We need enough candles for:
-  EMA
-  RSI
-  MACD
-  Bollinger
-  ATR
-  Stochastic
-  Support/Resistance
-*/
 const MAX_CANDLES = 250;
 
-/*
-  Cache lifetime.
-  Twelve Data should not be requested repeatedly
-  for the same pair within a few seconds.
-*/
 const CACHE_TTL = 15000;
 
-/*
-  Use only completed candles.
-
-  The latest 1-minute candle may still be forming.
-*/
-const USE_CLOSED_CANDLES = true;
-
-/*
-  Minimum candles required.
-*/
 const MIN_CANDLES = 80;
 
+/*
+=========================================================
+ SUPPORTED LIVE PAIRS
+=========================================================
+*/
 
-/* ======================================================
-   SUPPORTED LIVE PAIRS
-====================================================== */
+const SUPPORTED_PAIRS = [
+  "EUR/USD",
+  "GBP/USD",
+  "USD/JPY",
+  "USD/CHF",
+  "AUD/USD",
+  "USD/CAD",
+  "NZD/USD",
+  "EUR/GBP",
+  "EUR/JPY",
+  "GBP/JPY",
+  "AUD/JPY",
+  "CAD/JPY",
+  "CHF/JPY",
+  "EUR/AUD",
+  "EUR/CAD",
+  "EUR/CHF",
+  "GBP/AUD",
+  "GBP/CAD",
+  "GBP/CHF",
+  "NZD/JPY",
+  "NZD/CAD",
+  "AUD/CAD",
+  "AUD/CHF",
+  "CAD/CHF"
+];
 
-const PAIRS = {
-  "EUR/USD": "EUR/USD",
-  "GBP/USD": "GBP/USD",
-  "USD/JPY": "USD/JPY",
-  "USD/CHF": "USD/CHF",
-  "AUD/USD": "AUD/USD",
-  "USD/CAD": "USD/CAD",
-  "NZD/USD": "NZD/USD",
-  "EUR/GBP": "EUR/GBP",
-  "EUR/JPY": "EUR/JPY",
-  "GBP/JPY": "GBP/JPY",
-
-  // Additional major/minor FX pairs
-  "AUD/JPY": "AUD/JPY",
-  "CAD/JPY": "CAD/JPY",
-  "CHF/JPY": "CHF/JPY",
-  "EUR/AUD": "EUR/AUD",
-  "EUR/CAD": "EUR/CAD",
-  "EUR/CHF": "EUR/CHF",
-  "GBP/AUD": "GBP/AUD",
-  "GBP/CAD": "GBP/CAD",
-  "GBP/CHF": "GBP/CHF",
-  "NZD/JPY": "NZD/JPY",
-  "NZD/CAD": "NZD/CAD",
-  "AUD/CAD": "AUD/CAD",
-  "AUD/CHF": "AUD/CHF",
-  "CAD/CHF": "CAD/CHF"
-};
-
-
-/* ======================================================
-   CACHE
-====================================================== */
+/*
+=========================================================
+ CACHE
+=========================================================
+*/
 
 const marketCache = new Map();
 
+/*
+=========================================================
+ BASIC HELPERS
+=========================================================
+*/
 
-/* ======================================================
-   BASIC HELPERS
-====================================================== */
+function round(value, decimals = 6) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return null;
+  }
 
-function round(value, decimals = 5) {
-  if (!Number.isFinite(value)) return null;
-
-  const factor = Math.pow(10, decimals);
-
-  return Math.round(value * factor) / factor;
+  return Number(Number(value).toFixed(decimals));
 }
-
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-
 function average(values) {
-  const valid = values.filter(Number.isFinite);
-
-  if (!valid.length) return null;
-
-  return valid.reduce((a, b) => a + b, 0) / valid.length;
-}
-
-
-function standardDeviation(values) {
-  const valid = values.filter(Number.isFinite);
-
-  if (valid.length < 2) return null;
-
-  const mean = average(valid);
-
-  const variance =
-    valid.reduce(
-      (sum, value) => sum + Math.pow(value - mean, 2),
-      0
-    ) / valid.length;
-
-  return Math.sqrt(variance);
-}
-
-
-/* ======================================================
-   EMA
-====================================================== */
-
-function calculateEMA(values, period) {
-  if (!values || values.length < period) {
-    return Array(values ? values.length : 0).fill(null);
+  if (!values || values.length === 0) {
+    return null;
   }
 
-  const result = Array(values.length).fill(null);
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function safeNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/*
+=========================================================
+ EMA
+=========================================================
+*/
+
+function calculateEMA(values, period) {
+  const result = new Array(values.length).fill(null);
+
+  if (values.length < period) {
+    return result;
+  }
 
   const multiplier = 2 / (period + 1);
 
-  let previous = average(values.slice(0, period));
+  let sum = 0;
+
+  for (let i = 0; i < period; i++) {
+    sum += values[i];
+  }
+
+  let previous = sum / period;
 
   result[period - 1] = previous;
 
@@ -206,32 +157,16 @@ function calculateEMA(values, period) {
   return result;
 }
 
+/*
+=========================================================
+ RSI
+=========================================================
+*/
 
-/* ======================================================
-   SMA
-====================================================== */
+function calculateRSI(values, period = 14) {
+  const result = new Array(values.length).fill(null);
 
-function calculateSMA(values, period) {
-  const result = Array(values.length).fill(null);
-
-  for (let i = period - 1; i < values.length; i++) {
-    result[i] = average(
-      values.slice(i - period + 1, i + 1)
-    );
-  }
-
-  return result;
-}
-
-
-/* ======================================================
-   RSI
-====================================================== */
-
-function calculateRSI(closes, period = 14) {
-  const result = Array(closes.length).fill(null);
-
-  if (closes.length <= period) {
+  if (values.length <= period) {
     return result;
   }
 
@@ -239,9 +174,9 @@ function calculateRSI(closes, period = 14) {
   let losses = 0;
 
   for (let i = 1; i <= period; i++) {
-    const change = closes[i] - closes[i - 1];
+    const change = values[i] - values[i - 1];
 
-    if (change >= 0) {
+    if (change > 0) {
       gains += change;
     } else {
       losses += Math.abs(change);
@@ -258,212 +193,228 @@ function calculateRSI(closes, period = 14) {
     result[period] = 100 - 100 / (1 + rs);
   }
 
-  for (let i = period + 1; i < closes.length; i++) {
-    const change = closes[i] - closes[i - 1];
+  for (let i = period + 1; i < values.length; i++) {
+    const change = values[i] - values[i - 1];
 
     const gain = change > 0 ? change : 0;
     const loss = change < 0 ? Math.abs(change) : 0;
 
     averageGain =
-      (averageGain * (period - 1) + gain) / period;
+      ((averageGain * (period - 1)) + gain) / period;
 
     averageLoss =
-      (averageLoss * (period - 1) + loss) / period;
+      ((averageLoss * (period - 1)) + loss) / period;
 
     if (averageLoss === 0) {
       result[i] = 100;
     } else {
       const rs = averageGain / averageLoss;
 
-      result[i] = 100 - 100 / (1 + rs);
+      result[i] =
+        100 - 100 / (1 + rs);
     }
   }
 
   return result;
 }
 
-
-/* ======================================================
-   MACD
-====================================================== */
+/*
+=========================================================
+ MACD
+=========================================================
+*/
 
 function calculateMACD(
-  closes,
+  values,
   fastPeriod = 12,
   slowPeriod = 26,
   signalPeriod = 9
 ) {
-  const fastEMA = calculateEMA(closes, fastPeriod);
-  const slowEMA = calculateEMA(closes, slowPeriod);
+  const fastEMA = calculateEMA(values, fastPeriod);
+  const slowEMA = calculateEMA(values, slowPeriod);
 
-  const macd = Array(closes.length).fill(null);
+  const macdLine = new Array(values.length).fill(null);
 
-  for (let i = 0; i < closes.length; i++) {
+  for (let i = 0; i < values.length; i++) {
     if (
       fastEMA[i] !== null &&
       slowEMA[i] !== null
     ) {
-      macd[i] = fastEMA[i] - slowEMA[i];
+      macdLine[i] =
+        fastEMA[i] - slowEMA[i];
     }
   }
 
-  const macdValues = macd.filter(
-    value => value !== null
-  );
+  const compactMACD = [];
+  const compactIndexes = [];
 
-  const signalCompact = calculateEMA(
-    macdValues,
-    signalPeriod
-  );
-
-  const signal = Array(closes.length).fill(null);
-
-  let compactIndex = 0;
-
-  for (let i = 0; i < closes.length; i++) {
-    if (macd[i] !== null) {
-      signal[i] = signalCompact[compactIndex];
-      compactIndex++;
+  for (let i = 0; i < macdLine.length; i++) {
+    if (macdLine[i] !== null) {
+      compactMACD.push(macdLine[i]);
+      compactIndexes.push(i);
     }
   }
 
-  const histogram = Array(closes.length).fill(null);
+  const compactSignal =
+    calculateEMA(
+      compactMACD,
+      signalPeriod
+    );
 
-  for (let i = 0; i < closes.length; i++) {
-    if (
-      macd[i] !== null &&
-      signal[i] !== null
-    ) {
-      histogram[i] = macd[i] - signal[i];
+  const signalLine =
+    new Array(values.length).fill(null);
+
+  const histogram =
+    new Array(values.length).fill(null);
+
+  for (let i = 0; i < compactIndexes.length; i++) {
+    const originalIndex =
+      compactIndexes[i];
+
+    if (compactSignal[i] !== null) {
+      signalLine[originalIndex] =
+        compactSignal[i];
+
+      histogram[originalIndex] =
+        macdLine[originalIndex] -
+        compactSignal[i];
     }
   }
 
   return {
-    macd,
-    signal,
+    macdLine,
+    signalLine,
     histogram
   };
 }
 
-
-/* ======================================================
-   BOLLINGER BANDS
-====================================================== */
+/*
+=========================================================
+ BOLLINGER BANDS
+=========================================================
+*/
 
 function calculateBollinger(
-  closes,
+  values,
   period = 20,
   multiplier = 2
 ) {
-  const middle = calculateSMA(closes, period);
+  const upper = new Array(values.length).fill(null);
+  const middle = new Array(values.length).fill(null);
+  const lower = new Array(values.length).fill(null);
 
-  const upper = Array(closes.length).fill(null);
-  const lower = Array(closes.length).fill(null);
-  const bandwidth = Array(closes.length).fill(null);
+  for (let i = period - 1; i < values.length; i++) {
+    const slice =
+      values.slice(
+        i - period + 1,
+        i + 1
+      );
 
-  for (let i = period - 1; i < closes.length; i++) {
-    const window = closes.slice(
-      i - period + 1,
-      i + 1
-    );
+    const mean = average(slice);
 
-    const sd = standardDeviation(window);
+    const variance =
+      average(
+        slice.map(
+          value =>
+            Math.pow(value - mean, 2)
+        )
+      );
 
-    if (sd === null || middle[i] === null) {
-      continue;
-    }
+    const standardDeviation =
+      Math.sqrt(variance);
+
+    middle[i] = mean;
 
     upper[i] =
-      middle[i] + multiplier * sd;
+      mean +
+      multiplier * standardDeviation;
 
     lower[i] =
-      middle[i] - multiplier * sd;
-
-    if (middle[i] !== 0) {
-      bandwidth[i] =
-        (upper[i] - lower[i]) /
-        middle[i];
-    }
+      mean -
+      multiplier * standardDeviation;
   }
 
   return {
     upper,
     middle,
-    lower,
-    bandwidth
+    lower
   };
 }
 
+/*
+=========================================================
+ ATR
+=========================================================
+*/
 
-/* ======================================================
-   TRUE RANGE
-====================================================== */
+function calculateATR(candles, period = 14) {
+  const trueRanges =
+    new Array(candles.length).fill(null);
 
-function calculateTrueRange(candles) {
-  const tr = Array(candles.length).fill(null);
+  const atr =
+    new Array(candles.length).fill(null);
 
-  for (let i = 0; i < candles.length; i++) {
-    const candle = candles[i];
-
-    if (i === 0) {
-      tr[i] = candle.high - candle.low;
-      continue;
-    }
-
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
     const previousClose =
       candles[i - 1].close;
 
-    const range1 =
-      candle.high - candle.low;
+    const tr1 =
+      high - low;
 
-    const range2 =
-      Math.abs(candle.high - previousClose);
+    const tr2 =
+      Math.abs(high - previousClose);
 
-    const range3 =
-      Math.abs(candle.low - previousClose);
+    const tr3 =
+      Math.abs(low - previousClose);
 
-    tr[i] =
-      Math.max(range1, range2, range3);
+    trueRanges[i] =
+      Math.max(
+        tr1,
+        tr2,
+        tr3
+      );
   }
 
-  return tr;
-}
+  const initialTR =
+    trueRanges
+      .slice(1, period + 1)
+      .filter(v => v !== null);
 
-
-/* ======================================================
-   ATR
-====================================================== */
-
-function calculateATR(candles, period = 14) {
-  const tr = calculateTrueRange(candles);
-
-  const atr = Array(candles.length).fill(null);
-
-  if (tr.length < period) {
+  if (initialTR.length < period) {
     return atr;
   }
 
-  let initial = average(
-    tr.slice(0, period)
-  );
+  let previousATR =
+    average(initialTR);
 
-  atr[period - 1] = initial;
+  atr[period] =
+    previousATR;
 
-  for (let i = period; i < tr.length; i++) {
-    initial =
-      ((initial * (period - 1)) + tr[i]) /
-      period;
+  for (
+    let i = period + 1;
+    i < candles.length;
+    i++
+  ) {
+    previousATR =
+      (
+        previousATR * (period - 1) +
+        trueRanges[i]
+      ) / period;
 
-    atr[i] = initial;
+    atr[i] =
+      previousATR;
   }
 
   return atr;
 }
 
-
-/* ======================================================
-   STOCHASTIC
-====================================================== */
+/*
+=========================================================
+ STOCHASTIC
+=========================================================
+*/
 
 function calculateStochastic(
   candles,
@@ -472,24 +423,34 @@ function calculateStochastic(
   smoothD = 3
 ) {
   const rawK =
-    Array(candles.length).fill(null);
+    new Array(candles.length).fill(null);
+
+  const k =
+    new Array(candles.length).fill(null);
+
+  const d =
+    new Array(candles.length).fill(null);
 
   for (
     let i = period - 1;
     i < candles.length;
     i++
   ) {
-    const window =
+    const slice =
       candles.slice(
         i - period + 1,
         i + 1
       );
 
     const highestHigh =
-      Math.max(...window.map(c => c.high));
+      Math.max(
+        ...slice.map(c => c.high)
+      );
 
     const lowestLow =
-      Math.min(...window.map(c => c.low));
+      Math.min(
+        ...slice.map(c => c.low)
+      );
 
     const range =
       highestHigh - lowestLow;
@@ -498,28 +459,49 @@ function calculateStochastic(
       rawK[i] = 50;
     } else {
       rawK[i] =
-        ((candles[i].close - lowestLow) /
-          range) *
-        100;
+        (
+          (candles[i].close - lowestLow) /
+          range
+        ) * 100;
     }
   }
 
-  const k = calculateSMA(
-    rawK.map(v => v ?? 50),
-    smoothK
-  );
+  for (
+    let i = period - 1 + smoothK - 1;
+    i < candles.length;
+    i++
+  ) {
+    const values =
+      rawK
+        .slice(
+          i - smoothK + 1,
+          i + 1
+        )
+        .filter(v => v !== null);
 
-  const d = calculateSMA(
-    k.map(v => v ?? 50),
-    smoothD
-  );
+    if (values.length === smoothK) {
+      k[i] =
+        average(values);
+    }
+  }
 
-  /*
-    Restore nulls before enough data exists.
-  */
-  for (let i = 0; i < period - 1; i++) {
-    k[i] = null;
-    d[i] = null;
+  for (
+    let i = period - 1 + smoothK - 1 + smoothD - 1;
+    i < candles.length;
+    i++
+  ) {
+    const values =
+      k
+        .slice(
+          i - smoothD + 1,
+          i + 1
+        )
+        .filter(v => v !== null);
+
+    if (values.length === smoothD) {
+      d[i] =
+        average(values);
+    }
   }
 
   return {
@@ -528,29 +510,40 @@ function calculateStochastic(
   };
 }
 
-
-/* ======================================================
-   SUPPORT / RESISTANCE
-====================================================== */
+/*
+=========================================================
+ SUPPORT / RESISTANCE
+=========================================================
+*/
 
 function calculateSupportResistance(
   candles,
   lookback = 30
 ) {
-  const recent =
-    candles.slice(-lookback);
+  const slice =
+    candles.slice(
+      Math.max(
+        0,
+        candles.length - lookback
+      )
+    );
 
-  const lows =
-    recent.map(c => c.low);
-
-  const highs =
-    recent.map(c => c.high);
+  if (!slice.length) {
+    return {
+      support: null,
+      resistance: null
+    };
+  }
 
   const support =
-    Math.min(...lows);
+    Math.min(
+      ...slice.map(c => c.low)
+    );
 
   const resistance =
-    Math.max(...highs);
+    Math.max(
+      ...slice.map(c => c.high)
+    );
 
   return {
     support,
@@ -558,307 +551,188 @@ function calculateSupportResistance(
   };
 }
 
-
-/* ======================================================
-   MOMENTUM
-====================================================== */
+/*
+=========================================================
+ MOMENTUM
+=========================================================
+*/
 
 function calculateMomentum(
-  closes,
+  values,
   period = 5
 ) {
-  if (closes.length <= period) {
+  if (values.length <= period) {
     return null;
   }
 
   const current =
-    closes[closes.length - 1];
+    values[values.length - 1];
 
   const previous =
-    closes[closes.length - 1 - period];
+    values[
+      values.length - 1 - period
+    ];
 
-  if (previous === 0) {
+  if (!previous) {
     return null;
   }
 
   return (
-    ((current - previous) /
-      previous) *
-    100
-  );
+    (current - previous) /
+    previous
+  ) * 100;
 }
 
+/*
+=========================================================
+ CANDLE PARSING
+=========================================================
+*/
 
-/* ======================================================
-   CANDLE NORMALIZATION
-====================================================== */
-
-function normalizeCandles(values) {
+function parseTwelveDataCandles(values) {
   if (!Array.isArray(values)) {
     return [];
   }
 
-  const candles = values
-    .map(item => ({
-      datetime: item.datetime,
+  const candles =
+    values
+      .map(item => ({
+        datetime: item.datetime,
 
-      open: Number(item.open),
+        timestamp:
+          new Date(item.datetime).getTime(),
 
-      high: Number(item.high),
+        open:
+          Number(item.open),
 
-      low: Number(item.low),
+        high:
+          Number(item.high),
 
-      close: Number(item.close),
+        low:
+          Number(item.low),
 
-      volume:
-        item.volume !== undefined
-          ? Number(item.volume)
-          : null
-    }))
-    .filter(c =>
-      c.datetime &&
-      Number.isFinite(c.open) &&
-      Number.isFinite(c.high) &&
-      Number.isFinite(c.low) &&
-      Number.isFinite(c.close)
-    );
-
-  /*
-    Twelve Data normally returns newest first.
-    We want oldest -> newest.
-  */
-  candles.sort(
-    (a, b) =>
-      new Date(a.datetime) -
-      new Date(b.datetime)
-  );
+        close:
+          Number(item.close)
+      }))
+      .filter(c =>
+        Number.isFinite(c.timestamp) &&
+        Number.isFinite(c.open) &&
+        Number.isFinite(c.high) &&
+        Number.isFinite(c.low) &&
+        Number.isFinite(c.close)
+      )
+      .sort(
+        (a, b) =>
+          a.timestamp - b.timestamp
+      );
 
   return candles;
 }
 
+/*
+=========================================================
+ FETCH TWELVE DATA
+=========================================================
+*/
 
-/* ======================================================
-   1-MIN -> N-MIN AGGREGATION
-====================================================== */
-
-function aggregateCandles(
-  candles,
-  minutes
-) {
-  if (minutes === 1) {
-    return candles;
-  }
-
-  const result = [];
-
-  /*
-    Group by UTC minute buckets.
-  */
-  let bucket = null;
-
-  for (const candle of candles) {
-    const date =
-      new Date(candle.datetime);
-
-    const minute =
-      date.getUTCMinutes();
-
-    const bucketMinute =
-      Math.floor(minute / minutes) *
-      minutes;
-
-    const key =
-      Date.UTC(
-        date.getUTCFullYear(),
-        date.getUTCMonth(),
-        date.getUTCDate(),
-        date.getUTCHours(),
-        bucketMinute
-      );
-
-    if (
-      bucket === null ||
-      bucket.key !== key
-    ) {
-      bucket = {
-        key,
-        datetime:
-          new Date(key).toISOString(),
-
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-
-        volume:
-          Number.isFinite(candle.volume)
-            ? candle.volume
-            : null,
-
-        count: 1
-      };
-
-      result.push(bucket);
-    } else {
-      bucket.high =
-        Math.max(
-          bucket.high,
-          candle.high
-        );
-
-      bucket.low =
-        Math.min(
-          bucket.low,
-          candle.low
-        );
-
-      bucket.close =
-        candle.close;
-
-      if (
-        Number.isFinite(candle.volume)
-      ) {
-        bucket.volume =
-          (bucket.volume || 0) +
-          candle.volume;
-      }
-
-      bucket.count++;
-    }
-  }
-
-  /*
-    Only keep complete groups where possible.
-  */
-  return result.filter(
-    c => c.count >= minutes
-  );
-}
-
-
-/* ======================================================
-   DATA FETCH
-====================================================== */
-
-async function fetchTwelveData(
-  symbol,
-  retry = 1
-) {
-  if (!TWELVE_DATA_API_KEY) {
+async function fetchLiveCandles(pair) {
+  if (!API_KEY) {
     throw new Error(
-      "TWELVE_DATA_API_KEY is missing"
+      "TWELVE_DATA_API_KEY is not configured"
     );
   }
 
   const url =
-    new URL(TWELVE_DATA_URL);
+    `${TWELVE_DATA_URL}` +
+    `?symbol=${encodeURIComponent(pair)}` +
+    `&interval=${INTERVAL}` +
+    `&outputsize=${MAX_CANDLES}` +
+    `&timezone=UTC` +
+    `&apikey=${encodeURIComponent(API_KEY)}`;
 
-  url.searchParams.set(
-    "symbol",
-    symbol
-  );
+  const response =
+    await fetch(url);
 
-  url.searchParams.set(
-    "interval",
-    INTERVAL
-  );
-
-  url.searchParams.set(
-    "outputsize",
-    String(MAX_CANDLES)
-  );
-
-  url.searchParams.set(
-    "order",
-    "asc"
-  );
-
-  url.searchParams.set(
-    "apikey",
-    TWELVE_DATA_API_KEY
-  );
-
-  let lastError = null;
-
-  for (
-    let attempt = 0;
-    attempt <= retry;
-    attempt++
-  ) {
-    try {
-      const response =
-        await fetch(url.toString(), {
-          method: "GET",
-          headers: {
-            Accept: "application/json"
-          }
-        });
-
-      const data =
-        await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          `HTTP ${response.status}`
-        );
-      }
-
-      if (
-        data.status === "error" ||
-        data.code
-      ) {
-        throw new Error(
-          data.message ||
-          "Twelve Data API error"
-        );
-      }
-
-      const candles =
-        normalizeCandles(
-          data.values
-        );
-
-      if (
-        candles.length <
-        MIN_CANDLES
-      ) {
-        throw new Error(
-          `Not enough candles: ${candles.length}`
-        );
-      }
-
-      return {
-        candles,
-        meta: data.meta || null
-      };
-    } catch (error) {
-      lastError = error;
-
-      if (attempt < retry) {
-        await new Promise(
-          resolve =>
-            setTimeout(resolve, 1000)
-        );
-      }
-    }
+  if (!response.ok) {
+    throw new Error(
+      `Twelve Data HTTP ${response.status}`
+    );
   }
 
-  throw lastError ||
-    new Error(
-      "Unable to fetch market data"
+  const data =
+    await response.json();
+
+  if (data.status === "error") {
+    throw new Error(
+      data.message ||
+      "Twelve Data API error"
     );
+  }
+
+  if (!Array.isArray(data.values)) {
+    throw new Error(
+      "Twelve Data returned no candle data"
+    );
+  }
+
+  let candles =
+    parseTwelveDataCandles(
+      data.values
+    );
+
+  /*
+  -------------------------------------------------------
+  REMOVE ONLY AN INCOMPLETE CURRENT CANDLE
+  -------------------------------------------------------
+  */
+
+  const now =
+    Date.now();
+
+  const minuteStart =
+    Math.floor(now / 60000) * 60000;
+
+  candles =
+    candles.filter(
+      candle =>
+        candle.timestamp <
+        minuteStart
+    );
+
+  if (candles.length < MIN_CANDLES) {
+    throw new Error(
+      `Not enough candles: ${candles.length}`
+    );
+  }
+
+  if (candles.length > MAX_CANDLES) {
+    candles =
+      candles.slice(
+        candles.length - MAX_CANDLES
+      );
+  }
+
+  return {
+    candles,
+    fetchedAt:
+      new Date().toISOString(),
+    source:
+      "Twelve Data LIVE"
+  };
 }
 
+/*
+=========================================================
+ CACHE
+=========================================================
+*/
 
-/* ======================================================
-   CACHED MARKET DATA
-====================================================== */
-
-async function getMarketData(symbol) {
+async function getLiveCandles(pair) {
   const cached =
-    marketCache.get(symbol);
+    marketCache.get(pair);
 
-  const now = Date.now();
+  const now =
+    Date.now();
 
   if (
     cached &&
@@ -871,165 +745,218 @@ async function getMarketData(symbol) {
     };
   }
 
-  const fresh =
-    await fetchTwelveData(symbol);
+  const data =
+    await fetchLiveCandles(pair);
 
-  let candles =
-    fresh.candles;
-
-  /*
-    Remove latest candle if configured.
-    This avoids analyzing a candle that is still forming.
-  */
-  if (
-    USE_CLOSED_CANDLES &&
-    candles.length > 1
-  ) {
-    candles =
-      candles.slice(
-        0,
-        candles.length - 1
-      );
-  }
-
-  const result = {
-    candles,
-    meta: fresh.meta,
-    fetchedAt:
-      new Date().toISOString()
-  };
-
-  marketCache.set(symbol, {
-    timestamp: now,
-    data: result
-  });
+  marketCache.set(
+    pair,
+    {
+      timestamp: now,
+      data
+    }
+  );
 
   return {
-    ...result,
+    ...data,
     cache: "MISS"
   };
 }
 
+/*
+=========================================================
+ AGGREGATE 1-MIN CANDLES
+ INTO 2-MIN / 3-MIN
+=========================================================
+*/
 
-/* ======================================================
-   MARKET CONDITION
-====================================================== */
+function aggregateCandles(
+  candles,
+  minutes
+) {
+  const bucketMs =
+    minutes * 60 * 1000;
+
+  const groups = new Map();
+
+  for (const candle of candles) {
+    const bucket =
+      Math.floor(
+        candle.timestamp / bucketMs
+      ) * bucketMs;
+
+    if (!groups.has(bucket)) {
+      groups.set(bucket, []);
+    }
+
+    groups
+      .get(bucket)
+      .push(candle);
+  }
+
+  const result = [];
+
+  const sortedBuckets =
+    [...groups.keys()].sort(
+      (a, b) => a - b
+    );
+
+  for (const bucket of sortedBuckets) {
+    const group =
+      groups.get(bucket);
+
+    /*
+      We only keep complete groups.
+      This prevents partial 2m/3m candles.
+    */
+
+    if (group.length < minutes) {
+      continue;
+    }
+
+    const first =
+      group[0];
+
+    const last =
+      group[group.length - 1];
+
+    result.push({
+      datetime:
+        new Date(bucket).toISOString(),
+
+      timestamp:
+        bucket,
+
+      open:
+        first.open,
+
+      high:
+        Math.max(
+          ...group.map(c => c.high)
+        ),
+
+      low:
+        Math.min(
+          ...group.map(c => c.low)
+        ),
+
+      close:
+        last.close
+    });
+  }
+
+  return result;
+}
+
+/*
+=========================================================
+ MARKET CONDITION
+=========================================================
+*/
 
 function detectMarketCondition(
   candles,
-  indicators
+  ema9,
+  ema21,
+  atr
 ) {
-  const {
-    ema9,
-    ema21,
-    atr,
-    bollinger
-  } = indicators;
-
-  const i =
-    candles.length - 1;
-
-  const price =
-    candles[i].close;
-
-  const e9 =
-    ema9[i];
-
-  const e21 =
-    ema21[i];
-
-  const currentATR =
-    atr[i];
-
-  const middle =
-    bollinger.middle[i];
-
-  const upper =
-    bollinger.upper[i];
-
-  const lower =
-    bollinger.lower[i];
-
   if (
-    !Number.isFinite(e9) ||
-    !Number.isFinite(e21)
+    !ema9 ||
+    !ema21 ||
+    !atr ||
+    !candles.length
   ) {
     return "UNKNOWN";
   }
 
+  const price =
+    candles[candles.length - 1].close;
+
   const trendDistance =
-    Math.abs(e9 - e21) /
-    price;
+    Math.abs(
+      ema9 - ema21
+    );
 
-  let volatility =
-    "NORMAL";
+  const trendPercent =
+    (trendDistance / price) *
+    100;
 
-  if (
-    currentATR !== null &&
-    price > 0
-  ) {
-    const atrPercent =
-      (currentATR / price) * 100;
+  const atrPercent =
+    (atr / price) * 100;
 
-    if (atrPercent < 0.015) {
-      volatility = "LOW";
-    } else if (atrPercent > 0.20) {
-      volatility = "HIGH";
+  /*
+  Adaptive thresholds
+  */
+
+  const strongTrend =
+    trendPercent >=
+    Math.max(
+      0.004,
+      atrPercent * 0.10
+    );
+
+  const highVolatility =
+    atrPercent >= 0.20;
+
+  const lowVolatility =
+    atrPercent <= 0.015;
+
+  if (highVolatility) {
+    if (ema9 > ema21) {
+      return "HIGH_VOLATILITY_UPTREND";
     }
-  }
 
-  let trend;
-
-  if (trendDistance < 0.00008) {
-    trend = "RANGING";
-  } else if (e9 > e21) {
-    trend = "UPTREND";
-  } else {
-    trend = "DOWNTREND";
-  }
-
-  if (
-    upper !== null &&
-    lower !== null &&
-    middle !== null
-  ) {
-    const bandwidth =
-      (upper - lower) /
-      middle;
-
-    if (
-      bandwidth < 0.0005
-    ) {
-      return "LOW_VOLATILITY_RANGE";
+    if (ema9 < ema21) {
+      return "HIGH_VOLATILITY_DOWNTREND";
     }
+
+    return "HIGH_VOLATILITY_RANGE";
   }
 
-  if (
-    volatility === "HIGH"
-  ) {
-    return `HIGH_VOLATILITY_${trend}`;
+  if (lowVolatility) {
+    return "LOW_VOLATILITY_RANGE";
   }
 
-  return trend;
+  if (strongTrend && ema9 > ema21) {
+    return "UPTREND";
+  }
+
+  if (strongTrend && ema9 < ema21) {
+    return "DOWNTREND";
+  }
+
+  return "RANGING";
 }
 
+/*
+=========================================================
+ SIGNAL ENGINE V7.1
+=========================================================
+*/
 
-/* ======================================================
-   BUILD INDICATORS
-====================================================== */
-
-function buildIndicators(candles) {
+function calculateSignal(
+  candles,
+  timeframe
+) {
   const closes =
     candles.map(c => c.close);
 
-  const ema9 =
-    calculateEMA(closes, 9);
+  const ema9Series =
+    calculateEMA(
+      closes,
+      9
+    );
 
-  const ema21 =
-    calculateEMA(closes, 21);
+  const ema21Series =
+    calculateEMA(
+      closes,
+      21
+    );
 
-  const rsi =
-    calculateRSI(closes, 14);
+  const rsiSeries =
+    calculateRSI(
+      closes,
+      14
+    );
 
   const macd =
     calculateMACD(
@@ -1046,7 +973,7 @@ function buildIndicators(candles) {
       2
     );
 
-  const atr =
+  const atrSeries =
     calculateATR(
       candles,
       14
@@ -1060,11 +987,68 @@ function buildIndicators(candles) {
       3
     );
 
-  const supportResistance =
-    calculateSupportResistance(
-      candles,
-      30
-    );
+  const index =
+    candles.length - 1;
+
+  const previousIndex =
+    candles.length - 2;
+
+  const price =
+    closes[index];
+
+  const previousPrice =
+    closes[previousIndex];
+
+  const ema9 =
+    ema9Series[index];
+
+  const ema21 =
+    ema21Series[index];
+
+  const previousEMA9 =
+    ema9Series[previousIndex];
+
+  const previousEMA21 =
+    ema21Series[previousIndex];
+
+  const rsi =
+    rsiSeries[index];
+
+  const previousRSI =
+    rsiSeries[previousIndex];
+
+  const macdValue =
+    macd.macdLine[index];
+
+  const macdSignal =
+    macd.signalLine[index];
+
+  const macdHistogram =
+    macd.histogram[index];
+
+  const previousHistogram =
+    macd.histogram[previousIndex];
+
+  const bbUpper =
+    bollinger.upper[index];
+
+  const bbMiddle =
+    bollinger.middle[index];
+
+  const bbLower =
+    bollinger.lower[index];
+
+  const atr =
+    atrSeries[index];
+
+  const stochasticK =
+    stochastic.k[index];
+
+  const stochasticD =
+    stochastic.d[index];
+
+  const previousStochasticK =
+    stochastic.k[previousIndex];
 
   const momentum =
     calculateMomentum(
@@ -1072,50 +1056,25 @@ function buildIndicators(candles) {
       5
     );
 
-  return {
-    closes,
-    ema9,
-    ema21,
-    rsi,
-    macd,
-    bollinger,
-    atr,
-    stochastic,
-    supportResistance,
-    momentum
-  };
-}
+  const sr =
+    calculateSupportResistance(
+      candles,
+      30
+    );
 
+  const support =
+    sr.support;
 
-/* ======================================================
-   SIGNAL ENGINE
-====================================================== */
+  const resistance =
+    sr.resistance;
 
-function generateSignal(
-  candles,
-  indicators,
-  timeframe
-) {
-  const i =
-    candles.length - 1;
-
-  const previous =
-    Math.max(0, i - 1);
-
-  const price =
-    candles[i].close;
-
-  const {
-    ema9,
-    ema21,
-    rsi,
-    macd,
-    bollinger,
-    atr,
-    stochastic,
-    supportResistance,
-    momentum
-  } = indicators;
+  const marketCondition =
+    detectMarketCondition(
+      candles,
+      ema9,
+      ema21,
+      atr
+    );
 
   let callScore = 0;
   let putScore = 0;
@@ -1124,185 +1083,140 @@ function generateSignal(
   const putReasons = [];
 
   /*
-  ======================================================
+  =======================================================
   EMA TREND
-  ======================================================
+  =======================================================
   */
 
-  if (
-    ema9[i] !== null &&
-    ema21[i] !== null
-  ) {
-    if (ema9[i] > ema21[i]) {
-      callScore += 18;
-      callReasons.push(
-        "EMA9 above EMA21"
-      );
-    }
-
-    if (ema9[i] < ema21[i]) {
-      putScore += 18;
-      putReasons.push(
-        "EMA9 below EMA21"
-      );
-    }
-
-    /*
-      Fresh crossover gets additional weight.
-    */
-
-    if (
-      ema9[previous] !== null &&
-      ema21[previous] !== null
-    ) {
-      if (
-        ema9[previous] <=
-          ema21[previous] &&
-        ema9[i] >
-          ema21[i]
-      ) {
-        callScore += 8;
-        callReasons.push(
-          "Fresh bullish EMA crossover"
-        );
-      }
-
-      if (
-        ema9[previous] >=
-          ema21[previous] &&
-        ema9[i] <
-          ema21[i]
-      ) {
-        putScore += 8;
-        putReasons.push(
-          "Fresh bearish EMA crossover"
-        );
-      }
-    }
+  if (ema9 > ema21) {
+    callScore += 18;
+    callReasons.push(
+      "EMA9 above EMA21"
+    );
   }
 
+  if (ema9 < ema21) {
+    putScore += 18;
+    putReasons.push(
+      "EMA9 below EMA21"
+    );
+  }
 
   /*
-  ======================================================
+  =======================================================
+  FRESH EMA CROSS
+  =======================================================
+  */
+
+  const bullishCross =
+    previousEMA9 !== null &&
+    previousEMA21 !== null &&
+    previousEMA9 <= previousEMA21 &&
+    ema9 > ema21;
+
+  const bearishCross =
+    previousEMA9 !== null &&
+    previousEMA21 !== null &&
+    previousEMA9 >= previousEMA21 &&
+    ema9 < ema21;
+
+  if (bullishCross) {
+    callScore += 12;
+    callReasons.push(
+      "Fresh bullish EMA crossover"
+    );
+  }
+
+  if (bearishCross) {
+    putScore += 12;
+    putReasons.push(
+      "Fresh bearish EMA crossover"
+    );
+  }
+
+  /*
+  =======================================================
   PRICE VS EMA
-  ======================================================
+  =======================================================
   */
 
-  if (
-    ema9[i] !== null &&
-    ema21[i] !== null
-  ) {
-    if (
-      price > ema9[i] &&
-      price > ema21[i]
-    ) {
-      callScore += 10;
-
-      callReasons.push(
-        "Price above EMA9/EMA21"
-      );
-    }
-
-    if (
-      price < ema9[i] &&
-      price < ema21[i]
-    ) {
-      putScore += 10;
-
-      putReasons.push(
-        "Price below EMA9/EMA21"
-      );
-    }
+  if (price > ema9) {
+    callScore += 9;
+    callReasons.push(
+      "Price above EMA9"
+    );
   }
 
+  if (price < ema9) {
+    putScore += 9;
+    putReasons.push(
+      "Price below EMA9"
+    );
+  }
 
   /*
-  ======================================================
+  =======================================================
   RSI
-  ======================================================
+  =======================================================
   */
 
   if (
-    rsi[i] !== null
+    rsi !== null &&
+    previousRSI !== null
   ) {
-    /*
-      Bullish exit from oversold.
-    */
     if (
-      rsi[previous] !== null &&
-      rsi[previous] < 30 &&
-      rsi[i] >= 30
+      previousRSI <= 30 &&
+      rsi > 30
     ) {
       callScore += 14;
 
       callReasons.push(
         "RSI exited oversold upward"
       );
-    }
-    else if (
-      rsi[i] > 50 &&
-      rsi[i] < 70
+    } else if (
+      rsi > 45 &&
+      rsi < 65
     ) {
-      callScore += 7;
-
-      callReasons.push(
-        "RSI supports bullish momentum"
-      );
+      callScore += 5;
     }
 
-    /*
-      Bearish exit from overbought.
-    */
     if (
-      rsi[previous] !== null &&
-      rsi[previous] > 70 &&
-      rsi[i] <= 70
+      previousRSI >= 70 &&
+      rsi < 70
     ) {
       putScore += 14;
 
       putReasons.push(
         "RSI exited overbought downward"
       );
-    }
-    else if (
-      rsi[i] < 50 &&
-      rsi[i] > 30
+    } else if (
+      rsi > 35 &&
+      rsi < 55
     ) {
-      putScore += 7;
-
-      putReasons.push(
-        "RSI supports bearish momentum"
-      );
+      putScore += 5;
     }
   }
 
-
   /*
-  ======================================================
+  =======================================================
   MACD
-  ======================================================
+  =======================================================
   */
 
   if (
-    macd.macd[i] !== null &&
-    macd.signal[i] !== null
+    macdValue !== null &&
+    macdSignal !== null
   ) {
-    if (
-      macd.macd[i] >
-      macd.signal[i]
-    ) {
-      callScore += 12;
+    if (macdValue > macdSignal) {
+      callScore += 10;
 
       callReasons.push(
         "MACD bullish"
       );
     }
 
-    if (
-      macd.macd[i] <
-      macd.signal[i]
-    ) {
-      putScore += 12;
+    if (macdValue < macdSignal) {
+      putScore += 10;
 
       putReasons.push(
         "MACD bearish"
@@ -1310,513 +1224,534 @@ function generateSignal(
     }
 
     if (
-      macd.histogram[i] !== null &&
-      macd.histogram[previous] !== null
+      previousHistogram !== null &&
+      macdHistogram !== null
     ) {
       if (
-        macd.histogram[i] >
-        macd.histogram[previous]
+        previousHistogram <= 0 &&
+        macdHistogram > 0
+      ) {
+        callScore += 6;
+
+        callReasons.push(
+          "MACD histogram turned positive"
+        );
+      }
+
+      if (
+        previousHistogram >= 0 &&
+        macdHistogram < 0
+      ) {
+        putScore += 6;
+
+        putReasons.push(
+          "MACD histogram turned negative"
+        );
+      }
+    }
+  }
+
+  /*
+  =======================================================
+  BOLLINGER
+  =======================================================
+  */
+
+  if (
+    bbUpper !== null &&
+    bbMiddle !== null &&
+    bbLower !== null
+  ) {
+    const bandWidth =
+      bbUpper - bbLower;
+
+    if (bandWidth > 0) {
+      const location =
+        (price - bbLower) /
+        bandWidth;
+
+      /*
+      Near lower band = CALL setup
+      */
+
+      if (location <= 0.20) {
+        callScore += 12;
+
+        callReasons.push(
+          "Price near lower Bollinger Band"
+        );
+      }
+
+      /*
+      Near upper band = PUT setup
+      */
+
+      if (location >= 0.80) {
+        putScore += 12;
+
+        putReasons.push(
+          "Price near upper Bollinger Band"
+        );
+      }
+
+      /*
+      Mild continuation signals
+      */
+
+      if (
+        location > 0.55 &&
+        price > bbMiddle
       ) {
         callScore += 4;
       }
 
       if (
-        macd.histogram[i] <
-        macd.histogram[previous]
+        location < 0.45 &&
+        price < bbMiddle
       ) {
         putScore += 4;
       }
     }
   }
 
-
   /*
-  ======================================================
-  BOLLINGER BANDS
-  ======================================================
+  =======================================================
+  STOCHASTIC
+  =======================================================
   */
 
   if (
-    bollinger.upper[i] !== null &&
-    bollinger.lower[i] !== null &&
-    bollinger.middle[i] !== null
+    stochasticK !== null &&
+    stochasticD !== null
   ) {
-    const upper =
-      bollinger.upper[i];
-
-    const lower =
-      bollinger.lower[i];
-
-    const middle =
-      bollinger.middle[i];
-
     if (
-      price <= lower * 1.0002
+      previousStochasticK !== null &&
+      previousStochasticK <= 20 &&
+      stochasticK > 20 &&
+      stochasticK > stochasticD
     ) {
-      callScore += 12;
+      callScore += 10;
 
       callReasons.push(
-        "Price near lower Bollinger Band"
+        "Stochastic bullish exit"
       );
-    }
-
-    if (
-      price >= upper * 0.9998
-    ) {
-      putScore += 12;
-
-      putReasons.push(
-        "Price near upper Bollinger Band"
-      );
-    }
-
-    if (
-      price > middle &&
-      price < upper
+    } else if (
+      stochasticK > stochasticD &&
+      stochasticK < 70
     ) {
       callScore += 4;
     }
 
     if (
-      price < middle &&
-      price > lower
+      previousStochasticK !== null &&
+      previousStochasticK >= 80 &&
+      stochasticK < 80 &&
+      stochasticK < stochasticD
+    ) {
+      putScore += 10;
+
+      putReasons.push(
+        "Stochastic bearish exit"
+      );
+    } else if (
+      stochasticK < stochasticD &&
+      stochasticK > 30
     ) {
       putScore += 4;
     }
   }
 
-
   /*
-  ======================================================
-  STOCHASTIC
-  ======================================================
+  =======================================================
+  SUPPORT / RESISTANCE
+  =======================================================
   */
 
+  const range =
+    resistance - support;
+
   if (
-    stochastic.k[i] !== null &&
-    stochastic.d[i] !== null
+    range > 0 &&
+    atr !== null
   ) {
+    const distanceFromSupport =
+      price - support;
+
+    const distanceFromResistance =
+      resistance - price;
+
+    /*
+    Near support
+    */
+
     if (
-      stochastic.k[i] >
-        stochastic.d[i] &&
-      stochastic.k[i] < 30
+      distanceFromSupport >= 0 &&
+      distanceFromSupport <=
+        Math.max(
+          atr * 0.75,
+          range * 0.18
+        )
     ) {
       callScore += 10;
 
       callReasons.push(
-        "Stochastic bullish from low zone"
+        "Price near support"
       );
     }
 
+    /*
+    Near resistance
+    */
+
     if (
-      stochastic.k[i] <
-        stochastic.d[i] &&
-      stochastic.k[i] > 70
+      distanceFromResistance >= 0 &&
+      distanceFromResistance <=
+        Math.max(
+          atr * 0.75,
+          range * 0.18
+        )
     ) {
       putScore += 10;
 
       putReasons.push(
-        "Stochastic bearish from high zone"
+        "Price near resistance"
       );
     }
   }
 
-
   /*
-  ======================================================
-  SUPPORT / RESISTANCE
-  ======================================================
-  */
-
-  const support =
-    supportResistance.support;
-
-  const resistance =
-    supportResistance.resistance;
-
-  if (
-    support !== null &&
-    resistance !== null
-  ) {
-    const range =
-      resistance - support;
-
-    if (range > 0) {
-      const supportDistance =
-        (price - support) /
-        range;
-
-      const resistanceDistance =
-        (resistance - price) /
-        range;
-
-      if (
-        supportDistance < 0.20
-      ) {
-        callScore += 10;
-
-        callReasons.push(
-          "Price near support"
-        );
-      }
-
-      if (
-        resistanceDistance < 0.20
-      ) {
-        putScore += 10;
-
-        putReasons.push(
-          "Price near resistance"
-        );
-      }
-    }
-  }
-
-
-  /*
-  ======================================================
+  =======================================================
   MOMENTUM
-  ======================================================
+  =======================================================
   */
 
-  if (
-    momentum !== null
-  ) {
-    if (momentum > 0) {
+  if (momentum !== null) {
+    if (momentum > 0.01) {
       callScore += 8;
 
       callReasons.push(
-        "Positive short-term momentum"
+        "Positive momentum"
       );
     }
 
-    if (momentum < 0) {
+    if (momentum < -0.01) {
       putScore += 8;
 
       putReasons.push(
-        "Negative short-term momentum"
+        "Negative momentum"
       );
     }
   }
 
-
   /*
-  ======================================================
-  MARKET CONDITION
-  ======================================================
-  */
-
-  const marketCondition =
-    detectMarketCondition(
-      candles,
-      indicators
-    );
-
-  /*
-    High volatility reduces confidence.
-  */
-
-  if (
-    marketCondition.includes(
-      "HIGH_VOLATILITY"
-    )
-  ) {
-    callScore -= 8;
-    putScore -= 8;
-  }
-
-  /*
-    Very low volatility is usually
-    not ideal for directional signals.
+  =======================================================
+  MARKET CONDITION ADJUSTMENT
+  =======================================================
   */
 
   if (
     marketCondition ===
-      "LOW_VOLATILITY_RANGE"
+    "UPTREND"
   ) {
-    callScore -= 10;
-    putScore -= 10;
+    callScore += 6;
+    putScore -= 3;
   }
 
+  if (
+    marketCondition ===
+    "DOWNTREND"
+  ) {
+    putScore += 6;
+    callScore -= 3;
+  }
+
+  if (
+    marketCondition ===
+    "HIGH_VOLATILITY_UPTREND"
+  ) {
+    callScore += 4;
+    putScore -= 5;
+  }
+
+  if (
+    marketCondition ===
+    "HIGH_VOLATILITY_DOWNTREND"
+  ) {
+    putScore += 4;
+    callScore -= 5;
+  }
 
   /*
-  ======================================================
-  NORMALIZE SCORES
-  ======================================================
+  Range should not completely kill
+  a strong reversal setup.
+  */
+
+  if (
+    marketCondition ===
+    "LOW_VOLATILITY_RANGE"
+  ) {
+    callScore -= 4;
+    putScore -= 4;
+  }
+
+  /*
+  =======================================================
+  SCORE NORMALIZATION
+  =======================================================
   */
 
   callScore =
-    clamp(
-      Math.round(callScore),
-      0,
-      100
+    Math.round(
+      clamp(
+        callScore,
+        0,
+        100
+      )
     );
 
   putScore =
-    clamp(
-      Math.round(putScore),
-      0,
-      100
+    Math.round(
+      clamp(
+        putScore,
+        0,
+        100
+      )
     );
 
-
   /*
-  ======================================================
-  FINAL DECISION
-  ======================================================
+  =======================================================
+  ADAPTIVE THRESHOLD
+  =======================================================
   */
 
-  const MIN_SIGNAL_SCORE = 62;
+  let threshold = 60;
+
+  if (
+    marketCondition ===
+    "HIGH_VOLATILITY_UPTREND" ||
+    marketCondition ===
+    "HIGH_VOLATILITY_DOWNTREND"
+  ) {
+    threshold = 64;
+  }
+
+  if (
+    marketCondition ===
+    "LOW_VOLATILITY_RANGE"
+  ) {
+    threshold = 58;
+  }
+
+  if (
+    marketCondition ===
+    "RANGING"
+  ) {
+    threshold = 58;
+  }
+
+  /*
+  =======================================================
+  SIGNAL DECISION
+  =======================================================
+  */
+
+  const difference =
+    Math.abs(
+      callScore - putScore
+    );
 
   let direction =
     "NO TRADE";
 
-  let confidence =
-    Math.max(
-      callScore,
-      putScore
-    );
+  let winningScore = 0;
 
-  let reasons = [];
+  let reasons = [
+    "Signals are not sufficiently aligned"
+  ];
 
   if (
-    callScore >= MIN_SIGNAL_SCORE &&
-    callScore >= putScore + 5
+    callScore >= threshold &&
+    callScore > putScore &&
+    difference >= 6
   ) {
     direction = "CALL";
-    confidence = callScore;
-    reasons = callReasons;
-  }
-  else if (
-    putScore >= MIN_SIGNAL_SCORE &&
-    putScore >= callScore + 5
+    winningScore = callScore;
+    reasons = callReasons.slice(
+      0,
+      5
+    );
+  } else if (
+    putScore >= threshold &&
+    putScore > callScore &&
+    difference >= 6
   ) {
     direction = "PUT";
-    confidence = putScore;
-    reasons = putReasons;
+    winningScore = putScore;
+    reasons = putReasons.slice(
+      0,
+      5
+    );
   }
-  else {
-    direction = "NO TRADE";
+
+  /*
+  =======================================================
+  CONFIDENCE
+  =======================================================
+  */
+
+  let confidence;
+
+  if (
+    direction === "CALL" ||
+    direction === "PUT"
+  ) {
     confidence =
-      Math.max(
-        callScore,
-        putScore
+      Math.round(
+        clamp(
+          winningScore,
+          55,
+          95
+        )
       );
-
-    reasons = [
-      "Signals are not sufficiently aligned"
-    ];
+  } else {
+    confidence =
+      Math.round(
+        Math.max(
+          callScore,
+          putScore
+        )
+      );
   }
-
 
   /*
-  ======================================================
-  EXPIRY
-  ======================================================
+  =======================================================
+  ENTRY
+  =======================================================
   */
 
-  let expiryMinutes = 1;
-
-  if (timeframe === 2) {
-    expiryMinutes = 2;
-  }
-
-  if (timeframe === 3) {
-    expiryMinutes = 3;
-  }
-
-
-  /*
-  ======================================================
-  ENTRY / ATR
-  ======================================================
-  */
-
-  const currentATR =
-    atr[i];
-
-  let suggestedEntry =
+  const entry =
     price;
 
-  if (
-    direction === "CALL" &&
-    currentATR !== null
-  ) {
-    suggestedEntry =
-      price + currentATR * 0.05;
-  }
-
-  if (
-    direction === "PUT" &&
-    currentATR !== null
-  ) {
-    suggestedEntry =
-      price - currentATR * 0.05;
-  }
-
-
   /*
-  ======================================================
-  RETURN
-  ======================================================
+  =======================================================
+  EXPIRY
+  =======================================================
   */
+
+  const expiryMinutes =
+    timeframe;
 
   return {
     direction,
-
     confidence,
 
     callScore,
-
     putScore,
 
-    timeframe: `${timeframe} MIN`,
+    timeframe:
+      `${timeframe} MIN`,
 
     expiryMinutes,
 
-    entry: round(
-      suggestedEntry,
-      5
-    ),
+    entry:
+      round(entry, 6),
 
     currentPrice:
-      round(price, 5),
+      round(price, 6),
 
     marketCondition,
 
     support:
-      round(support, 5),
+      round(support, 6),
 
     resistance:
-      round(resistance, 5),
+      round(resistance, 6),
 
     indicators: {
       ema9:
-        round(ema9[i], 5),
+        round(ema9, 6),
 
       ema21:
-        round(ema21[i], 5),
+        round(ema21, 6),
 
       rsi:
-        round(rsi[i], 2),
+        round(rsi, 2),
 
       macd:
-        round(macd.macd[i], 6),
+        round(macdValue, 6),
 
       macdSignal:
-        round(macd.signal[i], 6),
+        round(macdSignal, 6),
 
       macdHistogram:
-        round(macd.histogram[i], 6),
+        round(macdHistogram, 6),
 
       bollingerUpper:
-        round(
-          bollinger.upper[i],
-          5
-        ),
+        round(bbUpper, 6),
 
       bollingerMiddle:
-        round(
-          bollinger.middle[i],
-          5
-        ),
+        round(bbMiddle, 6),
 
       bollingerLower:
-        round(
-          bollinger.lower[i],
-          5
-        ),
+        round(bbLower, 6),
 
       atr:
-        round(currentATR, 6),
+        round(atr, 6),
 
       stochasticK:
-        round(
-          stochastic.k[i],
-          2
-        ),
+        round(stochasticK, 2),
 
       stochasticD:
-        round(
-          stochastic.d[i],
-          2
-        ),
+        round(stochasticD, 2),
 
       momentum:
         round(momentum, 4)
     },
 
-    reasons:
-      reasons.slice(0, 6)
+    reasons
   };
 }
 
+/*
+=========================================================
+ ANALYZE ONE TIMEFRAME
+=========================================================
+*/
 
-/* ======================================================
-   ANALYZE PAIR
-====================================================== */
-
-async function analyzePair(
+async function analyzeTimeframe(
   pair,
-  timeframe
+  timeframe,
+  rawData
 ) {
-  const symbol =
-    PAIRS[pair];
-
-  if (!symbol) {
-    throw new Error(
-      `Unsupported pair: ${pair}`
-    );
-  }
-
-  if (
-    ![1, 2, 3].includes(timeframe)
-  ) {
-    throw new Error(
-      "Timeframe must be 1, 2 or 3"
-    );
-  }
-
-  const market =
-    await getMarketData(symbol);
-
   let candles =
-    market.candles;
+    rawData.candles;
 
-  /*
-    Aggregate 1-minute candles
-    into requested timeframe.
-  */
-  candles =
-    aggregateCandles(
-      candles,
-      timeframe
-    );
-
-  if (
-    candles.length < MIN_CANDLES / timeframe
-  ) {
-    throw new Error(
-      `Not enough ${timeframe}-minute candles`
-    );
+  if (timeframe > 1) {
+    candles =
+      aggregateCandles(
+        rawData.candles,
+        timeframe
+      );
   }
 
-  const indicators =
-    buildIndicators(candles);
+  if (candles.length < MIN_CANDLES) {
+    throw new Error(
+      `Not enough ${timeframe}m candles`
+    );
+  }
 
   const signal =
-    generateSignal(
+    calculateSignal(
       candles,
-      indicators,
       timeframe
     );
 
   return {
-    version: VERSION,
+    version: "V7.1",
 
     pair,
 
-    symbol,
+    symbol: pair,
 
     source:
       "Twelve Data LIVE",
@@ -1833,22 +1768,204 @@ async function analyzePair(
       candles.length,
 
     lastCandle:
-      candles[
-        candles.length - 1
-      ].datetime,
+      candles[candles.length - 1]
+        .datetime,
 
     fetchedAt:
-      market.fetchedAt,
+      rawData.fetchedAt,
 
     cache:
-      market.cache
+      rawData.cache
   };
 }
 
+/*
+=========================================================
+ MULTI-TIMEFRAME CONFIRMATION
+=========================================================
+*/
 
-/* ======================================================
-   ROUTE: HEALTH
-====================================================== */
+function applyMultiTimeframeConfirmation(
+  results
+) {
+  const one =
+    results["1min"];
+
+  const two =
+    results["2min"];
+
+  const three =
+    results["3min"];
+
+  if (!one || !two || !three) {
+    return results;
+  }
+
+  const directions = [
+    one.signal.direction,
+    two.signal.direction,
+    three.signal.direction
+  ];
+
+  /*
+  -------------------------------------------------------
+  1M + 2M CONFIRMATION
+  -------------------------------------------------------
+  */
+
+  if (
+    one.signal.direction === "CALL" &&
+    two.signal.direction === "CALL"
+  ) {
+    one.signal.confidence =
+      clamp(
+        one.signal.confidence + 5,
+        0,
+        95
+      );
+
+    one.signal.reasons.push(
+      "1M + 2M CALL confirmation"
+    );
+  }
+
+  if (
+    one.signal.direction === "PUT" &&
+    two.signal.direction === "PUT"
+  ) {
+    one.signal.confidence =
+      clamp(
+        one.signal.confidence + 5,
+        0,
+        95
+      );
+
+    one.signal.reasons.push(
+      "1M + 2M PUT confirmation"
+    );
+  }
+
+  /*
+  -------------------------------------------------------
+  2M + 3M CONFIRMATION
+  -------------------------------------------------------
+  */
+
+  if (
+    two.signal.direction === "CALL" &&
+    three.signal.direction === "CALL"
+  ) {
+    two.signal.confidence =
+      clamp(
+        two.signal.confidence + 5,
+        0,
+        95
+      );
+
+    two.signal.reasons.push(
+      "2M + 3M CALL confirmation"
+    );
+  }
+
+  if (
+    two.signal.direction === "PUT" &&
+    three.signal.direction === "PUT"
+  ) {
+    two.signal.confidence =
+      clamp(
+        two.signal.confidence + 5,
+        0,
+        95
+      );
+
+    two.signal.reasons.push(
+      "2M + 3M PUT confirmation"
+    );
+  }
+
+  /*
+  -------------------------------------------------------
+  ALL THREE ALIGN
+  -------------------------------------------------------
+  */
+
+  if (
+    directions.every(
+      d => d === "CALL"
+    )
+  ) {
+    for (const key of [
+      "1min",
+      "2min",
+      "3min"
+    ]) {
+      results[key].signal.confidence =
+        clamp(
+          results[key].signal.confidence + 8,
+          0,
+          95
+        );
+
+      results[key].signal.reasons.push(
+        "1M + 2M + 3M CALL alignment"
+      );
+    }
+  }
+
+  if (
+    directions.every(
+      d => d === "PUT"
+    )
+  ) {
+    for (const key of [
+      "1min",
+      "2min",
+      "3min"
+    ]) {
+      results[key].signal.confidence =
+        clamp(
+          results[key].signal.confidence + 8,
+          0,
+          95
+        );
+
+      results[key].signal.reasons.push(
+        "1M + 2M + 3M PUT alignment"
+      );
+    }
+  }
+
+  return results;
+}
+
+/*
+=========================================================
+ ROUTES
+=========================================================
+*/
+
+app.get(
+  "/",
+  (req, res) => {
+    res.json({
+      ok: true,
+      service:
+        "PO AI Predictor API",
+      version:
+        "V7.1",
+      source:
+        "Twelve Data LIVE",
+      message:
+        "PO AI Predictor API V7.1 is running."
+    });
+  }
+);
+
+/*
+=========================================================
+ HEALTH
+=========================================================
+*/
 
 app.get(
   "/api/health",
@@ -1856,7 +1973,8 @@ app.get(
     res.json({
       ok: true,
 
-      version: VERSION,
+      version:
+        "V7.1",
 
       service:
         "PO AI Predictor API",
@@ -1865,18 +1983,22 @@ app.get(
         "Twelve Data LIVE",
 
       dataInterval:
-        INTERVAL,
+        "1min",
+
+      timezone:
+        "UTC",
 
       apiKeyConfigured:
-        Boolean(
-          TWELVE_DATA_API_KEY
-        ),
+        Boolean(API_KEY),
 
       supportedTimeframes:
         [1, 2, 3],
 
       pairs:
-        Object.keys(PAIRS).length,
+        SUPPORTED_PAIRS.length,
+
+      cacheTTL:
+        CACHE_TTL,
 
       timestamp:
         new Date().toISOString()
@@ -1884,10 +2006,11 @@ app.get(
   }
 );
 
-
-/* ======================================================
-   ROUTE: PAIRS
-====================================================== */
+/*
+=========================================================
+ PAIRS
+=========================================================
+*/
 
 app.get(
   "/api/pairs",
@@ -1895,29 +2018,26 @@ app.get(
     res.json({
       ok: true,
 
-      version: VERSION,
+      version:
+        "V7.1",
 
       source:
         "Twelve Data LIVE",
 
-      pairs:
-        Object.keys(PAIRS),
+      count:
+        SUPPORTED_PAIRS.length,
 
-      timeframes:
-        [1, 2, 3]
+      pairs:
+        SUPPORTED_PAIRS
     });
   }
 );
 
-
-/* ======================================================
-   ROUTE: SINGLE SIGNAL
-======================================================
-
-Example:
-
-/api/signal?pair=EUR/USD&timeframe=1
-====================================================== */
+/*
+=========================================================
+ SINGLE SIGNAL
+=========================================================
+*/
 
 app.get(
   "/api/signal",
@@ -1927,35 +2047,62 @@ app.get(
         String(
           req.query.pair ||
           "EUR/USD"
-        );
+        ).toUpperCase();
 
       const timeframe =
         Number(
           req.query.timeframe || 1
         );
 
+      if (
+        !SUPPORTED_PAIRS.includes(pair)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Unsupported pair",
+          supportedPairs:
+            SUPPORTED_PAIRS
+        });
+      }
+
+      if (
+        ![1, 2, 3].includes(timeframe)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Timeframe must be 1, 2 or 3"
+        });
+      }
+
+      const rawData =
+        await getLiveCandles(pair);
+
       const result =
-        await analyzePair(
+        await analyzeTimeframe(
           pair,
-          timeframe
+          timeframe,
+          rawData
         );
 
       res.json({
         ok: true,
-        ...result
+        ...result,
+        timestamp:
+          new Date().toISOString()
       });
-    }
-    catch (error) {
+
+    } catch (error) {
       console.error(
         "[SIGNAL ERROR]",
-        error.message
+        error
       );
 
       res.status(500).json({
         ok: false,
-
-        version: VERSION,
-
+        version:
+          "V7.1",
         error:
           error.message
       });
@@ -1963,20 +2110,11 @@ app.get(
   }
 );
 
-
-/* ======================================================
-   ROUTE: FULL ANALYSIS
-======================================================
-
-Example:
-
-/api/analyze?pair=EUR/USD
-
-Returns:
-1 MIN
-2 MIN
-3 MIN
-====================================================== */
+/*
+=========================================================
+ FULL ANALYSIS
+=========================================================
+*/
 
 app.get(
   "/api/analyze",
@@ -1986,37 +2124,55 @@ app.get(
         String(
           req.query.pair ||
           "EUR/USD"
-        );
+        ).toUpperCase();
+
+      if (
+        !SUPPORTED_PAIRS.includes(pair)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Unsupported pair",
+          supportedPairs:
+            SUPPORTED_PAIRS
+        });
+      }
+
+      const rawData =
+        await getLiveCandles(pair);
 
       const results = {};
 
-      for (
-        const timeframe of [1, 2, 3]
-      ) {
-        try {
-          results[
-            `${timeframe}min`
-          ] =
-            await analyzePair(
-              pair,
-              timeframe
-            );
-        }
-        catch (error) {
-          results[
-            `${timeframe}min`
-          ] = {
-            ok: false,
-            error:
-              error.message
-          };
-        }
-      }
+      results["1min"] =
+        await analyzeTimeframe(
+          pair,
+          1,
+          rawData
+        );
+
+      results["2min"] =
+        await analyzeTimeframe(
+          pair,
+          2,
+          rawData
+        );
+
+      results["3min"] =
+        await analyzeTimeframe(
+          pair,
+          3,
+          rawData
+        );
+
+      applyMultiTimeframeConfirmation(
+        results
+      );
 
       res.json({
         ok: true,
 
-        version: VERSION,
+        version:
+          "V7.1",
 
         pair,
 
@@ -2028,17 +2184,18 @@ app.get(
         timestamp:
           new Date().toISOString()
       });
-    }
-    catch (error) {
+
+    } catch (error) {
       console.error(
         "[ANALYZE ERROR]",
-        error.message
+        error
       );
 
       res.status(500).json({
         ok: false,
 
-        version: VERSION,
+        version:
+          "V7.1",
 
         error:
           error.message
@@ -2047,96 +2204,104 @@ app.get(
   }
 );
 
-
-/* ======================================================
-   ROUTE: ALL PAIRS
-======================================================
-
-Returns a compact 1/2/3 minute analysis
-for all supported pairs.
-
-WARNING:
-This can consume many API requests if
-cache is empty.
-
-====================================================== */
+/*
+=========================================================
+ ALL PAIRS
+=========================================================
+*/
 
 app.get(
   "/api/all-signals",
   async (req, res) => {
     try {
-      const output = [];
+      const results = [];
 
       for (
-        const pair of Object.keys(PAIRS)
+        const pair of SUPPORTED_PAIRS
       ) {
-        const pairResult = {
-          pair
-        };
+        try {
+          const rawData =
+            await getLiveCandles(pair);
 
-        for (
-          const timeframe of [1, 2, 3]
-        ) {
-          try {
-            const result =
-              await analyzePair(
-                pair,
-                timeframe
-              );
+          const pairResults = {};
 
-            pairResult[
-              `${timeframe}min`
-            ] = {
-              signal:
-                result.signal.direction,
+          pairResults["1min"] =
+            await analyzeTimeframe(
+              pair,
+              1,
+              rawData
+            );
 
-              confidence:
-                result.signal.confidence,
+          pairResults["2min"] =
+            await analyzeTimeframe(
+              pair,
+              2,
+              rawData
+            );
 
-              condition:
-                result.signal.marketCondition,
+          pairResults["3min"] =
+            await analyzeTimeframe(
+              pair,
+              3,
+              rawData
+            );
 
-              price:
-                result.signal.currentPrice
-            };
-          }
-          catch (error) {
-            pairResult[
-              `${timeframe}min`
-            ] = {
-              signal: "ERROR",
-              error:
-                error.message
-            };
-          }
+          applyMultiTimeframeConfirmation(
+            pairResults
+          );
+
+          results.push({
+            pair,
+
+            "1min":
+              pairResults["1min"].signal,
+
+            "2min":
+              pairResults["2min"].signal,
+
+            "3min":
+              pairResults["3min"].signal
+          });
+
+        } catch (error) {
+          results.push({
+            pair,
+
+            error:
+              error.message
+          });
         }
-
-        output.push(pairResult);
       }
 
       res.json({
         ok: true,
 
-        version: VERSION,
+        version:
+          "V7.1",
 
         source:
           "Twelve Data LIVE",
 
         count:
-          output.length,
+          results.length,
 
-        data:
-          output,
+        results,
 
         timestamp:
           new Date().toISOString()
       });
-    }
-    catch (error) {
+
+    } catch (error) {
+      console.error(
+        "[ALL SIGNALS ERROR]",
+        error
+      );
+
       res.status(500).json({
         ok: false,
 
-        version: VERSION,
+        version:
+          "V7.1",
 
         error:
           error.message
@@ -2145,75 +2310,39 @@ app.get(
   }
 );
 
-
-/* ======================================================
-   ROUTE: ROOT
-====================================================== */
-
-app.get(
-  "/",
-  (req, res) => {
-    res.json({
-      service:
-        "PO AI Predictor API",
-
-      version:
-        VERSION,
-
-      status:
-        "LIVE",
-
-      source:
-        "Twelve Data",
-
-      endpoints: [
-        "/api/health",
-        "/api/pairs",
-        "/api/signal",
-        "/api/analyze",
-        "/api/all-signals"
-      ]
-    });
-  }
-);
-
-
-/* ======================================================
-   GLOBAL ERROR HANDLER
-====================================================== */
+/*
+=========================================================
+ 404
+=========================================================
+*/
 
 app.use(
-  (err, req, res, next) => {
-    console.error(
-      "[SERVER ERROR]",
-      err
-    );
-
-    res.status(500).json({
+  (req, res) => {
+    res.status(404).json({
       ok: false,
-
-      version: VERSION,
-
       error:
-        "Internal server error"
+        "Endpoint not found",
+      version:
+        "V7.1"
     });
   }
 );
 
-
-/* ======================================================
-   START SERVER
-====================================================== */
+/*
+=========================================================
+ START SERVER
+=========================================================
+*/
 
 app.listen(
   PORT,
   () => {
     console.log(
-      "================================================="
+      "=========================================="
     );
 
     console.log(
-      `PO AI PREDICTOR ${VERSION}`
+      "PO AI PREDICTOR API V7.1"
     );
 
     console.log(
@@ -2225,15 +2354,15 @@ app.listen(
     );
 
     console.log(
-      `API Key configured: ${
-        Boolean(TWELVE_DATA_API_KEY)
+      `API Key: ${
+        API_KEY
+          ? "CONFIGURED"
+          : "MISSING"
       }`
     );
 
     console.log(
-      `Pairs: ${
-        Object.keys(PAIRS).length
-      }`
+      `Pairs: ${SUPPORTED_PAIRS.length}`
     );
 
     console.log(
@@ -2241,7 +2370,11 @@ app.listen(
     );
 
     console.log(
-      "================================================="
+      "Timezone: UTC"
+    );
+
+    console.log(
+      "=========================================="
     );
   }
 );
