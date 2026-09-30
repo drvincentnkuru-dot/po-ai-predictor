@@ -1,347 +1,731 @@
+/* =========================================================
+   PO AI PREDICTOR V8
+   FRONTEND SCRIPT
+   Live API: Twelve Data LIVE
+========================================================= */
+
 const API_URL =
-  window.PO_API_URL ||
   "https://po-ai-predictor-api.onrender.com";
 
-const $ = id => document.getElementById(id);
+const ANALYZE_URL =
+  `${API_URL}/api/analyze`;
 
-let current = null;
-let timer = null;
-let busy = false;
 
-const pairRows = [
-  "EUR/USD",
-  "GBP/USD",
-  "USD/JPY",
-  "USD/CHF",
-  "AUD/USD",
-  "USD/CAD",
-  "NZD/USD",
-  "EUR/GBP",
-  "EUR/JPY",
-  "GBP/JPY",
-  "AUD/JPY",
-  "CAD/JPY",
-  "CHF/JPY",
-  "EUR/AUD",
-  "EUR/CAD",
-  "EUR/CHF",
-  "GBP/AUD",
-  "GBP/CAD",
-  "GBP/CHF",
-  "NZD/JPY",
-  "NZD/CAD",
-  "AUD/CAD",
-  "AUD/CHF",
-  "CAD/CHF"
-];
+/* =========================================================
+   DOM ELEMENTS
+========================================================= */
 
-function fmtTime(iso) {
-  if (!iso) return "—";
+const analyzeBtn =
+  document.getElementById("analyzeBtn");
 
-  return new Date(iso).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit"
-  });
+const results =
+  document.getElementById("results");
+
+const pairSelect =
+  document.getElementById("pair");
+
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function escapeHtml(value) {
+
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
-function countdown(iso) {
-  const seconds = Math.max(
-    0,
-    Math.floor((new Date(iso) - Date.now()) / 1000)
-  );
 
-  const minutes = Math.floor(seconds / 60);
-  const secs = seconds % 60;
+function formatNumber(value, decimals = 5) {
 
-  return `${String(minutes).padStart(2, "0")}:${String(
-    secs
-  ).padStart(2, "0")}`;
-}
-
-function price(value) {
-  if (value == null || value === "") {
+  if (
+    value === null ||
+    value === undefined ||
+    !Number.isFinite(Number(value))
+  ) {
     return "—";
   }
 
-  const number = Number(value);
+  return Number(value).toFixed(decimals);
+}
 
-  if (!Number.isFinite(number)) {
+
+function getDigits(pair) {
+
+  return String(pair || "").includes("JPY")
+    ? 3
+    : 5;
+}
+
+
+function formatDateTime(value) {
+
+  if (!value) {
     return "—";
   }
 
-  return number.toFixed(
-    String(value).includes(".") ? 5 : 2
+  const date =
+    new Date(value);
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return value;
+  }
+
+  return date.toLocaleString(
+    undefined,
+    {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    }
   );
 }
 
-function setStatus(ok) {
-  const status = $("backendStatus");
-  const dot = document.querySelector(".dot");
 
-  if (status) {
-    status.textContent = ok
-      ? "LIVE CONNECTED"
-      : "OFFLINE";
-  }
+/* =========================================================
+   BUTTON STATE
+========================================================= */
 
-  if (dot) {
-    dot.style.background = ok
-      ? "#21e38a"
-      : "#ff5575";
-  }
-}
+function setLoading(loading) {
 
-function showError(message) {
-  const box = $("errorBox");
-
-  if (!box) return;
-
-  box.textContent = message;
-  box.classList.remove("hidden");
-}
-
-function clearError() {
-  const box = $("errorBox");
-
-  if (!box) return;
-
-  box.classList.add("hidden");
-}
-
-function render(data) {
-  const x = data.selected;
-
-  if (!x) {
-    throw new Error("No selected market returned by backend.");
-  }
-
-  current = x;
-
-  clearError();
-  setStatus(true);
-
-  $("selectedPair").textContent =
-    `${x.pair} LIVE`;
-
-  $("trendBadge").textContent =
-    x.trend || "—";
-
-  const badge = $("signalBadge");
-
-  badge.textContent =
-    x.signal || "NO TRADE";
-
-  badge.className =
-    `signal-badge ${
-      (x.signal || "NO TRADE")
-        .toLowerCase()
-        .replace(" ", "-")
-    }`;
-
-  $("confidence").textContent =
-    `${x.confidence ?? "—"}%`;
-
-  $("timeframe").textContent =
-    `${x.timeframe ?? "—"} MIN`;
-
-  $("countdown").textContent =
-    countdown(x.entryTime);
-
-  $("entryTime").textContent =
-    fmtTime(x.entryTime);
-
-  $("expiryTime").textContent =
-    fmtTime(x.expiryTime);
-
-  $("entryPrice").textContent =
-    price(x.entryPrice);
-
-  $("callScore").textContent =
-    `${x.callScore ?? "—"}%`;
-
-  $("putScore").textContent =
-    `${x.putScore ?? "—"}%`;
-
-  $("support").textContent =
-    price(x.support);
-
-  $("resistance").textContent =
-    price(x.resistance);
-
-  $("ema9").textContent =
-    price(x.ema9);
-
-  $("ema21").textContent =
-    price(x.ema21);
-
-  $("rsi").textContent =
-    x.rsi ?? "—";
-
-  $("adx").textContent =
-    x.adx ?? "—";
-
-  $("reasons").textContent =
-    x.reasons?.join(" • ") ||
-    "No extra reason";
-
-  $("dataAge").textContent =
-    `Updated ${fmtTime(x.generatedAt)}`;
-
-  $("scanInfo").textContent =
-    `${data.cachedPairs ?? 0}/${data.scannedPairs ?? 0} pairs cached`;
-
-  const rows =
-    (data.candidates || [])
-      .map(candidate => {
-
-        const signal =
-          candidate.signal || "NO TRADE";
-
-        const signalClass =
-          signal === "CALL"
-            ? "scan-call"
-            : signal === "PUT"
-              ? "scan-put"
-              : "scan-wait";
-
-        return `
-          <div class="scan-row">
-
-            <strong>
-              ${candidate.pair}
-              •
-              ${candidate.timeframe}M
-            </strong>
-
-            <b class="${signalClass}">
-              ${signal}
-            </b>
-
-            <span>
-              ${candidate.confidence ?? "—"}%
-            </span>
-
-          </div>
-        `;
-      })
-      .join("");
-
-  $("scanner").innerHTML =
-    rows ||
-    "<div class='scan-row'>Waiting for more live pairs…</div>";
-}
-
-async function analyze() {
-
-  if (busy) {
+  if (!analyzeBtn) {
     return;
   }
 
-  busy = true;
+  analyzeBtn.disabled =
+    loading;
 
-  const button = $("analyzeBtn");
+  if (loading) {
 
-  if (button) {
-    button.disabled = true;
-    button.textContent = "SCANNING…";
+    analyzeBtn.dataset.originalText =
+      analyzeBtn.textContent;
+
+    analyzeBtn.textContent =
+      "ANALYZING...";
+
+  } else {
+
+    analyzeBtn.textContent =
+      analyzeBtn.dataset.originalText ||
+      "ANALYZE MARKET";
   }
+}
+
+
+/* =========================================================
+   LOADING SCREEN
+========================================================= */
+
+function showLoading() {
+
+  if (!results) {
+    return;
+  }
+
+  results.innerHTML = `
+    <div class="signal-card loading-card">
+
+      <div class="loading-title">
+        ANALYZING MARKET
+      </div>
+
+      <div class="loading-text">
+        Getting live Twelve Data market data...
+      </div>
+
+      <div class="loading-text">
+        Calculating EMA 9/21, RSI, ADX,
+        Support & Resistance...
+      </div>
+
+    </div>
+  `;
+}
+
+
+/* =========================================================
+   ERROR SCREEN
+========================================================= */
+
+function showError(message) {
+
+  if (!results) {
+    return;
+  }
+
+  results.innerHTML = `
+    <div class="signal-card error-card">
+
+      <div class="signal-title">
+        DATA ERROR
+      </div>
+
+      <div class="error-message">
+        ${escapeHtml(message)}
+      </div>
+
+      <div class="error-help">
+        Please try ANALYZE MARKET again.
+      </div>
+
+    </div>
+  `;
+}
+
+
+/* =========================================================
+   SIGNAL CLASS
+========================================================= */
+
+function signalClass(signal) {
+
+  if (signal === "CALL") {
+    return "call";
+  }
+
+  if (signal === "PUT") {
+    return "put";
+  }
+
+  return "no-trade";
+}
+
+
+/* =========================================================
+   RENDER SELECTED RESULT
+========================================================= */
+
+function renderSignal(signal) {
+
+  if (!results) {
+    return;
+  }
+
+  if (!signal) {
+
+    showError(
+      "The API did not return a selected market."
+    );
+
+    return;
+  }
+
+  const pair =
+    signal.pair || "—";
+
+  const timeframe =
+    Number(signal.timeframe) || 1;
+
+  const signalName =
+    signal.signal || "NO TRADE";
+
+  const confidence =
+    Number.isFinite(
+      Number(signal.confidence)
+    )
+      ? Number(signal.confidence)
+      : 0;
+
+  const digits =
+    getDigits(pair);
+
+  const trend =
+    signal.trend || "RANGE";
+
+  const signalCss =
+    signalClass(signalName);
+
+
+  /* =======================================================
+     REASONS
+  ======================================================= */
+
+  let reasonsHtml =
+    "";
+
+  if (
+    Array.isArray(
+      signal.reasons
+    ) &&
+    signal.reasons.length > 0
+  ) {
+
+    reasonsHtml =
+      signal.reasons
+        .map(
+          reason => `
+            <li>
+              ${escapeHtml(reason)}
+            </li>
+          `
+        )
+        .join("");
+
+  } else {
+
+    reasonsHtml =
+      "<li>No additional reasons.</li>";
+  }
+
+
+  /* =======================================================
+     MAIN CARD
+  ======================================================= */
+
+  results.innerHTML = `
+
+    <div class="signal-card ${signalCss}">
+
+      <div class="pair-title">
+        ${escapeHtml(pair)}
+      </div>
+
+      <div class="timeframe-title">
+        ${timeframe} MIN MINUTES
+      </div>
+
+
+      <div class="trend-box">
+        ${escapeHtml(trend)}
+      </div>
+
+
+      <div class="signal-main ${signalCss}">
+
+        ${escapeHtml(signalName)}
+
+      </div>
+
+
+      <div class="confidence">
+
+        CONFIDENCE
+
+        <strong>
+          ${confidence}%
+        </strong>
+
+      </div>
+
+
+      <div class="signal-grid">
+
+        <div class="info-box">
+          <span>PAIR</span>
+          <strong>
+            ${escapeHtml(pair)}
+          </strong>
+        </div>
+
+
+        <div class="info-box">
+          <span>TIMEFRAME</span>
+          <strong>
+            ${timeframe} MIN
+          </strong>
+        </div>
+
+
+        <div class="info-box">
+          <span>EXPIRY</span>
+          <strong>
+            ${timeframe} MIN
+          </strong>
+        </div>
+
+
+        <div class="info-box">
+          <span>ENTRY PRICE</span>
+          <strong>
+            ${formatNumber(
+              signal.entryPrice,
+              digits
+            )}
+          </strong>
+        </div>
+
+
+        <div class="info-box">
+          <span>ENTRY TIME</span>
+          <strong>
+            ${formatDateTime(
+              signal.entryTime
+            )}
+          </strong>
+        </div>
+
+
+        <div class="info-box">
+          <span>EXPIRY TIME</span>
+          <strong>
+            ${formatDateTime(
+              signal.expiryTime
+            )}
+          </strong>
+        </div>
+
+
+        <div class="info-box">
+          <span>CALL SCORE</span>
+          <strong>
+            ${signal.callScore ?? "—"}%
+          </strong>
+        </div>
+
+
+        <div class="info-box">
+          <span>PUT SCORE</span>
+          <strong>
+            ${signal.putScore ?? "—"}%
+          </strong>
+        </div>
+
+      </div>
+
+
+      <div class="section-title">
+        SUPPORT / RESISTANCE
+      </div>
+
+
+      <div class="indicator-grid">
+
+        <div class="indicator-box">
+          <span>SUPPORT</span>
+          <strong>
+            ${formatNumber(
+              signal.support,
+              digits
+            )}
+          </strong>
+        </div>
+
+
+        <div class="indicator-box">
+          <span>RESISTANCE</span>
+          <strong>
+            ${formatNumber(
+              signal.resistance,
+              digits
+            )}
+          </strong>
+        </div>
+
+      </div>
+
+
+      <div class="section-title">
+        TECHNICAL INDICATORS
+      </div>
+
+
+      <div class="indicator-grid">
+
+        <div class="indicator-box">
+          <span>EMA 9</span>
+          <strong>
+            ${formatNumber(
+              signal.ema9,
+              digits
+            )}
+          </strong>
+        </div>
+
+
+        <div class="indicator-box">
+          <span>EMA 21</span>
+          <strong>
+            ${formatNumber(
+              signal.ema21,
+              digits
+            )}
+          </strong>
+        </div>
+
+
+        <div class="indicator-box">
+          <span>RSI 14</span>
+          <strong>
+            ${formatNumber(
+              signal.rsi,
+              2
+            )}
+          </strong>
+        </div>
+
+
+        <div class="indicator-box">
+          <span>ADX 14</span>
+          <strong>
+            ${formatNumber(
+              signal.adx,
+              2
+            )}
+          </strong>
+        </div>
+
+      </div>
+
+
+      <div class="section-title">
+        ANALYSIS REASONS
+      </div>
+
+
+      <ul class="reasons">
+        ${reasonsHtml}
+      </ul>
+
+
+      <div class="market-meta">
+
+        <div>
+          Candles Used:
+          <strong>
+            ${signal.candlesUsed ?? "—"}
+          </strong>
+        </div>
+
+        <div>
+          Last Candle:
+          <strong>
+            ${escapeHtml(
+              signal.lastCandle || "—"
+            )}
+          </strong>
+        </div>
+
+        <div>
+          Generated:
+          <strong>
+            ${formatDateTime(
+              signal.generatedAt
+            )}
+          </strong>
+        </div>
+
+      </div>
+
+    </div>
+  `;
+}
+
+
+/* =========================================================
+   ANALYZE MARKET
+========================================================= */
+
+async function analyzeMarket() {
+
+  setLoading(true);
+
+  showLoading();
+
 
   try {
 
-    const response = await fetch(
-      `${API_URL}/api/analyze?ts=${Date.now()}`,
+    /*
+      IMPORTANT:
+      V8 backend selects the best pair/timeframe itself.
+
+      We therefore DO NOT send 1 MIN / 2 MIN / 3 MIN
+      separately.
+
+      The API returns:
+
       {
-        cache: "no-store"
+        selected: {...}
       }
-    );
 
-    const data = await response.json();
+      and we display ONLY selected.
+    */
 
-    if (!response.ok) {
+    const response =
+      await fetch(
+        ANALYZE_URL,
+        {
+          method: "GET",
+          headers: {
+            "Accept":
+              "application/json"
+          },
+          cache: "no-store"
+        }
+      );
+
+
+    let data = null;
+
+    try {
+
+      data =
+        await response.json();
+
+    } catch {
+
       throw new Error(
-        data.error ||
-        `HTTP ${response.status}`
+        `Server returned HTTP ${response.status}`
       );
     }
 
-    render(data);
+
+    if (!response.ok) {
+
+      throw new Error(
+        data?.error ||
+        `API request failed with HTTP ${response.status}`
+      );
+    }
+
+
+    if (!data) {
+
+      throw new Error(
+        "Empty response from V8 API."
+      );
+    }
+
+
+    if (!data.selected) {
+
+      throw new Error(
+        data.error ||
+        "V8 API returned no selected market."
+      );
+    }
+
+
+    /*
+      Render ONE selected result only.
+    */
+
+    renderSignal(
+      data.selected
+    );
+
+
+    /*
+      Optional console information
+      useful for testing.
+    */
+
+    console.log(
+      "PO AI Predictor V8 response:",
+      data
+    );
+
+    console.log(
+      "Selected market:",
+      data.selected
+    );
+
 
   } catch (error) {
 
-    setStatus(false);
+    console.error(
+      "ANALYZE MARKET ERROR:",
+      error
+    );
+
 
     showError(
       error.message ||
-      "Backend connection failed."
+      "Unable to connect to the V8 analysis server."
     );
 
   } finally {
 
-    busy = false;
+    setLoading(false);
+  }
+}
 
-    if (button) {
-      button.disabled = false;
-      button.textContent = "ANALYZE MARKET";
+
+/* =========================================================
+   BUTTON EVENT
+========================================================= */
+
+if (analyzeBtn) {
+
+  analyzeBtn.addEventListener(
+    "click",
+    analyzeMarket
+  );
+
+}
+
+
+/* =========================================================
+   OPTIONAL ENTER KEY
+========================================================= */
+
+if (pairSelect) {
+
+  pairSelect.addEventListener(
+    "keydown",
+    event => {
+
+      if (
+        event.key === "Enter"
+      ) {
+
+        analyzeMarket();
+
+      }
+
     }
-  }
-}
+  );
 
-function tick() {
-
-  if (!current) {
-    return;
-  }
-
-  $("countdown").textContent =
-    countdown(current.entryTime);
-
-  const expiry =
-    new Date(current.expiryTime).getTime();
-
-  if (
-    Date.now() >
-    expiry + 2000
-  ) {
-    analyze();
-  }
 }
 
 
-/*
-  MANUAL ANALYZE
-*/
+/* =========================================================
+   INITIAL MESSAGE
+========================================================= */
 
-$("analyzeBtn").addEventListener(
-  "click",
-  analyze
-);
+if (results) {
+
+  results.innerHTML = `
+
+    <div class="signal-card">
+
+      <div class="signal-title">
+        READY
+      </div>
+
+      <div class="loading-text">
+        Select your market settings
+        and press ANALYZE MARKET.
+      </div>
+
+      <div class="loading-text">
+        V8 will select the strongest
+        available live market and timeframe.
+      </div>
+
+    </div>
+
+  `;
+}
 
 
-/*
-  FIRST ANALYSIS
-*/
+/* =========================================================
+   GLOBAL ACCESS
+========================================================= */
 
-analyze();
-
-
-/*
-  REFRESH MARKET ANALYSIS
-  EVERY 20 SECONDS
-*/
-
-setInterval(
-  analyze,
-  20000
-);
-
-
-/*
-  COUNTDOWN
-  EVERY 1 SECOND
-*/
-
-timer = setInterval(
-  tick,
-  1000
-);
+window.analyzeMarket =
+  analyzeMarket;
