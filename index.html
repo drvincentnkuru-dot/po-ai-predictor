@@ -2,162 +2,391 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
-  />
+  <title>PO AI Predictor V8</title>
 
-  <title>PO AI Predictor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet"
+  >
 
   <link rel="stylesheet" href="style.css" />
 </head>
 
 <body>
 
-  <div class="container">
+  <div class="app-shell">
 
-    <!-- HEADER -->
-    <header class="header">
-      <h1>PO AI PREDICTOR</h1>
-      <p>LIVE MARKET ANALYSIS</p>
+    <!-- TOP BAR -->
+    <header class="topbar">
+
+      <div class="brand">
+
+        <div class="brand-mark">⚡</div>
+
+        <div>
+          <h1>PO AI PREDICTOR</h1>
+          <p>V8 • SMART LIVE SCANNER</p>
+        </div>
+
+      </div>
+
+      <div class="status-pill">
+        <span class="dot"></span>
+        <span id="backendStatus">CONNECTING</span>
+      </div>
+
     </header>
 
 
-    <!-- CONTROL PANEL -->
-    <section class="control-card">
+    <main>
 
-      <!-- MARKET -->
-      <div class="control-group">
-        <label for="marketType">MARKET TYPE</label>
-
-        <select id="marketType">
-          <option value="live" selected>LIVE MARKET</option>
-        </select>
-      </div>
-
-
-      <!-- CURRENCY PAIR -->
-      <div class="control-group">
-        <label for="pair">CURRENCY PAIR</label>
-
-        <select id="pair">
-          <option value="EUR/USD">EUR/USD LIVE</option>
-        </select>
-      </div>
-
-
-      <!-- TIMEFRAME -->
-      <div class="control-group">
-        <label for="timeframe">TIMEFRAME</label>
-
-        <select id="timeframe">
-
-          <option value="1" selected>
-            1 MINUTE
-          </option>
-
-          <option value="2">
-            2 MINUTES
-          </option>
-
-          <option value="3">
-            3 MINUTES
-          </option>
-
-        </select>
-      </div>
-
-
-      <!-- ANALYZE BUTTON -->
-      <button id="analyzeBtn" type="button">
-        ANALYZE MARKET
-      </button>
-
-    </section>
-
-
-    <!-- STATUS -->
-    <section class="status-card">
-
-      <div class="status-row">
-        <span>BACKEND STATUS</span>
-
-        <span id="status">
-          CHECKING...
-        </span>
-      </div>
-
-      <div class="status-row">
-        <span>DATA SOURCE</span>
-
-        <span id="dataStatus">
-          Twelve Data LIVE
-        </span>
-      </div>
-
-    </section>
-
-
-    <!-- SELECTED MARKET -->
-    <section class="market-card">
-
-      <h2>SELECTED MARKET</h2>
-
-      <div class="market-info">
+      <!-- HERO -->
+      <section class="hero">
 
         <div>
-          <span class="label">PAIR</span>
-          <strong id="pairLabel">
-            EUR/USD LIVE
-          </strong>
+
+          <span class="eyebrow">
+            LIVE MARKET ANALYSIS
+          </span>
+
+          <h2>
+            AI selects the strongest live setup
+          </h2>
+
+          <p>
+            Scans supported live pairs and chooses one setup using a compact
+            4-indicator model.
+          </p>
+
         </div>
 
-        <div>
-          <span class="label">TIMEFRAME</span>
-          <strong id="timeframeLabel">
-            1 MINUTE
-          </strong>
+        <button id="analyzeBtn" class="analyze-btn">
+          ANALYZE MARKET
+        </button>
+
+      </section>
+
+
+      <!-- ERROR -->
+      <section
+        id="errorBox"
+        class="error-box hidden">
+      </section>
+
+
+      <!-- MAIN SIGNAL CARD -->
+      <section
+        class="signal-card"
+        id="signalCard">
+
+        <div class="signal-head">
+
+          <div>
+
+            <span class="eyebrow">
+              AI SELECTED MARKET
+            </span>
+
+            <h3 id="selectedPair">
+              Waiting for live data…
+            </h3>
+
+          </div>
+
+          <span
+            id="trendBadge"
+            class="trend-badge">
+            —
+          </span>
+
         </div>
 
-      </div>
 
-    </section>
+        <!-- CALL / PUT / NO TRADE -->
+        <div
+          id="signalBadge"
+          class="signal-badge no-trade">
+          NO TRADE
+        </div>
 
 
-    <!-- RESULT -->
-    <main id="results">
+        <!-- CONFIDENCE / TIMEFRAME / COUNTDOWN -->
+        <div class="confidence-row">
 
-      <div class="empty-state">
+          <div>
+            <span class="muted">
+              AI CONFIDENCE
+            </span>
 
-        <h2>READY TO ANALYZE</h2>
+            <strong id="confidence">
+              —
+            </strong>
+          </div>
 
-        <p>
-          Select a currency pair and timeframe,
-          then press ANALYZE MARKET.
-        </p>
 
-      </div>
+          <div>
+            <span class="muted">
+              TIMEFRAME
+            </span>
+
+            <strong id="timeframe">
+              —
+            </strong>
+          </div>
+
+
+          <div>
+            <span class="muted">
+              ENTRY IN
+            </span>
+
+            <strong id="countdown">
+              —
+            </strong>
+          </div>
+
+        </div>
+
+
+        <!-- ENTRY / EXPIRY / PRICE -->
+        <div class="time-grid">
+
+          <div class="time-box">
+
+            <span>
+              ENTRY TIME
+            </span>
+
+            <strong id="entryTime">
+              —
+            </strong>
+
+          </div>
+
+
+          <div class="time-box">
+
+            <span>
+              EXPIRY TIME
+            </span>
+
+            <strong id="expiryTime">
+              —
+            </strong>
+
+          </div>
+
+
+          <div class="time-box">
+
+            <span>
+              ENTRY PRICE
+            </span>
+
+            <strong id="entryPrice">
+              —
+            </strong>
+
+          </div>
+
+        </div>
+
+
+        <!-- SCORES -->
+        <div class="score-grid">
+
+          <div>
+
+            <span>
+              CALL SCORE
+            </span>
+
+            <b id="callScore">
+              —
+            </b>
+
+          </div>
+
+
+          <div>
+
+            <span>
+              PUT SCORE
+            </span>
+
+            <b id="putScore">
+              —
+            </b>
+
+          </div>
+
+
+          <div>
+
+            <span>
+              SUPPORT
+            </span>
+
+            <b id="support">
+              —
+            </b>
+
+          </div>
+
+
+          <div>
+
+            <span>
+              RESISTANCE
+            </span>
+
+            <b id="resistance">
+              —
+            </b>
+
+          </div>
+
+        </div>
+
+      </section>
+
+
+      <!-- TECHNICAL CONFIRMATION -->
+      <section class="panel">
+
+        <div class="panel-title">
+
+          <h3>
+            TECHNICAL CONFIRMATION
+          </h3>
+
+          <span id="dataAge">
+            —
+          </span>
+
+        </div>
+
+
+        <div class="indicator-grid">
+
+          <div class="indicator">
+
+            <span>
+              EMA 9
+            </span>
+
+            <strong id="ema9">
+              —
+            </strong>
+
+          </div>
+
+
+          <div class="indicator">
+
+            <span>
+              EMA 21
+            </span>
+
+            <strong id="ema21">
+              —
+            </strong>
+
+          </div>
+
+
+          <div class="indicator">
+
+            <span>
+              RSI 14
+            </span>
+
+            <strong id="rsi">
+              —
+            </strong>
+
+          </div>
+
+
+          <div class="indicator">
+
+            <span>
+              ADX 14
+            </span>
+
+            <strong id="adx">
+              —
+            </strong>
+
+          </div>
+
+
+          <div class="indicator wide">
+
+            <span>
+              ANALYSIS REASONS
+            </span>
+
+            <strong id="reasons">
+              —
+            </strong>
+
+          </div>
+
+        </div>
+
+      </section>
+
+
+      <!-- LIVE PAIR SCANNER -->
+      <section class="panel">
+
+        <div class="panel-title">
+
+          <h3>
+            LIVE PAIR SCANNER
+          </h3>
+
+          <span id="scanInfo">
+            —
+          </span>
+
+        </div>
+
+
+        <div
+          id="scanner"
+          class="scanner">
+        </div>
+
+      </section>
+
+
+      <!-- FOOTER -->
+      <section class="footer-note">
+
+        Data source:
+        <b>Twelve Data LIVE</b>
+
+        • V8 uses EMA 9/21, RSI 14, ADX 14 and
+        Support/Resistance.
+
+        AI confidence is a setup score,
+        not a guaranteed win probability.
+
+      </section>
 
     </main>
-
-
-    <!-- FOOTER -->
-    <footer class="footer">
-
-      <p>
-        PO AI Predictor • LIVE MARKET
-      </p>
-
-      <p>
-        Signals are analytical estimates and are not guaranteed results.
-      </p>
-
-    </footer>
 
   </div>
 
 
+  <!-- JAVASCRIPT -->
   <script src="script.js"></script>
 
 </body>
