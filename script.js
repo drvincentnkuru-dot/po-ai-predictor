@@ -1,731 +1,679 @@
-/* =========================================================
-   PO AI PREDICTOR V8
-   FRONTEND SCRIPT
-   Live API: Twelve Data LIVE
-========================================================= */
+const API_URL = "https://po-ai-predictor-api.onrender.com";
+const ANALYZE_URL = `${API_URL}/api/analyze`;
 
-const API_URL =
-  "https://po-ai-predictor-api.onrender.com";
+// ================================
+// DOM ELEMENTS - V8
+// ================================
 
-const ANALYZE_URL =
-  `${API_URL}/api/analyze`;
+const backendStatus = document.getElementById("backendStatus");
+const analyzeBtn = document.getElementById("analyzeBtn");
+const errorBox = document.getElementById("errorBox");
+
+const signalCard = document.getElementById("signalCard");
+const selectedPair = document.getElementById("selectedPair");
+const trendBadge = document.getElementById("trendBadge");
+const signalBadge = document.getElementById("signalBadge");
+
+const confidence = document.getElementById("confidence");
+const timeframe = document.getElementById("timeframe");
+const countdown = document.getElementById("countdown");
+
+const entryTime = document.getElementById("entryTime");
+const expiryTime = document.getElementById("expiryTime");
+const entryPrice = document.getElementById("entryPrice");
+
+const callScore = document.getElementById("callScore");
+const putScore = document.getElementById("putScore");
+
+const support = document.getElementById("support");
+const resistance = document.getElementById("resistance");
+
+const dataAge = document.getElementById("dataAge");
+
+const ema9 = document.getElementById("ema9");
+const ema21 = document.getElementById("ema21");
+const rsi = document.getElementById("rsi");
+const adx = document.getElementById("adx");
+
+const reasons = document.getElementById("reasons");
+
+const scanInfo = document.getElementById("scanInfo");
+const scanner = document.getElementById("scanner");
 
 
-/* =========================================================
-   DOM ELEMENTS
-========================================================= */
+// ================================
+// STATE
+// ================================
 
-const analyzeBtn =
-  document.getElementById("analyzeBtn");
-
-const results =
-  document.getElementById("results");
-
-const pairSelect =
-  document.getElementById("pair");
+let currentResult = null;
+let countdownTimer = null;
 
 
-/* =========================================================
-   HELPERS
-========================================================= */
+// ================================
+// HELPERS
+// ================================
 
-function escapeHtml(value) {
+function safe(value, fallback = "—") {
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return fallback;
+    }
 
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+    return value;
 }
 
 
 function formatNumber(value, decimals = 5) {
+    if (value === null || value === undefined || value === "") {
+        return "—";
+    }
 
-  if (
-    value === null ||
-    value === undefined ||
-    !Number.isFinite(Number(value))
-  ) {
-    return "—";
-  }
+    const number = Number(value);
 
-  return Number(value).toFixed(decimals);
+    if (!Number.isFinite(number)) {
+        return String(value);
+    }
+
+    return number.toFixed(decimals);
 }
 
 
-function getDigits(pair) {
+function formatPercent(value) {
+    if (value === null || value === undefined || value === "") {
+        return "—";
+    }
 
-  return String(pair || "").includes("JPY")
-    ? 3
-    : 5;
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+        return `${value}%`;
+    }
+
+    return `${Math.round(number)}%`;
 }
 
 
 function formatDateTime(value) {
-
-  if (!value) {
-    return "—";
-  }
-
-  const date =
-    new Date(value);
-
-  if (
-    Number.isNaN(
-      date.getTime()
-    )
-  ) {
-    return value;
-  }
-
-  return date.toLocaleString(
-    undefined,
-    {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit"
+    if (!value) {
+        return "—";
     }
-  );
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+        return String(value);
+    }
+
+    return date.toLocaleString();
 }
 
 
-/* =========================================================
-   BUTTON STATE
-========================================================= */
+function showError(message) {
+    console.error(message);
 
-function setLoading(loading) {
-
-  if (!analyzeBtn) {
-    return;
-  }
-
-  analyzeBtn.disabled =
-    loading;
-
-  if (loading) {
-
-    analyzeBtn.dataset.originalText =
-      analyzeBtn.textContent;
-
-    analyzeBtn.textContent =
-      "ANALYZING...";
-
-  } else {
-
-    analyzeBtn.textContent =
-      analyzeBtn.dataset.originalText ||
-      "ANALYZE MARKET";
-  }
+    if (errorBox) {
+        errorBox.textContent = message;
+        errorBox.style.display = "block";
+    }
 }
 
 
-/* =========================================================
-   LOADING SCREEN
-========================================================= */
+function clearError() {
+    if (errorBox) {
+        errorBox.textContent = "";
+        errorBox.style.display = "none";
+    }
+}
+
+
+// ================================
+// BACKEND STATUS
+// ================================
+
+async function checkBackend() {
+    try {
+        const response = await fetch(`${API_URL}/api/health`, {
+            method: "GET",
+            cache: "no-store"
+        });
+
+        if (!response.ok) {
+            throw new Error(`Backend HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (backendStatus) {
+            backendStatus.textContent = "LIVE";
+        }
+
+        console.log("Backend health:", data);
+
+        return true;
+
+    } catch (error) {
+
+        console.error("Backend health error:", error);
+
+        if (backendStatus) {
+            backendStatus.textContent = "OFFLINE";
+        }
+
+        return false;
+    }
+}
+
+
+// ================================
+// LOADING STATE
+// ================================
 
 function showLoading() {
 
-  if (!results) {
-    return;
-  }
+    clearError();
 
-  results.innerHTML = `
-    <div class="signal-card loading-card">
+    if (analyzeBtn) {
+        analyzeBtn.disabled = true;
+        analyzeBtn.textContent = "ANALYZING...";
+    }
 
-      <div class="loading-title">
-        ANALYZING MARKET
-      </div>
+    if (signalCard) {
+        signalCard.style.display = "block";
+    }
 
-      <div class="loading-text">
-        Getting live Twelve Data market data...
-      </div>
+    if (signalBadge) {
+        signalBadge.textContent = "SCANNING";
+    }
 
-      <div class="loading-text">
-        Calculating EMA 9/21, RSI, ADX,
-        Support & Resistance...
-      </div>
+    if (trendBadge) {
+        trendBadge.textContent = "LIVE MARKET";
+    }
 
-    </div>
-  `;
+    if (selectedPair) {
+        selectedPair.textContent = "Scanning live pairs...";
+    }
+
+    if (confidence) {
+        confidence.textContent = "—";
+    }
+
+    if (timeframe) {
+        timeframe.textContent = "—";
+    }
+
+    if (entryTime) {
+        entryTime.textContent = "—";
+    }
+
+    if (expiryTime) {
+        expiryTime.textContent = "—";
+    }
+
+    if (entryPrice) {
+        entryPrice.textContent = "—";
+    }
+
+    if (callScore) {
+        callScore.textContent = "—";
+    }
+
+    if (putScore) {
+        putScore.textContent = "—";
+    }
+
+    if (support) {
+        support.textContent = "—";
+    }
+
+    if (resistance) {
+        resistance.textContent = "—";
+    }
+
+    if (ema9) {
+        ema9.textContent = "—";
+    }
+
+    if (ema21) {
+        ema21.textContent = "—";
+    }
+
+    if (rsi) {
+        rsi.textContent = "—";
+    }
+
+    if (adx) {
+        adx.textContent = "—";
+    }
+
+    if (reasons) {
+        reasons.textContent = "Analyzing live market conditions...";
+    }
 }
 
 
-/* =========================================================
-   ERROR SCREEN
-========================================================= */
+// ================================
+// RENDER RESULT
+// ================================
 
-function showError(message) {
+function renderSignal(result) {
 
-  if (!results) {
-    return;
-  }
+    if (!result) {
+        throw new Error("Backend returned no selected market.");
+    }
 
-  results.innerHTML = `
-    <div class="signal-card error-card">
+    currentResult = result;
 
-      <div class="signal-title">
-        DATA ERROR
-      </div>
+    console.log("AI selected result:", result);
 
-      <div class="error-message">
-        ${escapeHtml(message)}
-      </div>
+    if (signalCard) {
+        signalCard.style.display = "block";
+    }
 
-      <div class="error-help">
-        Please try ANALYZE MARKET again.
-      </div>
+    // Pair
+    if (selectedPair) {
+        selectedPair.textContent = safe(result.pair);
+    }
 
-    </div>
-  `;
+    // Trend
+    if (trendBadge) {
+        trendBadge.textContent = safe(result.trend, "—");
+    }
+
+    // Signal
+    if (signalBadge) {
+
+        const signal = safe(result.signal, "NO TRADE");
+
+        signalBadge.textContent = signal;
+
+        signalBadge.classList.remove(
+            "call",
+            "put",
+            "no-trade"
+        );
+
+        if (signal === "CALL") {
+            signalBadge.classList.add("call");
+        } else if (signal === "PUT") {
+            signalBadge.classList.add("put");
+        } else {
+            signalBadge.classList.add("no-trade");
+        }
+    }
+
+    // Confidence
+    if (confidence) {
+        confidence.textContent = formatPercent(result.confidence);
+    }
+
+    // Timeframe
+    if (timeframe) {
+        timeframe.textContent =
+            result.timeframe !== undefined
+                ? `${result.timeframe} MIN`
+                : "—";
+    }
+
+    // Entry / Expiry
+    if (entryTime) {
+        entryTime.textContent = formatDateTime(result.entryTime);
+    }
+
+    if (expiryTime) {
+        expiryTime.textContent = formatDateTime(result.expiryTime);
+    }
+
+    // Entry price
+    if (entryPrice) {
+        entryPrice.textContent = formatNumber(
+            result.entryPrice,
+            5
+        );
+    }
+
+    // Scores
+    if (callScore) {
+        callScore.textContent = formatPercent(
+            result.callScore
+        );
+    }
+
+    if (putScore) {
+        putScore.textContent = formatPercent(
+            result.putScore
+        );
+    }
+
+    // Support / Resistance
+    if (support) {
+        support.textContent = formatNumber(
+            result.support,
+            5
+        );
+    }
+
+    if (resistance) {
+        resistance.textContent = formatNumber(
+            result.resistance,
+            5
+        );
+    }
+
+    // Indicators
+    if (ema9) {
+        ema9.textContent = formatNumber(
+            result.ema9,
+            5
+        );
+    }
+
+    if (ema21) {
+        ema21.textContent = formatNumber(
+            result.ema21,
+            5
+        );
+    }
+
+    if (rsi) {
+        rsi.textContent = formatNumber(
+            result.rsi,
+            2
+        );
+    }
+
+    if (adx) {
+        adx.textContent = formatNumber(
+            result.adx,
+            2
+        );
+    }
+
+    // Reasons
+    if (reasons) {
+
+        if (
+            Array.isArray(result.reasons) &&
+            result.reasons.length > 0
+        ) {
+
+            reasons.innerHTML = result.reasons
+                .map(reason => `<div>• ${reason}</div>`)
+                .join("");
+
+        } else {
+
+            reasons.textContent = "No detailed reasons returned.";
+        }
+    }
+
+    // Data age / last candle
+    if (dataAge) {
+        if (result.lastCandle) {
+            dataAge.textContent =
+                `Last candle: ${result.lastCandle}`;
+        } else {
+            dataAge.textContent = "LIVE DATA";
+        }
+    }
+
+    // Scan info
+    if (scanInfo) {
+
+        const candles = safe(
+            result.candlesUsed,
+            "—"
+        );
+
+        scanInfo.textContent =
+            `LIVE • ${candles} candles analyzed`;
+    }
+
+    if (backendStatus) {
+        backendStatus.textContent = "LIVE";
+    }
+
+    updateCountdown();
 }
 
 
-/* =========================================================
-   SIGNAL CLASS
-========================================================= */
+// ================================
+// RENDER SCANNER INFORMATION
+// ================================
 
-function signalClass(signal) {
+function renderScanner(data) {
 
-  if (signal === "CALL") {
-    return "call";
-  }
+    if (!data) {
+        return;
+    }
 
-  if (signal === "PUT") {
-    return "put";
-  }
+    if (scanner) {
 
-  return "no-trade";
+        const scanned =
+            safe(data.scannedPairs, 0);
+
+        const cached =
+            safe(data.cachedPairs, 0);
+
+        scanner.textContent =
+            `${scanned} pairs scanned • ${cached} cached`;
+    }
 }
 
 
-/* =========================================================
-   RENDER SELECTED RESULT
-========================================================= */
+// ================================
+// COUNTDOWN
+// ================================
 
-function renderSignal(signal) {
+function updateCountdown() {
 
-  if (!results) {
-    return;
-  }
+    if (!countdown) {
+        return;
+    }
 
-  if (!signal) {
+    if (!currentResult || !currentResult.entryTime) {
+        countdown.textContent = "—";
+        return;
+    }
 
-    showError(
-      "The API did not return a selected market."
+    const entry = new Date(
+        currentResult.entryTime
+    ).getTime();
+
+    if (!Number.isFinite(entry)) {
+        countdown.textContent = "—";
+        return;
+    }
+
+    const now = Date.now();
+
+    const seconds = Math.max(
+        0,
+        Math.floor((entry - now) / 1000)
     );
 
-    return;
-  }
+    if (seconds <= 0) {
 
-  const pair =
-    signal.pair || "—";
+        countdown.textContent = "ENTRY NOW";
 
-  const timeframe =
-    Number(signal.timeframe) || 1;
+        return;
+    }
 
-  const signalName =
-    signal.signal || "NO TRADE";
+    const minutes = Math.floor(seconds / 60);
 
-  const confidence =
-    Number.isFinite(
-      Number(signal.confidence)
-    )
-      ? Number(signal.confidence)
-      : 0;
+    const remainingSeconds = seconds % 60;
 
-  const digits =
-    getDigits(pair);
-
-  const trend =
-    signal.trend || "RANGE";
-
-  const signalCss =
-    signalClass(signalName);
-
-
-  /* =======================================================
-     REASONS
-  ======================================================= */
-
-  let reasonsHtml =
-    "";
-
-  if (
-    Array.isArray(
-      signal.reasons
-    ) &&
-    signal.reasons.length > 0
-  ) {
-
-    reasonsHtml =
-      signal.reasons
-        .map(
-          reason => `
-            <li>
-              ${escapeHtml(reason)}
-            </li>
-          `
-        )
-        .join("");
-
-  } else {
-
-    reasonsHtml =
-      "<li>No additional reasons.</li>";
-  }
-
-
-  /* =======================================================
-     MAIN CARD
-  ======================================================= */
-
-  results.innerHTML = `
-
-    <div class="signal-card ${signalCss}">
-
-      <div class="pair-title">
-        ${escapeHtml(pair)}
-      </div>
-
-      <div class="timeframe-title">
-        ${timeframe} MIN MINUTES
-      </div>
-
-
-      <div class="trend-box">
-        ${escapeHtml(trend)}
-      </div>
-
-
-      <div class="signal-main ${signalCss}">
-
-        ${escapeHtml(signalName)}
-
-      </div>
-
-
-      <div class="confidence">
-
-        CONFIDENCE
-
-        <strong>
-          ${confidence}%
-        </strong>
-
-      </div>
-
-
-      <div class="signal-grid">
-
-        <div class="info-box">
-          <span>PAIR</span>
-          <strong>
-            ${escapeHtml(pair)}
-          </strong>
-        </div>
-
-
-        <div class="info-box">
-          <span>TIMEFRAME</span>
-          <strong>
-            ${timeframe} MIN
-          </strong>
-        </div>
-
-
-        <div class="info-box">
-          <span>EXPIRY</span>
-          <strong>
-            ${timeframe} MIN
-          </strong>
-        </div>
-
-
-        <div class="info-box">
-          <span>ENTRY PRICE</span>
-          <strong>
-            ${formatNumber(
-              signal.entryPrice,
-              digits
-            )}
-          </strong>
-        </div>
-
-
-        <div class="info-box">
-          <span>ENTRY TIME</span>
-          <strong>
-            ${formatDateTime(
-              signal.entryTime
-            )}
-          </strong>
-        </div>
-
-
-        <div class="info-box">
-          <span>EXPIRY TIME</span>
-          <strong>
-            ${formatDateTime(
-              signal.expiryTime
-            )}
-          </strong>
-        </div>
-
-
-        <div class="info-box">
-          <span>CALL SCORE</span>
-          <strong>
-            ${signal.callScore ?? "—"}%
-          </strong>
-        </div>
-
-
-        <div class="info-box">
-          <span>PUT SCORE</span>
-          <strong>
-            ${signal.putScore ?? "—"}%
-          </strong>
-        </div>
-
-      </div>
-
-
-      <div class="section-title">
-        SUPPORT / RESISTANCE
-      </div>
-
-
-      <div class="indicator-grid">
-
-        <div class="indicator-box">
-          <span>SUPPORT</span>
-          <strong>
-            ${formatNumber(
-              signal.support,
-              digits
-            )}
-          </strong>
-        </div>
-
-
-        <div class="indicator-box">
-          <span>RESISTANCE</span>
-          <strong>
-            ${formatNumber(
-              signal.resistance,
-              digits
-            )}
-          </strong>
-        </div>
-
-      </div>
-
-
-      <div class="section-title">
-        TECHNICAL INDICATORS
-      </div>
-
-
-      <div class="indicator-grid">
-
-        <div class="indicator-box">
-          <span>EMA 9</span>
-          <strong>
-            ${formatNumber(
-              signal.ema9,
-              digits
-            )}
-          </strong>
-        </div>
-
-
-        <div class="indicator-box">
-          <span>EMA 21</span>
-          <strong>
-            ${formatNumber(
-              signal.ema21,
-              digits
-            )}
-          </strong>
-        </div>
-
-
-        <div class="indicator-box">
-          <span>RSI 14</span>
-          <strong>
-            ${formatNumber(
-              signal.rsi,
-              2
-            )}
-          </strong>
-        </div>
-
-
-        <div class="indicator-box">
-          <span>ADX 14</span>
-          <strong>
-            ${formatNumber(
-              signal.adx,
-              2
-            )}
-          </strong>
-        </div>
-
-      </div>
-
-
-      <div class="section-title">
-        ANALYSIS REASONS
-      </div>
-
-
-      <ul class="reasons">
-        ${reasonsHtml}
-      </ul>
-
-
-      <div class="market-meta">
-
-        <div>
-          Candles Used:
-          <strong>
-            ${signal.candlesUsed ?? "—"}
-          </strong>
-        </div>
-
-        <div>
-          Last Candle:
-          <strong>
-            ${escapeHtml(
-              signal.lastCandle || "—"
-            )}
-          </strong>
-        </div>
-
-        <div>
-          Generated:
-          <strong>
-            ${formatDateTime(
-              signal.generatedAt
-            )}
-          </strong>
-        </div>
-
-      </div>
-
-    </div>
-  `;
+    countdown.textContent =
+        `ENTRY IN ${minutes}:${String(
+            remainingSeconds
+        ).padStart(2, "0")}`;
 }
 
 
-/* =========================================================
-   ANALYZE MARKET
-========================================================= */
+// ================================
+// MAIN ANALYZE FUNCTION
+// ================================
 
 async function analyzeMarket() {
 
-  setLoading(true);
+    console.log("ANALYZE MARKET clicked");
 
-  showLoading();
-
-
-  try {
-
-    /*
-      IMPORTANT:
-      V8 backend selects the best pair/timeframe itself.
-
-      We therefore DO NOT send 1 MIN / 2 MIN / 3 MIN
-      separately.
-
-      The API returns:
-
-      {
-        selected: {...}
-      }
-
-      and we display ONLY selected.
-    */
-
-    const response =
-      await fetch(
-        ANALYZE_URL,
-        {
-          method: "GET",
-          headers: {
-            "Accept":
-              "application/json"
-          },
-          cache: "no-store"
-        }
-      );
-
-
-    let data = null;
+    showLoading();
 
     try {
 
-      data =
-        await response.json();
+        const response = await fetch(
+            ANALYZE_URL,
+            {
+                method: "GET",
+                cache: "no-store",
+                headers: {
+                    "Accept": "application/json"
+                }
+            }
+        );
 
-    } catch {
+        console.log(
+            "Analyze HTTP status:",
+            response.status
+        );
 
-      throw new Error(
-        `Server returned HTTP ${response.status}`
-      );
+        const rawText = await response.text();
+
+        console.log(
+            "Analyze raw response:",
+            rawText
+        );
+
+        if (!response.ok) {
+
+            throw new Error(
+                `API error ${response.status}: ${rawText}`
+            );
+        }
+
+        let data;
+
+        try {
+
+            data = JSON.parse(rawText);
+
+        } catch (jsonError) {
+
+            throw new Error(
+                "Backend returned invalid JSON."
+            );
+        }
+
+        console.log(
+            "Analyze JSON:",
+            data
+        );
+
+        if (!data) {
+            throw new Error(
+                "Backend returned empty response."
+            );
+        }
+
+        if (!data.selected) {
+
+            throw new Error(
+                "Backend returned no selected market."
+            );
+        }
+
+        renderSignal(data.selected);
+
+        renderScanner(data);
+
+        clearError();
+
+    } catch (error) {
+
+        console.error(
+            "ANALYZE MARKET ERROR:",
+            error
+        );
+
+        showError(
+            `Unable to load live market data: ${error.message}`
+        );
+
+        if (signalBadge) {
+            signalBadge.textContent = "ERROR";
+        }
+
+        if (trendBadge) {
+            trendBadge.textContent = "DATA ERROR";
+        }
+
+    } finally {
+
+        if (analyzeBtn) {
+            analyzeBtn.disabled = false;
+            analyzeBtn.textContent = "ANALYZE MARKET";
+        }
     }
-
-
-    if (!response.ok) {
-
-      throw new Error(
-        data?.error ||
-        `API request failed with HTTP ${response.status}`
-      );
-    }
-
-
-    if (!data) {
-
-      throw new Error(
-        "Empty response from V8 API."
-      );
-    }
-
-
-    if (!data.selected) {
-
-      throw new Error(
-        data.error ||
-        "V8 API returned no selected market."
-      );
-    }
-
-
-    /*
-      Render ONE selected result only.
-    */
-
-    renderSignal(
-      data.selected
-    );
-
-
-    /*
-      Optional console information
-      useful for testing.
-    */
-
-    console.log(
-      "PO AI Predictor V8 response:",
-      data
-    );
-
-    console.log(
-      "Selected market:",
-      data.selected
-    );
-
-
-  } catch (error) {
-
-    console.error(
-      "ANALYZE MARKET ERROR:",
-      error
-    );
-
-
-    showError(
-      error.message ||
-      "Unable to connect to the V8 analysis server."
-    );
-
-  } finally {
-
-    setLoading(false);
-  }
 }
 
 
-/* =========================================================
-   BUTTON EVENT
-========================================================= */
+// ================================
+// BUTTON
+// ================================
 
 if (analyzeBtn) {
 
-  analyzeBtn.addEventListener(
-    "click",
-    analyzeMarket
-  );
+    analyzeBtn.addEventListener(
+        "click",
+        analyzeMarket
+    );
 
+} else {
+
+    console.error(
+        "ANALYZE MARKET button #analyzeBtn not found."
+    );
 }
 
 
-/* =========================================================
-   OPTIONAL ENTER KEY
-========================================================= */
+// ================================
+// COUNTDOWN TIMER
+// ================================
 
-if (pairSelect) {
+if (countdownTimer) {
+    clearInterval(countdownTimer);
+}
 
-  pairSelect.addEventListener(
-    "keydown",
-    event => {
+countdownTimer = setInterval(
+    updateCountdown,
+    1000
+);
 
-      if (
-        event.key === "Enter"
-      ) {
 
-        analyzeMarket();
+// ================================
+// INITIAL STATUS
+// ================================
 
-      }
+document.addEventListener(
+    "DOMContentLoaded",
+    async () => {
 
+        console.log(
+            "PO AI Predictor V8 frontend loaded."
+        );
+
+        await checkBackend();
+
+        updateCountdown();
     }
-  );
-
-}
+);
 
 
-/* =========================================================
-   INITIAL MESSAGE
-========================================================= */
+// ================================
+// GLOBAL FUNCTION
+// ================================
 
-if (results) {
-
-  results.innerHTML = `
-
-    <div class="signal-card">
-
-      <div class="signal-title">
-        READY
-      </div>
-
-      <div class="loading-text">
-        Select your market settings
-        and press ANALYZE MARKET.
-      </div>
-
-      <div class="loading-text">
-        V8 will select the strongest
-        available live market and timeframe.
-      </div>
-
-    </div>
-
-  `;
-}
-
-
-/* =========================================================
-   GLOBAL ACCESS
-========================================================= */
-
-window.analyzeMarket =
-  analyzeMarket;
+window.analyzeMarket = analyzeMarket;
