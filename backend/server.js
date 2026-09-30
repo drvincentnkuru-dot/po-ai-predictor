@@ -46,6 +46,16 @@ const SCAN_EVERY_MS = 60000;
 
 const ENTRY_BUFFER_SECONDS = 30;
 
+/*
+  V8.1 UTC TIME SYNC
+
+  All server-side candle timestamps are normalized
+  and interpreted as UTC.
+
+  Entry/expiry scheduling already uses Unix timestamps,
+  which are timezone-independent. ISO output is UTC.
+*/
+
 const cache = new Map();
 
 let scanCursor = 0;
@@ -59,13 +69,42 @@ function sleep(ms) {
 
 
 /* =========================
+   UTC DATE PARSER
+========================= */
+
+function parseUTCDateTime(value) {
+  if (!value) {
+    return NaN;
+  }
+
+  const normalized = String(value)
+    .trim()
+    .replace(" ", "T");
+
+  const utcValue =
+    normalized.endsWith("Z")
+      ? normalized
+      : `${normalized}Z`;
+
+  const timestamp =
+    new Date(utcValue).getTime();
+
+  return Number.isFinite(timestamp)
+    ? timestamp
+    : NaN;
+}
+
+
+/* =========================
    TWELVE DATA
 ========================= */
 
 async function fetchCandles(pair) {
 
   if (!TWELVE_DATA_API_KEY) {
-    throw new Error("TWELVE_DATA_API_KEY is missing");
+    throw new Error(
+      "TWELVE_DATA_API_KEY is missing"
+    );
   }
 
   const url = new URL(
@@ -92,14 +131,26 @@ async function fetchCandles(pair) {
     "ASC"
   );
 
+  /*
+    IMPORTANT:
+    Request candle timestamps in UTC so the
+    entire backend uses one consistent time standard.
+  */
+  url.searchParams.set(
+    "timezone",
+    "UTC"
+  );
+
   url.searchParams.set(
     "apikey",
     TWELVE_DATA_API_KEY
   );
 
-  const response = await fetch(url);
+  const response =
+    await fetch(url);
 
-  const data = await response.json();
+  const data =
+    await response.json();
 
   if (
     !response.ok ||
@@ -127,6 +178,13 @@ async function fetchCandles(pair) {
         candle.low,
         candle.close
       ].every(Number.isFinite)
+    )
+    .filter(candle =>
+      Number.isFinite(
+        parseUTCDateTime(
+          candle.datetime
+        )
+      )
     );
 }
 
@@ -416,24 +474,93 @@ function adx(candles, period = 14) {
 
 /* =========================
    TIMEFRAME AGGREGATION
+   V8.1 UTC SYNC
 ========================= */
 
 function aggregate(candles, minutes) {
 
+  /*
+    Normalize and sort every candle by UTC timestamp.
+    Also remove invalid/future candles.
+  */
+
+  const now =
+    Date.now();
+
+  const validCandles =
+    candles
+      .map(candle => {
+
+        const timestamp =
+          parseUTCDateTime(
+            candle.datetime
+          );
+
+        return {
+          ...candle,
+          _timestamp: timestamp
+        };
+      })
+      .filter(candle =>
+        Number.isFinite(
+          candle._timestamp
+        )
+      )
+      .filter(candle =>
+        candle._timestamp <=
+        now + 30000
+      )
+      .sort(
+        (a, b) =>
+          a._timestamp -
+          b._timestamp
+      );
+
+  /*
+    1-minute timeframe:
+    return normalized UTC-sorted candles.
+  */
+
   if (minutes === 1) {
-    return candles.slice();
+
+    return validCandles.map(
+      candle => ({
+        datetime:
+          new Date(
+            candle._timestamp
+          ).toISOString(),
+
+        open:
+          candle.open,
+
+        high:
+          candle.high,
+
+        low:
+          candle.low,
+
+        close:
+          candle.close
+      })
+    );
   }
+
+
+  /*
+    2-minute / 3-minute aggregation.
+    Buckets are created from UTC timestamps.
+  */
 
   const output = [];
   const buckets = new Map();
 
-  for (const candle of candles) {
+  for (
+    const candle
+    of validCandles
+  ) {
 
     const timestamp =
-      new Date(
-        candle.datetime
-          .replace(" ", "T") + "Z"
-      ).getTime();
+      candle._timestamp;
 
     const bucket =
       Math.floor(
@@ -444,7 +571,10 @@ function aggregate(candles, minutes) {
       60000;
 
     if (!buckets.has(bucket)) {
-      buckets.set(bucket, []);
+      buckets.set(
+        bucket,
+        []
+      );
     }
 
     buckets
@@ -463,13 +593,18 @@ function aggregate(candles, minutes) {
       continue;
     }
 
+    values.sort(
+      (a, b) =>
+        a._timestamp -
+        b._timestamp
+    );
+
     output.push({
 
       datetime:
-        new Date(bucket)
-          .toISOString()
-          .slice(0, 16)
-          .replace("T", " "),
+        new Date(
+          bucket
+        ).toISOString(),
 
       open:
         values[0].open,
@@ -494,7 +629,15 @@ function aggregate(candles, minutes) {
     });
   }
 
-  return output;
+  return output.sort(
+    (a, b) =>
+      parseUTCDateTime(
+        a.datetime
+      ) -
+      parseUTCDateTime(
+        b.datetime
+      )
+  );
 }
 
 
@@ -828,10 +971,19 @@ function analyze(
         );
 
 
-  /* ENTRY / EXPIRY */
+  /* =========================
+     ENTRY / EXPIRY
+     UTC-SYNCHRONIZED
+  ========================= */
 
   const now =
     new Date();
+
+  /*
+    Unix timestamp is timezone-independent.
+    Math.ceil() therefore calculates the next
+    timeframe boundary consistently in UTC.
+  */
 
   const step =
     timeframe * 60000;
@@ -846,6 +998,10 @@ function analyze(
     entry -
     now.getTime();
 
+  /*
+    Keep the existing 30-second entry buffer.
+  */
+
   if (
     secondsUntilEntry <
     ENTRY_BUFFER_SECONDS * 1000
@@ -856,6 +1012,20 @@ function analyze(
 
   const expiry =
     entry + step;
+
+
+  /*
+    Normalize the last candle to ISO UTC.
+  */
+
+  const lastCandleValue =
+    aggregated.at(-1)
+      ?.datetime || null;
+
+  const lastCandleTimestamp =
+    parseUTCDateTime(
+      lastCandleValue
+    );
 
 
   return {
@@ -877,6 +1047,10 @@ function analyze(
       Math.round(
         putScore
       ),
+
+    /*
+      ISO strings ending in Z are explicitly UTC.
+    */
 
     entryTime:
       new Date(
@@ -940,9 +1114,19 @@ function analyze(
     candlesUsed:
       aggregated.length,
 
+    /*
+      Last candle is now returned as
+      an explicit UTC ISO timestamp.
+    */
+
     lastCandle:
-      aggregated.at(-1)
-        ?.datetime || null,
+      Number.isFinite(
+        lastCandleTimestamp
+      )
+        ? new Date(
+            lastCandleTimestamp
+          ).toISOString()
+        : null,
 
     reasons:
       reasons.slice(0, 5),
@@ -1119,7 +1303,7 @@ app.get(
 
       ok: true,
 
-      version: "V8",
+      version: "V8.1",
 
       source:
         "Twelve Data LIVE",
@@ -1198,7 +1382,7 @@ app.get(
     res.json({
 
       version:
-        "V8",
+        "V8.1",
 
       source:
         "Twelve Data LIVE",
@@ -1232,7 +1416,7 @@ app.listen(
   () => {
 
     console.log(
-      `PO AI Predictor V8 running on ${PORT}`
+      `PO AI Predictor V8.1 UTC TIME SYNC running on ${PORT}`
     );
   }
 );
