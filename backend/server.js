@@ -1,10 +1,11 @@
 // ============================================================
 // PO AI PREDICTOR
-// BACKEND V8.3.1
+// BACKEND V8.3.2
 // SMART PRICE-ACTION SCANNER
 // LIVE ONLY - TWELVE DATA
 // UTC TIME SYNC
 // FRESHNESS + LOCATION FILTER
+// FULL 24-PAIR SCAN CYCLE CONTROL
 // ============================================================
 
 const express = require("express");
@@ -27,7 +28,7 @@ const TWELVE_DATA_API_KEY =
 const TWELVE_DATA_URL =
     "https://api.twelvedata.com/time_series";
 
-const VERSION = "V8.3.1";
+const VERSION = "V8.3.2";
 
 const TIMEFRAMES = [1, 2, 3];
 
@@ -62,6 +63,9 @@ const MAX_CANDLES = 180;
 const MIN_CANDLES = 60;
 
 const SCAN_BATCH_SIZE = 8;
+
+// Keep the existing Twelve Data request rhythm.
+// 8 pairs every 60 seconds.
 const SCAN_EVERY_MS = 60000;
 
 const FETCH_TIMEOUT_MS = 12000;
@@ -70,22 +74,20 @@ const REQUEST_DELAY_MS = 150;
 const ENTRY_BUFFER_SECONDS = 30;
 
 // ============================================================
-// V8.3.1 SMART FILTER SETTINGS
+// FRESHNESS FILTER
 // ============================================================
 
-// Latest completed 1-minute candle should normally be recent.
-// If data is older than this, signal becomes NO TRADE.
 const MAX_DATA_AGE_SECONDS = 90;
 
-// Very stale data is treated as unusable.
 const HARD_STALE_SECONDS = 180;
 
-// Location filter based mainly on ATR.
+// ============================================================
+// LOCATION FILTER
+// ============================================================
+
 const SUPPORT_RISK_ATR_MULTIPLIER = 0.75;
 const RESISTANCE_RISK_ATR_MULTIPLIER = 0.75;
 
-// Extremely narrow support/resistance range can create
-// contradictory "near support" + "near resistance" conditions.
 const MIN_SR_RANGE_ATR_MULTIPLIER = 1.20;
 
 // ============================================================
@@ -95,10 +97,36 @@ const MIN_SR_RANGE_ATR_MULTIPLIER = 1.20;
 const cache = new Map();
 
 let scanRunning = false;
+
 let scanCursor = 0;
+
 let lastScanAt = null;
+
 let lastScanError = null;
+
 let totalScanned = 0;
+
+// ------------------------------------------------------------
+// V8.3.2 cycle state
+// ------------------------------------------------------------
+
+let scanCycle = 1;
+
+let cycleScanned = 0;
+
+let cycleSuccessful = 0;
+
+let cycleFailed = 0;
+
+let cycleStartedAt = null;
+
+let cycleCompletedAt = null;
+
+let cycleComplete = false;
+
+let lastBatchStartedAt = null;
+
+let lastBatchCompletedAt = null;
 
 // ============================================================
 // BASIC HELPERS
@@ -109,7 +137,10 @@ function sleep(ms) {
 }
 
 function clamp(value, min, max) {
-    return Math.max(min, Math.min(max, value));
+    return Math.max(
+        min,
+        Math.min(max, value)
+    );
 }
 
 function round(value, decimals = 5) {
@@ -119,51 +150,42 @@ function round(value, decimals = 5) {
         return null;
     }
 
-    return Number(n.toFixed(decimals));
+    return Number(
+        n.toFixed(decimals)
+    );
 }
 
 function average(values) {
-    if (!Array.isArray(values) || values.length === 0) {
+    if (
+        !Array.isArray(values) ||
+        values.length === 0
+    ) {
         return null;
     }
 
-    const valid = values
-        .map(Number)
-        .filter(Number.isFinite);
+    const valid =
+        values
+            .map(Number)
+            .filter(Number.isFinite);
 
     if (!valid.length) {
         return null;
     }
 
-    return valid.reduce((a, b) => a + b, 0) / valid.length;
-}
-
-function median(values) {
-    if (!Array.isArray(values) || values.length === 0) {
-        return null;
-    }
-
-    const valid = values
-        .map(Number)
-        .filter(Number.isFinite)
-        .sort((a, b) => a - b);
-
-    if (!valid.length) {
-        return null;
-    }
-
-    const middle = Math.floor(valid.length / 2);
-
-    if (valid.length % 2 === 0) {
-        return (valid[middle - 1] + valid[middle]) / 2;
-    }
-
-    return valid[middle];
+    return (
+        valid.reduce(
+            (a, b) => a + b,
+            0
+        ) / valid.length
+    );
 }
 
 function safeNumber(value) {
     const n = Number(value);
-    return Number.isFinite(n) ? n : null;
+
+    return Number.isFinite(n)
+        ? n
+        : null;
 }
 
 function isoNow() {
@@ -189,7 +211,10 @@ function parseUTCDate(value) {
 }
 
 function getDataAgeSeconds(lastCandleTime) {
-    const candleDate = parseUTCDate(lastCandleTime);
+    const candleDate =
+        parseUTCDate(
+            lastCandleTime
+        );
 
     if (!candleDate) {
         return null;
@@ -198,7 +223,10 @@ function getDataAgeSeconds(lastCandleTime) {
     return Math.max(
         0,
         Math.floor(
-            (Date.now() - candleDate.getTime()) / 1000
+            (
+                Date.now() -
+                candleDate.getTime()
+            ) / 1000
         )
     );
 }
@@ -206,67 +234,80 @@ function getDataAgeSeconds(lastCandleTime) {
 function nextEntryTime(timeframe) {
     const now = new Date();
 
-    const seconds =
+    const currentMinute =
+        now.getUTCMinutes();
+
+    const currentSecond =
         now.getUTCSeconds();
 
-    const milliseconds =
+    const currentMs =
         now.getUTCMilliseconds();
 
-    const totalSecondsIntoMinute =
-        seconds + milliseconds / 1000;
+    const remainder =
+        currentMinute % timeframe;
 
     let minutesToAdd =
-        timeframe -
-        (now.getUTCMinutes() % timeframe);
+        timeframe - remainder;
 
-    if (
-        now.getUTCMinutes() % timeframe === 0 &&
-        totalSecondsIntoMinute < 1
-    ) {
-        minutesToAdd = timeframe;
+    if (remainder === 0) {
+        minutesToAdd =
+            timeframe;
     }
 
     const entry =
         new Date(
             now.getTime() +
             minutesToAdd * 60000 -
-            seconds * 1000 -
-            milliseconds
+            currentSecond * 1000 -
+            currentMs
         );
 
-    // Safety: make absolutely sure entry is >= buffer.
     const minimumEntry =
         new Date(
             now.getTime() +
             ENTRY_BUFFER_SECONDS * 1000
         );
 
-    if (entry.getTime() < minimumEntry.getTime()) {
-        const candidate =
-            new Date(
-                minimumEntry.getTime()
-            );
-
-        const remainder =
-            candidate.getUTCMinutes() % timeframe;
-
-        if (remainder !== 0) {
-            candidate.setUTCMinutes(
-                candidate.getUTCMinutes() +
-                (timeframe - remainder)
-            );
-        }
-
-        candidate.setUTCSeconds(0, 0);
-
-        return candidate;
+    if (
+        entry.getTime() >=
+        minimumEntry.getTime()
+    ) {
+        return entry;
     }
 
-    return entry;
+    const candidate =
+        new Date(
+            minimumEntry.getTime()
+        );
+
+    candidate.setUTCSeconds(0, 0);
+
+    const candidateMinute =
+        candidate.getUTCMinutes();
+
+    const candidateRemainder =
+        candidateMinute % timeframe;
+
+    if (
+        candidateRemainder !== 0
+    ) {
+        candidate.setUTCMinutes(
+            candidateMinute +
+            (
+                timeframe -
+                candidateRemainder
+            )
+        );
+    }
+
+    return candidate;
 }
 
 function buildEntryExpiry(timeframe) {
-    const entry = nextEntryTime(timeframe);
+    const entry =
+        nextEntryTime(
+            timeframe
+        );
 
     const expiry =
         new Date(
@@ -278,13 +319,20 @@ function buildEntryExpiry(timeframe) {
         Math.max(
             0,
             Math.floor(
-                (entry.getTime() - Date.now()) / 1000
+                (
+                    entry.getTime() -
+                    Date.now()
+                ) / 1000
             )
         );
 
     return {
-        entryTime: entry.toISOString(),
-        expiryTime: expiry.toISOString(),
+        entryTime:
+            entry.toISOString(),
+
+        expiryTime:
+            expiry.toISOString(),
+
         entryInSeconds
     };
 }
@@ -301,7 +349,9 @@ async function fetchCandles(pair) {
     }
 
     const url =
-        new URL(TWELVE_DATA_URL);
+        new URL(
+            TWELVE_DATA_URL
+        );
 
     url.searchParams.set(
         "symbol",
@@ -338,7 +388,8 @@ async function fetchCandles(pair) {
 
     const timeout =
         setTimeout(
-            () => controller.abort(),
+            () =>
+                controller.abort(),
             FETCH_TIMEOUT_MS
         );
 
@@ -348,9 +399,12 @@ async function fetchCandles(pair) {
                 url.toString(),
                 {
                     method: "GET",
-                    signal: controller.signal,
+
+                    signal:
+                        controller.signal,
+
                     headers: {
-                        "Accept":
+                        Accept:
                             "application/json"
                     }
                 }
@@ -368,21 +422,29 @@ async function fetchCandles(pair) {
         let data;
 
         try {
-            data = JSON.parse(text);
+            data =
+                JSON.parse(text);
         } catch {
             throw new Error(
                 "Twelve Data returned invalid JSON."
             );
         }
 
-        if (data.status === "error") {
+        if (
+            data.status ===
+            "error"
+        ) {
             throw new Error(
                 data.message ||
                 "Twelve Data returned an error."
             );
         }
 
-        if (!Array.isArray(data.values)) {
+        if (
+            !Array.isArray(
+                data.values
+            )
+        ) {
             throw new Error(
                 "Twelve Data returned no candle values."
             );
@@ -395,62 +457,89 @@ async function fetchCandles(pair) {
                         c.datetime,
 
                     open:
-                        safeNumber(c.open),
+                        safeNumber(
+                            c.open
+                        ),
 
                     high:
-                        safeNumber(c.high),
+                        safeNumber(
+                            c.high
+                        ),
 
                     low:
-                        safeNumber(c.low),
+                        safeNumber(
+                            c.low
+                        ),
 
                     close:
-                        safeNumber(c.close)
+                        safeNumber(
+                            c.close
+                        )
                 }))
                 .filter(c =>
                     c.datetime &&
-                    Number.isFinite(c.open) &&
-                    Number.isFinite(c.high) &&
-                    Number.isFinite(c.low) &&
-                    Number.isFinite(c.close)
+                    Number.isFinite(
+                        c.open
+                    ) &&
+                    Number.isFinite(
+                        c.high
+                    ) &&
+                    Number.isFinite(
+                        c.low
+                    ) &&
+                    Number.isFinite(
+                        c.close
+                    )
                 );
 
-        if (candles.length < MIN_CANDLES) {
+        if (
+            candles.length <
+            MIN_CANDLES
+        ) {
             throw new Error(
                 `Insufficient candles: ${candles.length}/${MIN_CANDLES}`
             );
         }
 
-        // --------------------------------------------------------
-        // IMPORTANT:
+        // ------------------------------------------------------
         // Remove current forming candle.
-        // We only analyze completed candles.
-        // --------------------------------------------------------
+        // Only completed candles are analyzed.
+        // ------------------------------------------------------
 
-        const now = Date.now();
+        const now =
+            Date.now();
 
         const completed =
-            candles.filter(c => {
-                const t =
-                    parseUTCDate(
-                        c.datetime
+            candles.filter(
+                candle => {
+                    const t =
+                        parseUTCDate(
+                            candle.datetime
+                        );
+
+                    if (!t) {
+                        return false;
+                    }
+
+                    return (
+                        t.getTime() <=
+                        now - 1000
                     );
-
-                if (!t) {
-                    return false;
                 }
+            );
 
-                return (
-                    t.getTime() <= now - 1000
-                );
-            });
-
-        if (completed.length < MIN_CANDLES) {
+        if (
+            completed.length <
+            MIN_CANDLES
+        ) {
             throw new Error(
                 `Not enough completed candles: ${completed.length}/${MIN_CANDLES}`
             );
         }
 
-        return completed.slice(-MAX_CANDLES);
+        return completed.slice(
+            -MAX_CANDLES
+        );
 
     } finally {
         clearTimeout(timeout);
@@ -465,7 +554,9 @@ function aggregateCandles(
     candles,
     timeframe
 ) {
-    if (timeframe === 1) {
+    if (
+        timeframe === 1
+    ) {
         return candles.slice();
     }
 
@@ -493,7 +584,10 @@ function aggregateCandles(
 
         const groupMinute =
             minute -
-            (minute % timeframe);
+            (
+                minute %
+                timeframe
+            );
 
         const key =
             `${d.getUTCFullYear()}-${String(
@@ -508,7 +602,9 @@ function aggregateCandles(
 
         let group =
             groups.find(
-                g => g.key === key
+                g =>
+                    g.key ===
+                    key
             );
 
         if (!group) {
@@ -517,16 +613,21 @@ function aggregateCandles(
                 candles: []
             };
 
-            groups.push(group);
+            groups.push(
+                group
+            );
         }
 
-        group.candles.push(candle);
+        group.candles.push(
+            candle
+        );
     }
 
     return groups
         .filter(
             g =>
-                g.candles.length >= timeframe
+                g.candles.length >=
+                timeframe
         )
         .map(g => {
             const first =
@@ -547,14 +648,16 @@ function aggregateCandles(
                 high:
                     Math.max(
                         ...g.candles.map(
-                            c => c.high
+                            c =>
+                                c.high
                         )
                     ),
 
                 low:
                     Math.min(
                         ...g.candles.map(
-                            c => c.low
+                            c =>
+                                c.low
                         )
                     ),
 
@@ -580,11 +683,15 @@ function calculateEMA(
     }
 
     const multiplier =
-        2 / (period + 1);
+        2 /
+        (period + 1);
 
     let ema =
         average(
-            values.slice(0, period)
+            values.slice(
+                0,
+                period
+            )
         );
 
     if (ema === null) {
@@ -598,7 +705,8 @@ function calculateEMA(
     ) {
         ema =
             (
-                values[i] - ema
+                values[i] -
+                ema
             ) *
             multiplier +
             ema;
@@ -637,7 +745,10 @@ function calculateRSI(
         if (change > 0) {
             gains += change;
         } else {
-            losses += Math.abs(change);
+            losses +=
+                Math.abs(
+                    change
+                );
         }
     }
 
@@ -669,28 +780,34 @@ function calculateRSI(
         avgGain =
             (
                 avgGain *
-                (period - 1) +
+                    (period - 1) +
                 gain
-            ) / period;
+            ) /
+            period;
 
         avgLoss =
             (
                 avgLoss *
-                (period - 1) +
+                    (period - 1) +
                 loss
-            ) / period;
+            ) /
+            period;
     }
 
-    if (avgLoss === 0) {
+    if (
+        avgLoss === 0
+    ) {
         return 100;
     }
 
     const rs =
-        avgGain / avgLoss;
+        avgGain /
+        avgLoss;
 
     return (
         100 -
-        100 / (1 + rs)
+        100 /
+            (1 + rs)
     );
 }
 
@@ -738,11 +855,14 @@ function calculateATR(
                 )
             );
 
-        trueRanges.push(tr);
+        trueRanges.push(
+            tr
+        );
     }
 
     if (
-        trueRanges.length < period
+        trueRanges.length <
+        period
     ) {
         return null;
     }
@@ -763,9 +883,10 @@ function calculateATR(
         atr =
             (
                 atr *
-                (period - 1) +
+                    (period - 1) +
                 trueRanges[i]
-            ) / period;
+            ) /
+            period;
     }
 
     return atr;
@@ -781,7 +902,8 @@ function calculateADX(
 ) {
     if (
         !Array.isArray(candles) ||
-        candles.length < period * 2 + 1
+        candles.length <
+            period * 2 + 1
     ) {
         return null;
     }
@@ -828,14 +950,16 @@ function calculateADX(
         trs.push(tr);
 
         plusDM.push(
-            upMove > downMove &&
+            upMove >
+                downMove &&
             upMove > 0
                 ? upMove
                 : 0
         );
 
         minusDM.push(
-            downMove > upMove &&
+            downMove >
+                upMove &&
             downMove > 0
                 ? downMove
                 : 0
@@ -843,32 +967,45 @@ function calculateADX(
     }
 
     if (
-        trs.length < period * 2
+        trs.length <
+        period * 2
     ) {
         return null;
     }
 
     let smoothedTR =
         trs
-            .slice(0, period)
+            .slice(
+                0,
+                period
+            )
             .reduce(
-                (a, b) => a + b,
+                (a, b) =>
+                    a + b,
                 0
             );
 
     let smoothedPlus =
         plusDM
-            .slice(0, period)
+            .slice(
+                0,
+                period
+            )
             .reduce(
-                (a, b) => a + b,
+                (a, b) =>
+                    a + b,
                 0
             );
 
     let smoothedMinus =
         minusDM
-            .slice(0, period)
+            .slice(
+                0,
+                period
+            )
             .reduce(
-                (a, b) => a + b,
+                (a, b) =>
+                    a + b,
                 0
             );
 
@@ -879,20 +1016,25 @@ function calculateADX(
         i < trs.length;
         i++
     ) {
-        if (i > period) {
+        if (
+            i > period
+        ) {
             smoothedTR =
                 smoothedTR -
-                smoothedTR / period +
+                smoothedTR /
+                    period +
                 trs[i];
 
             smoothedPlus =
                 smoothedPlus -
-                smoothedPlus / period +
+                smoothedPlus /
+                    period +
                 plusDM[i];
 
             smoothedMinus =
                 smoothedMinus -
-                smoothedMinus / period +
+                smoothedMinus /
+                    period +
                 minusDM[i];
         }
 
@@ -911,7 +1053,8 @@ function calculateADX(
                   smoothedTR;
 
         const denominator =
-            plusDI + minusDI;
+            plusDI +
+            minusDI;
 
         const dx =
             denominator === 0
@@ -923,11 +1066,14 @@ function calculateADX(
                   ) /
                   denominator;
 
-        dxValues.push(dx);
+        dxValues.push(
+            dx
+        );
     }
 
     if (
-        dxValues.length < period
+        dxValues.length <
+        period
     ) {
         return null;
     }
@@ -948,9 +1094,10 @@ function calculateADX(
         adx =
             (
                 adx *
-                (period - 1) +
+                    (period - 1) +
                 dxValues[i]
-            ) / period;
+            ) /
+            period;
     }
 
     return adx;
@@ -964,7 +1111,9 @@ function calculateSupportResistance(
     candles
 ) {
     const recent =
-        candles.slice(-40);
+        candles.slice(
+            -40
+        );
 
     if (!recent.length) {
         return {
@@ -974,22 +1123,30 @@ function calculateSupportResistance(
     }
 
     const lows =
-        recent.map(c => c.low);
+        recent.map(
+            c => c.low
+        );
 
     const highs =
-        recent.map(c => c.high);
+        recent.map(
+            c => c.high
+        );
 
     return {
         support:
-            Math.min(...lows),
+            Math.min(
+                ...lows
+            ),
 
         resistance:
-            Math.max(...highs)
+            Math.max(
+                ...highs
+            )
     };
 }
 
 // ============================================================
-// CANDLESTICK PATTERNS
+// CANDLE INFO
 // ============================================================
 
 function candleInfo(
@@ -1019,30 +1176,34 @@ function candleInfo(
         ) -
         candle.low;
 
-    const bullish =
-        candle.close >
-        candle.open;
-
-    const bearish =
-        candle.close <
-        candle.open;
-
     return {
         body,
         range,
         upperWick,
         lowerWick,
-        bullish,
-        bearish
+
+        bullish:
+            candle.close >
+            candle.open,
+
+        bearish:
+            candle.close <
+            candle.open
     };
 }
+
+// ============================================================
+// CANDLESTICK PATTERN
+// ============================================================
 
 function detectCandlestickPattern(
     candles,
     support,
     resistance
 ) {
-    if (candles.length < 3) {
+    if (
+        candles.length < 3
+    ) {
         return {
             pattern: "NONE",
             direction: "NONE",
@@ -1053,16 +1214,24 @@ function detectCandlestickPattern(
     }
 
     const current =
-        candles[candles.length - 1];
+        candles[
+            candles.length - 1
+        ];
 
     const previous =
-        candles[candles.length - 2];
+        candles[
+            candles.length - 2
+        ];
 
     const ci =
-        candleInfo(current);
+        candleInfo(
+            current
+        );
 
     const pi =
-        candleInfo(previous);
+        candleInfo(
+            previous
+        );
 
     const price =
         current.close;
@@ -1071,16 +1240,23 @@ function detectCandlestickPattern(
         calculateATR(
             candles,
             14
-        ) || ci.range;
+        ) ||
+        ci.range;
 
     const nearSupport =
         support !== null &&
-        Math.abs(price - support) <=
+        Math.abs(
+            price -
+            support
+        ) <=
             atr * 0.9;
 
     const nearResistance =
         resistance !== null &&
-        Math.abs(resistance - price) <=
+        Math.abs(
+            resistance -
+            price
+        ) <=
             atr * 0.9;
 
     // --------------------------------------------------------
@@ -1094,7 +1270,8 @@ function detectCandlestickPattern(
             previous.close &&
         current.close >=
             previous.open &&
-        ci.body > pi.body;
+        ci.body >
+            pi.body;
 
     if (
         bullishEngulfing &&
@@ -1103,9 +1280,14 @@ function detectCandlestickPattern(
         return {
             pattern:
                 "BULLISH ENGULFING",
-            direction: "CALL",
+
+            direction:
+                "CALL",
+
             score: 15,
+
             strength: 90,
+
             description:
                 "Bullish engulfing near support indicates strong buyer rejection."
         };
@@ -1122,7 +1304,8 @@ function detectCandlestickPattern(
             previous.close &&
         current.close <=
             previous.open &&
-        ci.body > pi.body;
+        ci.body >
+            pi.body;
 
     if (
         bearishEngulfing &&
@@ -1131,9 +1314,14 @@ function detectCandlestickPattern(
         return {
             pattern:
                 "BEARISH ENGULFING",
-            direction: "PUT",
+
+            direction:
+                "PUT",
+
             score: 15,
+
             strength: 90,
+
             description:
                 "Bearish engulfing near resistance indicates strong seller rejection."
         };
@@ -1147,7 +1335,10 @@ function detectCandlestickPattern(
         ci.lowerWick >=
             ci.body * 2 &&
         ci.upperWick <=
-            Math.max(ci.body * 0.7, 0.0000001);
+            Math.max(
+                ci.body * 0.7,
+                0.0000001
+            );
 
     if (
         hammer &&
@@ -1156,9 +1347,14 @@ function detectCandlestickPattern(
         return {
             pattern:
                 "HAMMER AT SUPPORT",
-            direction: "CALL",
+
+            direction:
+                "CALL",
+
             score: 13,
+
             strength: 85,
+
             description:
                 "Long lower wick shows rejection of lower prices near support."
         };
@@ -1172,7 +1368,10 @@ function detectCandlestickPattern(
         ci.upperWick >=
             ci.body * 2 &&
         ci.lowerWick <=
-            Math.max(ci.body * 0.7, 0.0000001);
+            Math.max(
+                ci.body * 0.7,
+                0.0000001
+            );
 
     if (
         shootingStar &&
@@ -1181,9 +1380,14 @@ function detectCandlestickPattern(
         return {
             pattern:
                 "SHOOTING STAR AT RESISTANCE",
-            direction: "PUT",
+
+            direction:
+                "PUT",
+
             score: 13,
+
             strength: 85,
+
             description:
                 "Long upper wick shows rejection of higher prices near resistance."
         };
@@ -1203,9 +1407,14 @@ function detectCandlestickPattern(
         return {
             pattern:
                 "BULLISH PIN BAR",
-            direction: "CALL",
+
+            direction:
+                "CALL",
+
             score: 12,
+
             strength: 80,
+
             description:
                 "Lower-wick rejection indicates buyers defending lower prices."
         };
@@ -1225,9 +1434,14 @@ function detectCandlestickPattern(
         return {
             pattern:
                 "BEARISH PIN BAR",
-            direction: "PUT",
+
+            direction:
+                "PUT",
+
             score: 12,
+
             strength: 80,
+
             description:
                 "Upper-wick rejection indicates sellers defending higher prices."
         };
@@ -1239,27 +1453,43 @@ function detectCandlestickPattern(
 
     if (
         ci.range > 0 &&
-        ci.body / ci.range >= 0.70
+        ci.body /
+            ci.range >=
+            0.70
     ) {
-        if (ci.bullish) {
+        if (
+            ci.bullish
+        ) {
             return {
                 pattern:
                     "STRONG BULLISH CANDLE",
-                direction: "CALL",
+
+                direction:
+                    "CALL",
+
                 score: 10,
+
                 strength: 75,
+
                 description:
                     "Large bullish body indicates strong short-term upward momentum."
             };
         }
 
-        if (ci.bearish) {
+        if (
+            ci.bearish
+        ) {
             return {
                 pattern:
                     "STRONG BEARISH CANDLE",
-                direction: "PUT",
+
+                direction:
+                    "PUT",
+
                 score: 10,
+
                 strength: 75,
+
                 description:
                     "Large bearish body indicates strong short-term downward momentum."
             };
@@ -1272,13 +1502,21 @@ function detectCandlestickPattern(
 
     if (
         ci.range > 0 &&
-        ci.body / ci.range <= 0.15
+        ci.body /
+            ci.range <=
+            0.15
     ) {
         return {
-            pattern: "DOJI / INDECISION",
-            direction: "NONE",
+            pattern:
+                "DOJI / INDECISION",
+
+            direction:
+                "NONE",
+
             score: 0,
+
             strength: 35,
+
             description:
                 "Small candle body indicates market indecision."
         };
@@ -1294,7 +1532,7 @@ function detectCandlestickPattern(
 }
 
 // ============================================================
-// PRICE ACTION / MARKET PSYCHOLOGY
+// PRICE ACTION
 // ============================================================
 
 function analyzePriceAction(
@@ -1306,16 +1544,19 @@ function analyzePriceAction(
     atr
 ) {
     const current =
-        candles[candles.length - 1];
+        candles[
+            candles.length - 1
+        ];
 
     const previous =
-        candles[candles.length - 2];
+        candles[
+            candles.length - 2
+        ];
 
     const ci =
-        candleInfo(current);
-
-    const previousInfo =
-        candleInfo(previous);
+        candleInfo(
+            current
+        );
 
     const price =
         current.close;
@@ -1325,37 +1566,35 @@ function analyzePriceAction(
 
     const observations = [];
 
-    // --------------------------------------------------------
-    // Support / resistance distance
-    // --------------------------------------------------------
-
     const supportDistance =
         support !== null
             ? Math.abs(
-                  price - support
+                  price -
+                  support
               )
             : Infinity;
 
     const resistanceDistance =
         resistance !== null
             ? Math.abs(
-                  resistance - price
+                  resistance -
+                  price
               )
             : Infinity;
 
     const supportNear =
-        Number.isFinite(atr) &&
+        Number.isFinite(
+            atr
+        ) &&
         supportDistance <=
             atr * 0.9;
 
     const resistanceNear =
-        Number.isFinite(atr) &&
+        Number.isFinite(
+            atr
+        ) &&
         resistanceDistance <=
             atr * 0.9;
-
-    // --------------------------------------------------------
-    // Wick rejection
-    // --------------------------------------------------------
 
     if (
         ci.lowerWick >
@@ -1385,10 +1624,6 @@ function analyzePriceAction(
         );
     }
 
-    // --------------------------------------------------------
-    // EMA structure
-    // --------------------------------------------------------
-
     if (
         ema9 !== null &&
         ema21 !== null
@@ -1416,15 +1651,15 @@ function analyzePriceAction(
         }
     }
 
-    // --------------------------------------------------------
-    // Strong body
-    // --------------------------------------------------------
-
     if (
         ci.range > 0 &&
-        ci.body / ci.range >= 0.65
+        ci.body /
+            ci.range >=
+            0.65
     ) {
-        if (ci.bullish) {
+        if (
+            ci.bullish
+        ) {
             callScore += 4;
 
             observations.push(
@@ -1432,7 +1667,9 @@ function analyzePriceAction(
             );
         }
 
-        if (ci.bearish) {
+        if (
+            ci.bearish
+        ) {
             putScore += 4;
 
             observations.push(
@@ -1440,10 +1677,6 @@ function analyzePriceAction(
             );
         }
     }
-
-    // --------------------------------------------------------
-    // Momentum acceleration
-    // --------------------------------------------------------
 
     const currentBody =
         Math.abs(
@@ -1461,7 +1694,9 @@ function analyzePriceAction(
         currentBody >
             previousBody * 1.25
     ) {
-        if (ci.bullish) {
+        if (
+            ci.bullish
+        ) {
             callScore += 3;
 
             observations.push(
@@ -1469,7 +1704,9 @@ function analyzePriceAction(
             );
         }
 
-        if (ci.bearish) {
+        if (
+            ci.bearish
+        ) {
             putScore += 3;
 
             observations.push(
@@ -1478,13 +1715,11 @@ function analyzePriceAction(
         }
     }
 
-    // --------------------------------------------------------
-    // Indecision
-    // --------------------------------------------------------
-
     if (
         ci.range > 0 &&
-        ci.body / ci.range <= 0.18
+        ci.body /
+            ci.range <=
+            0.18
     ) {
         observations.push(
             "MARKET INDECISION"
@@ -1492,37 +1727,52 @@ function analyzePriceAction(
     }
 
     const finalCall =
-        clamp(callScore, 0, 15);
+        clamp(
+            callScore,
+            0,
+            15
+        );
 
     const finalPut =
-        clamp(putScore, 0, 15);
+        clamp(
+            putScore,
+            0,
+            15
+        );
 
-    let direction = "NONE";
+    let direction =
+        "NONE";
 
     if (
-        finalCall > finalPut &&
+        finalCall >
+            finalPut &&
         finalCall >= 5
     ) {
-        direction = "CALL";
+        direction =
+            "CALL";
     } else if (
-        finalPut > finalCall &&
+        finalPut >
+            finalCall &&
         finalPut >= 5
     ) {
-        direction = "PUT";
+        direction =
+            "PUT";
     }
 
     let psychology =
         "BALANCED PRICE ACTION";
 
     if (
-        direction === "CALL"
+        direction ===
+        "CALL"
     ) {
         psychology =
             "BUYER PRICE-ACTION PRESSURE";
     }
 
     if (
-        direction === "PUT"
+        direction ===
+        "PUT"
     ) {
         psychology =
             "SELLER PRICE-ACTION PRESSURE";
@@ -1530,18 +1780,27 @@ function analyzePriceAction(
 
     return {
         direction,
+
         score:
             Math.max(
                 finalCall,
                 finalPut
             ),
+
         callScore:
             finalCall,
+
         putScore:
             finalPut,
+
         psychology,
+
         observations:
-            [...new Set(observations)]
+            [
+                ...new Set(
+                    observations
+                )
+            ]
     };
 }
 
@@ -1601,7 +1860,7 @@ function determineTrend(
 }
 
 // ============================================================
-// SMART LOCATION FILTER
+// LOCATION FILTER
 // ============================================================
 
 function analyzeLocation(
@@ -1614,7 +1873,13 @@ function analyzeLocation(
     if (
         !Number.isFinite(price) ||
         !Number.isFinite(atr) ||
-        atr <= 0
+        atr <= 0 ||
+        !Number.isFinite(
+            support
+        ) ||
+        !Number.isFinite(
+            resistance
+        )
     ) {
         return {
             bias: "UNKNOWN",
@@ -1628,13 +1893,15 @@ function analyzeLocation(
     const supportDistance =
         Math.max(
             0,
-            price - support
+            price -
+                support
         );
 
     const resistanceDistance =
         Math.max(
             0,
-            resistance - price
+            resistance -
+                price
         );
 
     const supportRiskDistance =
@@ -1648,7 +1915,8 @@ function analyzeLocation(
     const srRange =
         Math.max(
             0,
-            resistance - support
+            resistance -
+                support
         );
 
     const narrowRange =
@@ -1664,106 +1932,136 @@ function analyzeLocation(
         resistanceDistance <=
         resistanceRiskDistance;
 
-    // --------------------------------------------------------
-    // Ambiguous location
-    // --------------------------------------------------------
-
     if (
         nearSupport &&
         nearResistance
     ) {
         return {
-            bias: "AMBIGUOUS",
-            risk: "HIGH",
-            blocked: true,
+            bias:
+                "AMBIGUOUS",
+
+            risk:
+                "HIGH",
+
+            blocked:
+                true,
+
             reason:
                 "Support and resistance are too close for a clean directional setup."
         };
     }
 
-    // --------------------------------------------------------
-    // PUT too close to support
-    // --------------------------------------------------------
-
     if (
-        rawDirection === "PUT" &&
+        rawDirection ===
+            "PUT" &&
         nearSupport
     ) {
         return {
-            bias: "SUPPORT",
-            risk: "HIGH",
-            blocked: true,
+            bias:
+                "SUPPORT",
+
+            risk:
+                "HIGH",
+
+            blocked:
+                true,
+
             reason:
                 "PUT blocked because price is too close to support."
         };
     }
 
-    // --------------------------------------------------------
-    // CALL too close to resistance
-    // --------------------------------------------------------
-
     if (
-        rawDirection === "CALL" &&
+        rawDirection ===
+            "CALL" &&
         nearResistance
     ) {
         return {
-            bias: "RESISTANCE",
-            risk: "HIGH",
-            blocked: true,
+            bias:
+                "RESISTANCE",
+
+            risk:
+                "HIGH",
+
+            blocked:
+                true,
+
             reason:
                 "CALL blocked because price is too close to resistance."
         };
     }
 
-    // --------------------------------------------------------
-    // Narrow range
-    // --------------------------------------------------------
-
-    if (narrowRange) {
+    if (
+        narrowRange
+    ) {
         return {
-            bias: "NARROW_RANGE",
-            risk: "MEDIUM",
-            blocked: true,
+            bias:
+                "NARROW_RANGE",
+
+            risk:
+                "MEDIUM",
+
+            blocked:
+                true,
+
             reason:
                 "Support/resistance range is too narrow relative to current volatility."
         };
     }
 
-    // --------------------------------------------------------
-    // Price location
-    // --------------------------------------------------------
-
-    if (nearSupport) {
+    if (
+        nearSupport
+    ) {
         return {
-            bias: "NEAR_SUPPORT",
-            risk: "MEDIUM",
-            blocked: false,
+            bias:
+                "NEAR_SUPPORT",
+
+            risk:
+                "MEDIUM",
+
+            blocked:
+                false,
+
             reason:
                 "Price is near support."
         };
     }
 
-    if (nearResistance) {
+    if (
+        nearResistance
+    ) {
         return {
-            bias: "NEAR_RESISTANCE",
-            risk: "MEDIUM",
-            blocked: false,
+            bias:
+                "NEAR_RESISTANCE",
+
+            risk:
+                "MEDIUM",
+
+            blocked:
+                false,
+
             reason:
                 "Price is near resistance."
         };
     }
 
     return {
-        bias: "OPEN_ZONE",
-        risk: "LOW",
-        blocked: false,
+        bias:
+            "OPEN_ZONE",
+
+        risk:
+            "LOW",
+
+        blocked:
+            false,
+
         reason:
             "Price is in an open area between support and resistance."
     };
 }
 
 // ============================================================
-// BUILD ANALYSIS
+// ANALYZE TIMEFRAME
 // ============================================================
 
 function analyzeTimeframe(
@@ -1872,14 +2170,16 @@ function analyzeTimeframe(
     const reasons = [];
 
     // --------------------------------------------------------
-    // EMA = 28 points
+    // EMA
     // --------------------------------------------------------
 
     if (
         ema9 !== null &&
         ema21 !== null
     ) {
-        if (ema9 > ema21) {
+        if (
+            ema9 > ema21
+        ) {
             callScore += 28;
 
             reasons.push(
@@ -1897,11 +2197,15 @@ function analyzeTimeframe(
     }
 
     // --------------------------------------------------------
-    // RSI = 18 points
+    // RSI
     // --------------------------------------------------------
 
-    if (rsi !== null) {
-        if (rsi >= 55) {
+    if (
+        rsi !== null
+    ) {
+        if (
+            rsi >= 55
+        ) {
             callScore += 18;
 
             reasons.push(
@@ -1919,16 +2223,22 @@ function analyzeTimeframe(
     }
 
     // --------------------------------------------------------
-    // ADX = 22 points
+    // ADX
     // --------------------------------------------------------
 
-    if (adx !== null) {
-        if (adx >= 25) {
+    if (
+        adx !== null
+    ) {
+        if (
+            adx >= 25
+        ) {
             if (
                 ema9 !== null &&
                 ema21 !== null
             ) {
-                if (ema9 > ema21) {
+                if (
+                    ema9 > ema21
+                ) {
                     callScore += 22;
 
                     reasons.push(
@@ -1952,7 +2262,7 @@ function analyzeTimeframe(
     }
 
     // --------------------------------------------------------
-    // Price vs EMA = 12 points
+    // Price vs EMA
     // --------------------------------------------------------
 
     if (
@@ -1978,7 +2288,7 @@ function analyzeTimeframe(
     }
 
     // --------------------------------------------------------
-    // Support / resistance = 20 points
+    // Location
     // --------------------------------------------------------
 
     const atrForLocation =
@@ -1989,9 +2299,11 @@ function analyzeTimeframe(
         ) / 10;
 
     const rawDirection =
-        callScore > putScore
+        callScore >
+            putScore
             ? "CALL"
-            : putScore > callScore
+            : putScore >
+                callScore
                 ? "PUT"
                 : "NONE";
 
@@ -2005,7 +2317,8 @@ function analyzeTimeframe(
         );
 
     if (
-        rawDirection === "CALL" &&
+        rawDirection ===
+            "CALL" &&
         location.bias ===
             "NEAR_SUPPORT"
     ) {
@@ -2017,7 +2330,8 @@ function analyzeTimeframe(
     }
 
     if (
-        rawDirection === "PUT" &&
+        rawDirection ===
+            "PUT" &&
         location.bias ===
             "NEAR_RESISTANCE"
     ) {
@@ -2029,7 +2343,7 @@ function analyzeTimeframe(
     }
 
     // --------------------------------------------------------
-    // Candlestick score
+    // Candlestick
     // --------------------------------------------------------
 
     if (
@@ -2065,7 +2379,7 @@ function analyzeTimeframe(
     }
 
     // --------------------------------------------------------
-    // Price action score
+    // Price action
     // --------------------------------------------------------
 
     if (
@@ -2102,20 +2416,25 @@ function analyzeTimeframe(
             putScore
         );
 
-    let signal = "NO TRADE";
+    let signal =
+        "NO TRADE";
 
     if (
         callScore >= 65 &&
-        callScore > putScore &&
+        callScore >
+            putScore &&
         difference >= 15
     ) {
-        signal = "CALL";
+        signal =
+            "CALL";
     } else if (
         putScore >= 65 &&
-        putScore > callScore &&
+        putScore >
+            callScore &&
         difference >= 15
     ) {
-        signal = "PUT";
+        signal =
+            "PUT";
     }
 
     // ========================================================
@@ -2126,13 +2445,15 @@ function analyzeTimeframe(
         signal === "CALL" &&
         candlePattern.direction ===
             "PUT" &&
-        candlePattern.strength >= 75 &&
+        candlePattern.strength >=
+            75 &&
         priceAction.direction ===
             "PUT" &&
         adx !== null &&
         adx >= 30
     ) {
-        signal = "NO TRADE";
+        signal =
+            "NO TRADE";
 
         reasons.push(
             "CALL blocked by strong bearish price-action conflict."
@@ -2143,13 +2464,15 @@ function analyzeTimeframe(
         signal === "PUT" &&
         candlePattern.direction ===
             "CALL" &&
-        candlePattern.strength >= 75 &&
+        candlePattern.strength >=
+            75 &&
         priceAction.direction ===
             "CALL" &&
         adx !== null &&
         adx >= 30
     ) {
-        signal = "NO TRADE";
+        signal =
+            "NO TRADE";
 
         reasons.push(
             "PUT blocked by strong bullish price-action conflict."
@@ -2163,11 +2486,14 @@ function analyzeTimeframe(
     if (
         location.blocked &&
         (
-            signal === "CALL" ||
-            signal === "PUT"
+            signal ===
+                "CALL" ||
+            signal ===
+                "PUT"
         )
     ) {
-        signal = "NO TRADE";
+        signal =
+            "NO TRADE";
 
         reasons.push(
             location.reason
@@ -2194,36 +2520,56 @@ function analyzeTimeframe(
         );
 
     let dataFresh = true;
-    let freshnessStatus = "FRESH";
-    let staleReason = null;
+
+    let freshnessStatus =
+        "FRESH";
+
+    let staleReason =
+        null;
 
     if (
-        dataAgeSeconds === null
+        dataAgeSeconds ===
+        null
     ) {
-        dataFresh = false;
-        freshnessStatus = "UNKNOWN";
+        dataFresh =
+            false;
+
+        freshnessStatus =
+            "UNKNOWN";
+
         staleReason =
             "Latest candle timestamp is unavailable.";
+
     } else if (
         dataAgeSeconds >
         HARD_STALE_SECONDS
     ) {
-        dataFresh = false;
-        freshnessStatus = "STALE";
+        dataFresh =
+            false;
+
+        freshnessStatus =
+            "STALE";
+
         staleReason =
             `Data is critically stale (${dataAgeSeconds}s old).`;
+
     } else if (
         dataAgeSeconds >
         MAX_DATA_AGE_SECONDS
     ) {
-        dataFresh = false;
-        freshnessStatus = "STALE";
+        dataFresh =
+            false;
+
+        freshnessStatus =
+            "STALE";
+
         staleReason =
             `Data is stale (${dataAgeSeconds}s old).`;
     }
 
     if (!dataFresh) {
-        signal = "NO TRADE";
+        signal =
+            "NO TRADE";
 
         reasons.push(
             staleReason
@@ -2231,7 +2577,7 @@ function analyzeTimeframe(
     }
 
     // ========================================================
-    // FINAL CONFIDENCE
+    // CONFIDENCE
     // ========================================================
 
     const strongestScore =
@@ -2250,7 +2596,8 @@ function analyzeTimeframe(
         );
 
     if (
-        signal === "NO TRADE"
+        signal ===
+        "NO TRADE"
     ) {
         confidence =
             clamp(
@@ -2262,9 +2609,9 @@ function analyzeTimeframe(
             );
     }
 
-    // --------------------------------------------------------
-    // Entry / expiry
-    // --------------------------------------------------------
+    // ========================================================
+    // ENTRY / EXPIRY
+    // ========================================================
 
     const timing =
         buildEntryExpiry(
@@ -2277,21 +2624,32 @@ function analyzeTimeframe(
 
     return {
         pair,
+
         timeframe,
 
         signal,
+
         confidence,
 
         trend,
 
         callScore:
-            round(callScore, 2),
+            round(
+                callScore,
+                2
+            ),
 
         putScore:
-            round(putScore, 2),
+            round(
+                putScore,
+                2
+            ),
 
         entryPrice:
-            round(price, 5),
+            round(
+                price,
+                5
+            ),
 
         entryTime:
             timing.entryTime,
@@ -2303,25 +2661,46 @@ function analyzeTimeframe(
             timing.entryInSeconds,
 
         support:
-            round(support, 5),
+            round(
+                support,
+                5
+            ),
 
         resistance:
-            round(resistance, 5),
+            round(
+                resistance,
+                5
+            ),
 
         ema9:
-            round(ema9, 5),
+            round(
+                ema9,
+                5
+            ),
 
         ema21:
-            round(ema21, 5),
+            round(
+                ema21,
+                5
+            ),
 
         rsi:
-            round(rsi, 2),
+            round(
+                rsi,
+                2
+            ),
 
         adx:
-            round(adx, 2),
+            round(
+                adx,
+                2
+            ),
 
         atr:
-            round(atr, 6),
+            round(
+                atr,
+                6
+            ),
 
         candlestickPattern:
             candlePattern.pattern,
@@ -2377,7 +2756,11 @@ function analyzeTimeframe(
             lastCandleTime,
 
         reasons:
-            [...new Set(reasons)],
+            [
+                ...new Set(
+                    reasons
+                )
+            ],
 
         generatedAt:
             isoNow()
@@ -2392,12 +2775,15 @@ async function analyzePair(
     pair
 ) {
     const candles =
-        await fetchCandles(pair);
+        await fetchCandles(
+            pair
+        );
 
     const results = [];
 
     for (
-        const timeframe of TIMEFRAMES
+        const timeframe of
+        TIMEFRAMES
     ) {
         try {
             const result =
@@ -2407,7 +2793,10 @@ async function analyzePair(
                     timeframe
                 );
 
-            results.push(result);
+            results.push(
+                result
+            );
+
         } catch (error) {
             console.error(
                 `[ANALYZE ${pair} ${timeframe}m]`,
@@ -2416,7 +2805,9 @@ async function analyzePair(
         }
     }
 
-    if (!results.length) {
+    if (
+        !results.length
+    ) {
         throw new Error(
             `No valid timeframe analysis for ${pair}.`
         );
@@ -2433,45 +2824,55 @@ async function analyzePair(
 // RESULT RANKING
 // ============================================================
 
-function rankResult(result) {
+function rankResult(
+    result
+) {
     if (!result) {
         return -Infinity;
     }
 
     let score =
-        Number(result.confidence) || 0;
+        Number(
+            result.confidence
+        ) || 0;
 
     if (
-        result.signal === "CALL" ||
-        result.signal === "PUT"
+        result.signal ===
+            "CALL" ||
+        result.signal ===
+            "PUT"
     ) {
         score += 25;
     }
 
     if (
-        Number(result.adx) >= 25
+        Number(result.adx) >=
+        25
     ) {
         score += 8;
     }
 
     if (
         result.candlestickDirection ===
-        result.signal &&
-        result.signal !== "NO TRADE"
+            result.signal &&
+        result.signal !==
+            "NO TRADE"
     ) {
         score += 8;
     }
 
     if (
         result.priceActionDirection ===
-        result.signal &&
-        result.signal !== "NO TRADE"
+            result.signal &&
+        result.signal !==
+            "NO TRADE"
     ) {
         score += 8;
     }
 
     if (
-        result.locationRisk === "LOW"
+        result.locationRisk ===
+        "LOW"
     ) {
         score += 5;
     }
@@ -2495,7 +2896,8 @@ function rankResult(result) {
     }
 
     if (
-        result.signal === "NO TRADE"
+        result.signal ===
+        "NO TRADE"
     ) {
         score -= 15;
     }
@@ -2507,7 +2909,9 @@ function bestFromResults(
     results
 ) {
     if (
-        !Array.isArray(results) ||
+        !Array.isArray(
+            results
+        ) ||
         !results.length
     ) {
         return null;
@@ -2529,7 +2933,10 @@ function bestFromResults(
 function cacheResult(
     result
 ) {
-    if (!result || !result.pair) {
+    if (
+        !result ||
+        !result.pair
+    ) {
         return;
     }
 
@@ -2546,11 +2953,8 @@ function getCachedResults() {
 }
 
 function bestFromCache() {
-    const results =
-        getCachedResults();
-
     return bestFromResults(
-        results
+        getCachedResults()
     );
 }
 
@@ -2559,14 +2963,100 @@ function countCachedPairs() {
         new Set();
 
     for (
-        const result of cache.values()
+        const result of
+        cache.values()
     ) {
-        if (result && result.pair) {
-            pairs.add(result.pair);
+        if (
+            result &&
+            result.pair
+        ) {
+            pairs.add(
+                result.pair
+            );
         }
     }
 
     return pairs.size;
+}
+
+// ============================================================
+// CYCLE HELPERS
+// ============================================================
+
+function startNewCycle() {
+    scanCycle++;
+
+    cycleScanned = 0;
+
+    cycleSuccessful = 0;
+
+    cycleFailed = 0;
+
+    cycleStartedAt =
+        isoNow();
+
+    cycleCompletedAt =
+        null;
+
+    cycleComplete =
+        false;
+
+    console.log(
+        `[SCANNER] Starting scan cycle ${scanCycle}.`
+    );
+}
+
+function markCycleCompleted() {
+    cycleComplete =
+        true;
+
+    cycleCompletedAt =
+        isoNow();
+
+    console.log(
+        `[SCANNER] FULL CYCLE ${scanCycle} COMPLETE: ${cycleSuccessful}/${PAIRS.length} successful, ${cycleFailed} failed.`
+    );
+}
+
+function getScannerProgress() {
+    const processed =
+        Math.min(
+            scanCursor,
+            PAIRS.length
+        );
+
+    const percentage =
+        Math.round(
+            (
+                processed /
+                PAIRS.length
+            ) * 100
+        );
+
+    return {
+        processedPairs:
+            processed,
+
+        totalPairs:
+            PAIRS.length,
+
+        percentage,
+
+        cycle:
+            scanCycle,
+
+        cycleScanned,
+
+        cycleSuccessful,
+
+        cycleFailed,
+
+        cycleComplete,
+
+        cycleStartedAt,
+
+        cycleCompletedAt
+    };
 }
 
 // ============================================================
@@ -2582,19 +3072,36 @@ async function scanPair(
         );
 
         const analyzed =
-            await analyzePair(pair);
+            await analyzePair(
+                pair
+            );
 
         for (
-            const result of analyzed.results
+            const result of
+            analyzed.results
         ) {
-            cacheResult(result);
+            cacheResult(
+                result
+            );
         }
 
         totalScanned++;
 
+        cycleScanned++;
+
+        cycleSuccessful++;
+
+        console.log(
+            `[SCANNER] ${pair} complete. Cycle ${scanCycle}: ${cycleScanned}/${PAIRS.length}`
+        );
+
         return true;
 
     } catch (error) {
+        cycleScanned++;
+
+        cycleFailed++;
+
         console.error(
             `[SCANNER] ${pair} failed:`,
             error.message
@@ -2609,11 +3116,31 @@ async function scanPair(
 // ============================================================
 
 async function runScanBatch() {
-    if (scanRunning) {
+    if (
+        scanRunning
+    ) {
+        console.log(
+            "[SCANNER] Batch skipped because another scan is running."
+        );
+
         return;
     }
 
-    scanRunning = true;
+    scanRunning =
+        true;
+
+    lastBatchStartedAt =
+        isoNow();
+
+    // --------------------------------------------------------
+    // Start a new cycle when cursor is at zero.
+    // --------------------------------------------------------
+
+    if (
+        scanCursor === 0
+    ) {
+        startNewCycle();
+    }
 
     const startIndex =
         scanCursor;
@@ -2632,7 +3159,7 @@ async function runScanBatch() {
         );
 
     console.log(
-        `[SCANNER] Batch ${startIndex} -> ${endIndex - 1}`
+        `[SCANNER] Cycle ${scanCycle} | Batch ${startIndex + 1}-${endIndex}/${PAIRS.length}`
     );
 
     let successful =
@@ -2640,10 +3167,13 @@ async function runScanBatch() {
 
     try {
         for (
-            const pair of batch
+            const pair of
+            batch
         ) {
             const ok =
-                await scanPair(pair);
+                await scanPair(
+                    pair
+                );
 
             if (ok) {
                 successful++;
@@ -2655,7 +3185,8 @@ async function runScanBatch() {
         }
 
         scanCursor =
-            endIndex >= PAIRS.length
+            endIndex >=
+            PAIRS.length
                 ? 0
                 : endIndex;
 
@@ -2665,8 +3196,21 @@ async function runScanBatch() {
         lastScanError =
             null;
 
+        lastBatchCompletedAt =
+            isoNow();
+
+        // ----------------------------------------------------
+        // Full 24-pair cycle finished.
+        // ----------------------------------------------------
+
+        if (
+            scanCursor === 0
+        ) {
+            markCycleCompleted();
+        }
+
         console.log(
-            `[SCANNER] Batch complete: ${successful}/${batch.length} successful. Cached pairs: ${countCachedPairs()}`
+            `[SCANNER] Batch complete: ${successful}/${batch.length} successful. Cached pairs: ${countCachedPairs()}/${PAIRS.length}. Cursor: ${scanCursor}/${PAIRS.length}`
         );
 
     } catch (error) {
@@ -2679,7 +3223,8 @@ async function runScanBatch() {
         );
 
     } finally {
-        scanRunning = false;
+        scanRunning =
+            false;
     }
 }
 
@@ -2689,8 +3234,24 @@ async function runScanBatch() {
 
 function startScanner() {
     console.log(
-        `[SCANNER] V8.3.1 started. ${PAIRS.length} pairs, batch ${SCAN_BATCH_SIZE}, every ${SCAN_EVERY_MS}ms.`
+        `[SCANNER] ${VERSION} started.`
     );
+
+    console.log(
+        `[SCANNER] ${PAIRS.length} pairs.`
+    );
+
+    console.log(
+        `[SCANNER] Batch size: ${SCAN_BATCH_SIZE}.`
+    );
+
+    console.log(
+        `[SCANNER] Interval: ${SCAN_EVERY_MS}ms.`
+    );
+
+    // --------------------------------------------------------
+    // Initial batch after server startup.
+    // --------------------------------------------------------
 
     setTimeout(
         () => {
@@ -2704,6 +3265,10 @@ function startScanner() {
         },
         1000
     );
+
+    // --------------------------------------------------------
+    // Continue scanning until all 24 pairs are completed.
+    // --------------------------------------------------------
 
     setInterval(
         () => {
@@ -2720,7 +3285,7 @@ function startScanner() {
 }
 
 // ============================================================
-// ROUTES
+// ROOT
 // ============================================================
 
 app.get(
@@ -2728,13 +3293,27 @@ app.get(
     (req, res) => {
         res.json({
             ok: true,
+
             name:
                 "PO AI Predictor API",
-            version: VERSION,
+
+            version:
+                VERSION,
+
             source:
                 "Twelve Data LIVE",
+
             message:
-                "V8.3.1 backend is running."
+                `${VERSION} backend is running.`,
+
+            timezone:
+                "UTC",
+
+            pairs:
+                PAIRS.length,
+
+            timeframes:
+                TIMEFRAMES
         });
     }
 );
@@ -2768,11 +3347,11 @@ app.get(
             scanBatchSize:
                 SCAN_BATCH_SIZE,
 
+            totalScanned,
+
             lastScanAt,
 
             lastScanError,
-
-            totalScanned,
 
             timezone:
                 "UTC",
@@ -2782,6 +3361,9 @@ app.get(
 
             supportedTimeframes:
                 TIMEFRAMES,
+
+            scanner:
+                getScannerProgress(),
 
             freshnessFilter: {
                 maxDataAgeSeconds:
@@ -2831,6 +3413,9 @@ app.get(
             version:
                 VERSION,
 
+            source:
+                "Twelve Data LIVE",
+
             scanRunning,
 
             scanCursor,
@@ -2853,7 +3438,12 @@ app.get(
 
             lastScanError,
 
-            best: best || null,
+            scanner:
+                getScannerProgress(),
+
+            best:
+                best ||
+                null,
 
             time:
                 isoNow()
@@ -2870,7 +3460,7 @@ app.get(
     async (req, res) => {
         try {
             // ------------------------------------------------
-            // If cache has valid data, use it immediately.
+            // Use current cache immediately if available.
             // ------------------------------------------------
 
             let best =
@@ -2897,6 +3487,9 @@ app.get(
 
                     scanRunning,
 
+                    scanner:
+                        getScannerProgress(),
+
                     lastScanAt,
 
                     time:
@@ -2905,8 +3498,8 @@ app.get(
             }
 
             // ------------------------------------------------
-            // Cache empty:
-            // scan one batch now so first request gets data.
+            // Cache empty.
+            // Perform one batch immediately.
             // ------------------------------------------------
 
             await runScanBatch();
@@ -2915,7 +3508,9 @@ app.get(
                 bestFromCache();
 
             if (!best) {
-                return res.status(503).json({
+                return res.status(
+                    503
+                ).json({
                     ok: false,
 
                     version:
@@ -2935,6 +3530,9 @@ app.get(
                     lastScanAt,
 
                     lastScanError,
+
+                    scanner:
+                        getScannerProgress(),
 
                     time:
                         isoNow()
@@ -2961,6 +3559,9 @@ app.get(
 
                 scanRunning,
 
+                scanner:
+                    getScannerProgress(),
+
                 lastScanAt,
 
                 time:
@@ -2973,7 +3574,9 @@ app.get(
                 error
             );
 
-            res.status(500).json({
+            return res.status(
+                500
+            ).json({
                 ok: false,
 
                 version:
@@ -3010,22 +3613,31 @@ app.get(
                 );
 
             if (!pair) {
-                return res.status(404).json({
+                return res.status(
+                    404
+                ).json({
                     ok: false,
+
                     error:
                         `Unsupported pair: ${requestedPair}`,
+
                     supportedPairs:
                         PAIRS
                 });
             }
 
             const analyzed =
-                await analyzePair(pair);
+                await analyzePair(
+                    pair
+                );
 
             for (
-                const result of analyzed.results
+                const result of
+                analyzed.results
             ) {
-                cacheResult(result);
+                cacheResult(
+                    result
+                );
             }
 
             const best =
@@ -3053,17 +3665,22 @@ app.get(
                 cachedPairs:
                     countCachedPairs(),
 
+                scanner:
+                    getScannerProgress(),
+
                 time:
                     isoNow()
             });
 
         } catch (error) {
             console.error(
-                `[API PAIR]`,
+                "[API PAIR]",
                 error
             );
 
-            return res.status(500).json({
+            return res.status(
+                500
+            ).json({
                 ok: false,
 
                 version:
@@ -3115,11 +3732,19 @@ app.listen(
         );
 
         console.log(
+            `MIN CANDLES: ${MIN_CANDLES}`
+        );
+
+        console.log(
             `SCAN BATCH: ${SCAN_BATCH_SIZE}`
         );
 
         console.log(
             `SCAN INTERVAL: ${SCAN_EVERY_MS}ms`
+        );
+
+        console.log(
+            `REQUEST DELAY: ${REQUEST_DELAY_MS}ms`
         );
 
         console.log(
