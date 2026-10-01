@@ -1,15 +1,26 @@
-const API_URL = "https://po-ai-predictor-api.onrender.com";
-const ANALYZE_URL = `${API_URL}/api/analyze`;
+/* =========================================================
+   PO AI PREDICTOR
+   V8.3.5 • SMART LIVE SCANNER FRONTEND
+   Backend: Twelve Data LIVE
+   ========================================================= */
 
-// ================================
-// DOM ELEMENTS - V8
-// ================================
+const API_URL = "https://po-ai-predictor-api.onrender.com";
+
+const ANALYZE_URL = `${API_URL}/api/analyze`;
+const SCANNER_URL = `${API_URL}/api/scanner`;
+const HEALTH_URL = `${API_URL}/api/health`;
+
+
+/* =========================================================
+   DOM
+   ========================================================= */
 
 const backendStatus = document.getElementById("backendStatus");
 const analyzeBtn = document.getElementById("analyzeBtn");
-const errorBox = document.getElementById("errorBox");
 
+const errorBox = document.getElementById("errorBox");
 const signalCard = document.getElementById("signalCard");
+
 const selectedPair = document.getElementById("selectedPair");
 const trendBadge = document.getElementById("trendBadge");
 const signalBadge = document.getElementById("signalBadge");
@@ -41,639 +52,995 @@ const scanInfo = document.getElementById("scanInfo");
 const scanner = document.getElementById("scanner");
 
 
-// ================================
-// STATE
-// ================================
+/* =========================================================
+   STATE
+   ========================================================= */
 
 let currentResult = null;
 let countdownTimer = null;
+let healthTimer = null;
+let scannerTimer = null;
 
 
-// ================================
-// HELPERS
-// ================================
+/* =========================================================
+   HELPERS
+   ========================================================= */
 
-function safe(value, fallback = "—") {
-    if (
-        value === null ||
-        value === undefined ||
-        value === ""
-    ) {
-        return fallback;
-    }
+function escapeHtml(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
 
-    return value;
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 
-function formatNumber(value, decimals = 5) {
-    if (value === null || value === undefined || value === "") {
-        return "—";
-    }
+function safeNumber(value, digits = 5) {
+  const number = Number(value);
 
-    const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "—";
+  }
 
-    if (!Number.isFinite(number)) {
-        return String(value);
-    }
-
-    return number.toFixed(decimals);
+  return number.toFixed(digits);
 }
 
 
-function formatPercent(value) {
-    if (value === null || value === undefined || value === "") {
-        return "—";
-    }
+function percentage(value) {
+  const number = Number(value);
 
-    const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "—";
+  }
 
-    if (!Number.isFinite(number)) {
-        return `${value}%`;
-    }
-
-    return `${Math.round(number)}%`;
+  return `${Math.round(number)}%`;
 }
 
 
-function formatDateTime(value) {
-    if (!value) {
-        return "—";
-    }
+function formatTimeframe(value) {
+  const number = Number(value);
 
-    const date = new Date(value);
+  if (!Number.isFinite(number)) {
+    return "—";
+  }
 
-    if (Number.isNaN(date.getTime())) {
-        return String(value);
-    }
-
-    return date.toLocaleString();
+  return `${number} MIN`;
 }
 
+
+/* =========================================================
+   UTC TIME
+   ========================================================= */
+
+function formatUTC(value) {
+  if (!value) {
+    return "—";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "—";
+  }
+
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(date.getUTCSeconds()).padStart(2, "0");
+
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} UTC`;
+}
+
+
+function formatShortUTC(value) {
+  if (!value) {
+    return "—";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "—";
+  }
+
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(date.getUTCSeconds()).padStart(2, "0");
+
+  return `${hours}:${minutes}:${seconds} UTC`;
+}
+
+
+/* =========================================================
+   ERROR UI
+   ========================================================= */
 
 function showError(message) {
-    console.error(message);
+  if (!errorBox) {
+    return;
+  }
 
-    if (errorBox) {
-        errorBox.textContent = message;
-        errorBox.style.display = "block";
-    }
+  errorBox.textContent = message || "Unable to load live market data.";
+  errorBox.classList.remove("hidden");
 }
 
 
-function clearError() {
-    if (errorBox) {
-        errorBox.textContent = "";
-        errorBox.style.display = "none";
-    }
+function hideError() {
+  if (!errorBox) {
+    return;
+  }
+
+  errorBox.textContent = "";
+  errorBox.classList.add("hidden");
 }
 
 
-// ================================
-// BACKEND STATUS
-// ================================
+/* =========================================================
+   BACKEND STATUS
+   ========================================================= */
 
-async function checkBackend() {
-    try {
-        const response = await fetch(`${API_URL}/api/health`, {
-            method: "GET",
-            cache: "no-store"
-        });
+function setBackendStatus(text, state = "normal") {
+  if (!backendStatus) {
+    return;
+  }
 
-        if (!response.ok) {
-            throw new Error(`Backend HTTP ${response.status}`);
-        }
+  backendStatus.textContent = text;
 
-        const data = await response.json();
+  const dot = document.querySelector(".dot");
 
-        if (backendStatus) {
-            backendStatus.textContent = "LIVE";
-        }
+  if (!dot) {
+    return;
+  }
 
-        console.log("Backend health:", data);
-
-        return true;
-
-    } catch (error) {
-
-        console.error("Backend health error:", error);
-
-        if (backendStatus) {
-            backendStatus.textContent = "OFFLINE";
-        }
-
-        return false;
-    }
+  if (state === "online") {
+    dot.style.background = "#21e38a";
+  } else if (state === "error") {
+    dot.style.background = "#ff5575";
+  } else if (state === "loading") {
+    dot.style.background = "#ffc857";
+  } else {
+    dot.style.background = "#ffc857";
+  }
 }
 
 
-// ================================
-// LOADING STATE
-// ================================
+/* =========================================================
+   LOADING
+   ========================================================= */
 
 function showLoading() {
+  hideError();
 
-    clearError();
+  setBackendStatus("SCANNING", "loading");
 
-    if (analyzeBtn) {
-        analyzeBtn.disabled = true;
-        analyzeBtn.textContent = "ANALYZING...";
-    }
+  if (analyzeBtn) {
+    analyzeBtn.disabled = true;
+    analyzeBtn.textContent = "SCANNING...";
+  }
 
-    if (signalCard) {
-        signalCard.style.display = "block";
-    }
+  if (selectedPair) {
+    selectedPair.textContent = "Scanning live pairs...";
+  }
 
-    if (signalBadge) {
-        signalBadge.textContent = "SCANNING";
-    }
+  if (trendBadge) {
+    trendBadge.textContent = "ANALYZING";
+  }
 
-    if (trendBadge) {
-        trendBadge.textContent = "LIVE MARKET";
-    }
+  if (signalBadge) {
+    signalBadge.className = "signal-badge no-trade";
+    signalBadge.textContent = "SCANNING";
+  }
 
-    if (selectedPair) {
-        selectedPair.textContent = "Scanning live pairs...";
-    }
+  if (confidence) {
+    confidence.textContent = "—";
+  }
 
-    if (confidence) {
-        confidence.textContent = "—";
-    }
+  if (timeframe) {
+    timeframe.textContent = "—";
+  }
 
-    if (timeframe) {
-        timeframe.textContent = "—";
-    }
+  if (countdown) {
+    countdown.textContent = "—";
+  }
 
-    if (entryTime) {
-        entryTime.textContent = "—";
-    }
+  if (entryTime) {
+    entryTime.textContent = "—";
+  }
 
-    if (expiryTime) {
-        expiryTime.textContent = "—";
-    }
+  if (expiryTime) {
+    expiryTime.textContent = "—";
+  }
 
-    if (entryPrice) {
-        entryPrice.textContent = "—";
-    }
-
-    if (callScore) {
-        callScore.textContent = "—";
-    }
-
-    if (putScore) {
-        putScore.textContent = "—";
-    }
-
-    if (support) {
-        support.textContent = "—";
-    }
-
-    if (resistance) {
-        resistance.textContent = "—";
-    }
-
-    if (ema9) {
-        ema9.textContent = "—";
-    }
-
-    if (ema21) {
-        ema21.textContent = "—";
-    }
-
-    if (rsi) {
-        rsi.textContent = "—";
-    }
-
-    if (adx) {
-        adx.textContent = "—";
-    }
-
-    if (reasons) {
-        reasons.textContent = "Analyzing live market conditions...";
-    }
+  if (entryPrice) {
+    entryPrice.textContent = "—";
+  }
 }
 
 
-// ================================
-// RENDER RESULT
-// ================================
+/* =========================================================
+   FINISH BUTTON
+   ========================================================= */
+
+function finishAnalyzeButton() {
+  if (!analyzeBtn) {
+    return;
+  }
+
+  analyzeBtn.disabled = false;
+  analyzeBtn.textContent = "ANALYZE MARKET";
+}
+
+
+/* =========================================================
+   SIGNAL BADGE
+   ========================================================= */
+
+function applySignalBadge(signal) {
+  const normalized = String(signal || "NO TRADE")
+    .trim()
+    .toUpperCase();
+
+  if (!signalBadge) {
+    return;
+  }
+
+  signalBadge.classList.remove(
+    "call",
+    "put",
+    "no-trade"
+  );
+
+  if (normalized === "CALL") {
+    signalBadge.classList.add("call");
+    signalBadge.textContent = "CALL";
+    return;
+  }
+
+  if (normalized === "PUT") {
+    signalBadge.classList.add("put");
+    signalBadge.textContent = "PUT";
+    return;
+  }
+
+  signalBadge.classList.add("no-trade");
+  signalBadge.textContent = "NO TRADE";
+}
+
+
+/* =========================================================
+   TREND
+   ========================================================= */
+
+function formatTrend(value) {
+  if (!value) {
+    return "—";
+  }
+
+  return String(value)
+    .replace(/_/g, " ")
+    .toUpperCase();
+}
+
+
+/* =========================================================
+   REASONS
+   ========================================================= */
+
+function formatReasons(value) {
+  if (!value) {
+    return "No additional analysis reasons.";
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .filter(Boolean)
+      .map(item => String(item))
+      .join(" • ");
+  }
+
+  return String(value);
+}
+
+
+/* =========================================================
+   DATA AGE
+   ========================================================= */
+
+function renderDataAge(result) {
+  if (!dataAge) {
+    return;
+  }
+
+  const candle = result?.lastCandle;
+
+  if (!candle) {
+    dataAge.textContent = "Last candle: —";
+    return;
+  }
+
+  let candleTime = null;
+
+  if (typeof candle === "string") {
+    candleTime = candle;
+  } else if (typeof candle === "object") {
+    candleTime =
+      candle.time ||
+      candle.datetime ||
+      candle.timestamp ||
+      null;
+  }
+
+  if (!candleTime) {
+    dataAge.textContent = "Last candle: —";
+    return;
+  }
+
+  const candleDate = new Date(candleTime);
+
+  if (Number.isNaN(candleDate.getTime())) {
+    dataAge.textContent = `Last candle: ${candleTime}`;
+    return;
+  }
+
+  const ageSeconds = Math.max(
+    0,
+    Math.floor((Date.now() - candleDate.getTime()) / 1000)
+  );
+
+  dataAge.textContent =
+    `Last candle: ${formatShortUTC(candleDate)} • Age ${ageSeconds}s`;
+}
+
+
+/* =========================================================
+   RENDER SIGNAL
+   ========================================================= */
 
 function renderSignal(result) {
+  if (!result) {
+    throw new Error("Backend returned no selected market.");
+  }
 
-    if (!result) {
-        throw new Error("Backend returned no selected market.");
-    }
+  currentResult = result;
 
-    currentResult = result;
+  if (selectedPair) {
+    selectedPair.textContent =
+      result.pair || "Unknown pair";
+  }
 
-    console.log("AI selected result:", result);
+  if (trendBadge) {
+    trendBadge.textContent =
+      formatTrend(result.trend);
+  }
 
-    if (signalCard) {
-        signalCard.style.display = "block";
-    }
+  applySignalBadge(result.signal);
 
-    // Pair
-    if (selectedPair) {
-        selectedPair.textContent = safe(result.pair);
-    }
+  if (confidence) {
+    confidence.textContent =
+      percentage(result.confidence);
+  }
 
-    // Trend
-    if (trendBadge) {
-        trendBadge.textContent = safe(result.trend, "—");
-    }
+  if (timeframe) {
+    timeframe.textContent =
+      formatTimeframe(result.timeframe);
+  }
 
-    // Signal
-    if (signalBadge) {
+  if (entryTime) {
+    entryTime.textContent =
+      formatUTC(result.entryTime);
+  }
 
-        const signal = safe(result.signal, "NO TRADE");
+  if (expiryTime) {
+    expiryTime.textContent =
+      formatUTC(result.expiryTime);
+  }
 
-        signalBadge.textContent = signal;
+  if (entryPrice) {
+    entryPrice.textContent =
+      safeNumber(result.entryPrice, 5);
+  }
 
-        signalBadge.classList.remove(
-            "call",
-            "put",
-            "no-trade"
-        );
+  if (callScore) {
+    callScore.textContent =
+      percentage(result.callScore);
+  }
 
-        if (signal === "CALL") {
-            signalBadge.classList.add("call");
-        } else if (signal === "PUT") {
-            signalBadge.classList.add("put");
-        } else {
-            signalBadge.classList.add("no-trade");
-        }
-    }
+  if (putScore) {
+    putScore.textContent =
+      percentage(result.putScore);
+  }
 
-    // Confidence
-    if (confidence) {
-        confidence.textContent = formatPercent(result.confidence);
-    }
+  if (support) {
+    support.textContent =
+      safeNumber(result.support, 5);
+  }
 
-    // Timeframe
-    if (timeframe) {
-        timeframe.textContent =
-            result.timeframe !== undefined
-                ? `${result.timeframe} MIN`
-                : "—";
-    }
+  if (resistance) {
+    resistance.textContent =
+      safeNumber(result.resistance, 5);
+  }
 
-    // Entry / Expiry
-    if (entryTime) {
-        entryTime.textContent = formatDateTime(result.entryTime);
-    }
+  if (ema9) {
+    ema9.textContent =
+      safeNumber(result.ema9, 5);
+  }
 
-    if (expiryTime) {
-        expiryTime.textContent = formatDateTime(result.expiryTime);
-    }
+  if (ema21) {
+    ema21.textContent =
+      safeNumber(result.ema21, 5);
+  }
 
-    // Entry price
-    if (entryPrice) {
-        entryPrice.textContent = formatNumber(
-            result.entryPrice,
-            5
-        );
-    }
+  if (rsi) {
+    rsi.textContent =
+      safeNumber(result.rsi, 2);
+  }
 
-    // Scores
-    if (callScore) {
-        callScore.textContent = formatPercent(
-            result.callScore
-        );
-    }
+  if (adx) {
+    adx.textContent =
+      safeNumber(result.adx, 2);
+  }
 
-    if (putScore) {
-        putScore.textContent = formatPercent(
-            result.putScore
-        );
-    }
+  if (reasons) {
+    reasons.textContent =
+      formatReasons(result.reasons);
+  }
 
-    // Support / Resistance
-    if (support) {
-        support.textContent = formatNumber(
-            result.support,
-            5
-        );
-    }
+  renderDataAge(result);
 
-    if (resistance) {
-        resistance.textContent = formatNumber(
-            result.resistance,
-            5
-        );
-    }
+  startCountdown();
 
-    // Indicators
-    if (ema9) {
-        ema9.textContent = formatNumber(
-            result.ema9,
-            5
-        );
-    }
-
-    if (ema21) {
-        ema21.textContent = formatNumber(
-            result.ema21,
-            5
-        );
-    }
-
-    if (rsi) {
-        rsi.textContent = formatNumber(
-            result.rsi,
-            2
-        );
-    }
-
-    if (adx) {
-        adx.textContent = formatNumber(
-            result.adx,
-            2
-        );
-    }
-
-    // Reasons
-    if (reasons) {
-
-        if (
-            Array.isArray(result.reasons) &&
-            result.reasons.length > 0
-        ) {
-
-            reasons.innerHTML = result.reasons
-                .map(reason => `<div>• ${reason}</div>`)
-                .join("");
-
-        } else {
-
-            reasons.textContent = "No detailed reasons returned.";
-        }
-    }
-
-    // Data age / last candle
-    if (dataAge) {
-        if (result.lastCandle) {
-            dataAge.textContent =
-                `Last candle: ${result.lastCandle}`;
-        } else {
-            dataAge.textContent = "LIVE DATA";
-        }
-    }
-
-    // Scan info
-    if (scanInfo) {
-
-        const candles = safe(
-            result.candlesUsed,
-            "—"
-        );
-
-        scanInfo.textContent =
-            `LIVE • ${candles} candles analyzed`;
-    }
-
-    if (backendStatus) {
-        backendStatus.textContent = "LIVE";
-    }
-
-    updateCountdown();
+  if (signalCard) {
+    signalCard.scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
+  }
 }
 
 
-// ================================
-// RENDER SCANNER INFORMATION
-// ================================
+/* =========================================================
+   COUNTDOWN
+   ========================================================= */
 
-function renderScanner(data) {
+function startCountdown() {
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
 
-    if (!data) {
-        return;
-    }
+  updateCountdown();
 
-    if (scanner) {
-
-        const scanned =
-            safe(data.scannedPairs, 0);
-
-        const cached =
-            safe(data.cachedPairs, 0);
-
-        scanner.textContent =
-            `${scanned} pairs scanned • ${cached} cached`;
-    }
+  countdownTimer = setInterval(
+    updateCountdown,
+    1000
+  );
 }
 
-
-// ================================
-// COUNTDOWN
-// ================================
 
 function updateCountdown() {
+  if (!countdown) {
+    return;
+  }
 
-    if (!countdown) {
-        return;
+  if (!currentResult || !currentResult.entryTime) {
+    countdown.textContent = "—";
+    return;
+  }
+
+  const entryTimestamp =
+    new Date(currentResult.entryTime).getTime();
+
+  if (!Number.isFinite(entryTimestamp)) {
+    countdown.textContent = "—";
+    return;
+  }
+
+  const now = Date.now();
+
+  const seconds =
+    Math.ceil((entryTimestamp - now) / 1000);
+
+  if (seconds <= 0) {
+    countdown.textContent = "NOW";
+    return;
+  }
+
+  const minutes =
+    Math.floor(seconds / 60);
+
+  const remainingSeconds =
+    seconds % 60;
+
+  if (minutes > 0) {
+    countdown.textContent =
+      `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+  } else {
+    countdown.textContent =
+      `${remainingSeconds}s`;
+  }
+}
+
+
+/* =========================================================
+   SCANNER UI
+   ========================================================= */
+
+function renderScanner(data) {
+  if (!scanner) {
+    return;
+  }
+
+  scanner.innerHTML = "";
+
+  const cachedResults =
+    Number(data?.cachedResults || 0);
+
+  const totalScanned =
+    Number(data?.totalScanned || 0);
+
+  const totalFailed =
+    Number(data?.totalFailed || 0);
+
+  const scanBatchSize =
+    Number(data?.scanBatchSize || 0);
+
+  const scanCursor =
+    Number(data?.scanCursor || 0);
+
+  const lastScanAt =
+    data?.lastScanAt || null;
+
+  if (scanInfo) {
+    if (lastScanAt) {
+      scanInfo.textContent =
+        `${totalScanned} scanned • ${cachedResults} cached • Last ${formatShortUTC(lastScanAt)}`;
+    } else {
+      scanInfo.textContent =
+        `${totalScanned} scanned • ${cachedResults} cached`;
     }
+  }
 
-    if (!currentResult || !currentResult.entryTime) {
-        countdown.textContent = "—";
-        return;
+  const rows = [
+    {
+      title: "SCANNER",
+      value:
+        data?.scanRunning
+          ? "RUNNING"
+          : "READY",
+      className:
+        data?.scanRunning
+          ? "scan-call"
+          : "scan-wait"
+    },
+    {
+      title: "PAIRS SCANNED",
+      value:
+        `${totalScanned}`,
+      className:
+        totalScanned > 0
+          ? "scan-call"
+          : "scan-wait"
+    },
+    {
+      title: "RESULTS CACHED",
+      value:
+        `${cachedResults}`,
+      className:
+        cachedResults > 0
+          ? "scan-call"
+          : "scan-wait"
+    },
+    {
+      title: "BATCH",
+      value:
+        scanBatchSize > 0
+          ? `${scanBatchSize} pairs`
+          : "—",
+      className: "scan-wait"
+    },
+    {
+      title: "FAILED",
+      value:
+        `${totalFailed}`,
+      className:
+        totalFailed > 0
+          ? "scan-put"
+          : "scan-wait"
+    },
+    {
+      title: "CURSOR",
+      value:
+        `${scanCursor}`,
+      className: "scan-wait"
     }
+  ];
 
-    const entry = new Date(
-        currentResult.entryTime
-    ).getTime();
+  rows.forEach(row => {
+    const element =
+      document.createElement("div");
 
-    if (!Number.isFinite(entry)) {
-        countdown.textContent = "—";
-        return;
-    }
+    element.className = "scan-row";
 
-    const now = Date.now();
+    element.innerHTML = `
+      <strong>${escapeHtml(row.title)}</strong>
+      <span class="${escapeHtml(row.className)}">
+        ${escapeHtml(row.value)}
+      </span>
+      <span></span>
+    `;
 
-    const seconds = Math.max(
-        0,
-        Math.floor((entry - now) / 1000)
+    scanner.appendChild(element);
+  });
+}
+
+
+/* =========================================================
+   SCANNER REQUEST
+   ========================================================= */
+
+async function refreshScanner() {
+  try {
+    const response = await fetch(
+      SCANNER_URL,
+      {
+        method: "GET",
+        cache: "no-store"
+      }
     );
 
-    if (seconds <= 0) {
+    const data =
+      await response.json();
 
-        countdown.textContent = "ENTRY NOW";
-
-        return;
+    if (data && data.ok) {
+      renderScanner(data);
     }
-
-    const minutes = Math.floor(seconds / 60);
-
-    const remainingSeconds = seconds % 60;
-
-    countdown.textContent =
-        `ENTRY IN ${minutes}:${String(
-            remainingSeconds
-        ).padStart(2, "0")}`;
+  } catch (error) {
+    console.warn(
+      "Scanner status unavailable:",
+      error
+    );
+  }
 }
 
 
-// ================================
-// MAIN ANALYZE FUNCTION
-// ================================
+/* =========================================================
+   HEALTH CHECK
+   ========================================================= */
+
+async function checkHealth() {
+  try {
+    const response = await fetch(
+      HEALTH_URL,
+      {
+        method: "GET",
+        cache: "no-store"
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Health HTTP ${response.status}`
+      );
+    }
+
+    const data =
+      await response.json();
+
+    if (data?.ok) {
+      setBackendStatus(
+        "LIVE",
+        "online"
+      );
+
+      if (scanInfo && !currentResult) {
+        scanInfo.textContent =
+          `Backend ${data.version || "V8"} • ${data.pairs || 24} pairs`;
+      }
+
+      return data;
+    }
+
+    throw new Error(
+      "Backend health check failed."
+    );
+
+  } catch (error) {
+
+    console.warn(
+      "Backend health error:",
+      error
+    );
+
+    setBackendStatus(
+      "OFFLINE",
+      "error"
+    );
+
+    return null;
+  }
+}
+
+
+/* =========================================================
+   ANALYZE MARKET
+   ========================================================= */
 
 async function analyzeMarket() {
+  showLoading();
 
-    console.log("ANALYZE MARKET clicked");
+  try {
 
-    showLoading();
+    const response =
+      await fetch(
+        ANALYZE_URL,
+        {
+          method: "GET",
+          cache: "no-store",
+          headers: {
+            "Accept": "application/json"
+          }
+        }
+      );
+
+    let data = null;
 
     try {
-
-        const response = await fetch(
-            ANALYZE_URL,
-            {
-                method: "GET",
-                cache: "no-store",
-                headers: {
-                    "Accept": "application/json"
-                }
-            }
-        );
-
-        console.log(
-            "Analyze HTTP status:",
-            response.status
-        );
-
-        const rawText = await response.text();
-
-        console.log(
-            "Analyze raw response:",
-            rawText
-        );
-
-        if (!response.ok) {
-
-            throw new Error(
-                `API error ${response.status}: ${rawText}`
-            );
-        }
-
-        let data;
-
-        try {
-
-            data = JSON.parse(rawText);
-
-        } catch (jsonError) {
-
-            throw new Error(
-                "Backend returned invalid JSON."
-            );
-        }
-
-        console.log(
-            "Analyze JSON:",
-            data
-        );
-
-        if (!data) {
-            throw new Error(
-                "Backend returned empty response."
-            );
-        }
-
-        if (!data.selected) {
-
-            throw new Error(
-                "Backend returned no selected market."
-            );
-        }
-
-        renderSignal(data.selected);
-
-        renderScanner(data);
-
-        clearError();
-
-    } catch (error) {
-
-        console.error(
-            "ANALYZE MARKET ERROR:",
-            error
-        );
-
-        showError(
-            `Unable to load live market data: ${error.message}`
-        );
-
-        if (signalBadge) {
-            signalBadge.textContent = "ERROR";
-        }
-
-        if (trendBadge) {
-            trendBadge.textContent = "DATA ERROR";
-        }
-
-    } finally {
-
-        if (analyzeBtn) {
-            analyzeBtn.disabled = false;
-            analyzeBtn.textContent = "ANALYZE MARKET";
-        }
+      data = await response.json();
+    } catch (jsonError) {
+      throw new Error(
+        "Backend returned an invalid JSON response."
+      );
     }
+
+
+    /* -----------------------------------------------------
+       HTTP ERROR
+       ----------------------------------------------------- */
+
+    if (!response.ok) {
+
+      const backendMessage =
+        data?.error ||
+        data?.message ||
+        data?.lastScanError ||
+        `Backend HTTP ${response.status}`;
+
+      throw new Error(
+        backendMessage
+      );
+    }
+
+
+    /* -----------------------------------------------------
+       BACKEND ERROR
+       ----------------------------------------------------- */
+
+    if (data?.ok === false) {
+
+      throw new Error(
+        data.error ||
+        "Backend analysis failed."
+      );
+    }
+
+
+    /* -----------------------------------------------------
+       IMPORTANT:
+       V8.3.4 BACKEND RETURNS:
+       data.best
+
+       Older frontend expected:
+       data.selected
+
+       We support both so the UI stays compatible.
+       ----------------------------------------------------- */
+
+    const selected =
+      data?.best ||
+      data?.selected ||
+      data?.selectedMarket ||
+      null;
+
+
+    if (!selected) {
+
+      throw new Error(
+        "Backend has no fresh selected market yet. Wait for the live scanner and try again."
+      );
+    }
+
+
+    /* -----------------------------------------------------
+       RENDER ONLY ONE RESULT
+       ----------------------------------------------------- */
+
+    renderSignal(selected);
+
+
+    /* -----------------------------------------------------
+       BACKEND IS ONLINE
+       ----------------------------------------------------- */
+
+    setBackendStatus(
+      "LIVE",
+      "online"
+    );
+
+
+    /* -----------------------------------------------------
+       SCANNER STATUS
+       ----------------------------------------------------- */
+
+    if (data?.scanner) {
+      renderScanner(data.scanner);
+    }
+
+    await refreshScanner();
+
+
+    /* -----------------------------------------------------
+       RETURN RESULT
+       ----------------------------------------------------- */
+
+    return selected;
+
+  } catch (error) {
+
+    console.error(
+      "Analyze error:",
+      error
+    );
+
+    setBackendStatus(
+      "ERROR",
+      "error"
+    );
+
+    showError(
+      `Unable to load live market data: ${
+        error?.message ||
+        "Unknown backend error."
+      }`
+    );
+
+    if (signalBadge) {
+      signalBadge.className =
+        "signal-badge no-trade";
+
+      signalBadge.textContent =
+        "DATA ERROR";
+    }
+
+    if (selectedPair) {
+      selectedPair.textContent =
+        "Live market data unavailable";
+    }
+
+    if (trendBadge) {
+      trendBadge.textContent =
+        "ERROR";
+    }
+
+    if (confidence) {
+      confidence.textContent =
+        "—";
+    }
+
+    if (timeframe) {
+      timeframe.textContent =
+        "—";
+    }
+
+    if (countdown) {
+      countdown.textContent =
+        "—";
+    }
+
+    return null;
+
+  } finally {
+
+    finishAnalyzeButton();
+  }
 }
 
 
-// ================================
-// BUTTON
-// ================================
+/* =========================================================
+   AUTO REFRESH SCANNER STATUS
+   ========================================================= */
+
+function startScannerRefresh() {
+
+  if (scannerTimer) {
+    clearInterval(scannerTimer);
+  }
+
+  scannerTimer =
+    setInterval(
+      refreshScanner,
+      15000
+    );
+}
+
+
+/* =========================================================
+   AUTO HEALTH CHECK
+   ========================================================= */
+
+function startHealthRefresh() {
+
+  if (healthTimer) {
+    clearInterval(healthTimer);
+  }
+
+  healthTimer =
+    setInterval(
+      checkHealth,
+      30000
+    );
+}
+
+
+/* =========================================================
+   BUTTON EVENT
+   ========================================================= */
 
 if (analyzeBtn) {
 
-    analyzeBtn.addEventListener(
-        "click",
-        analyzeMarket
-    );
+  analyzeBtn.addEventListener(
+    "click",
+    analyzeMarket
+  );
 
-} else {
-
-    console.error(
-        "ANALYZE MARKET button #analyzeBtn not found."
-    );
 }
 
 
-// ================================
-// COUNTDOWN TIMER
-// ================================
-
-if (countdownTimer) {
-    clearInterval(countdownTimer);
-}
-
-countdownTimer = setInterval(
-    updateCountdown,
-    1000
-);
-
-
-// ================================
-// INITIAL STATUS
-// ================================
+/* =========================================================
+   STARTUP
+   ========================================================= */
 
 document.addEventListener(
-    "DOMContentLoaded",
-    async () => {
+  "DOMContentLoaded",
+  async () => {
 
-        console.log(
-            "PO AI Predictor V8 frontend loaded."
-        );
+    await checkHealth();
 
-        await checkBackend();
+    await refreshScanner();
 
-        updateCountdown();
-    }
+    startHealthRefresh();
+
+    startScannerRefresh();
+
+  }
 );
 
 
-// ================================
-// GLOBAL FUNCTION
-// ================================
+/* =========================================================
+   PAGE VISIBILITY
+   ========================================================= */
 
-window.analyzeMarket = analyzeMarket;
+document.addEventListener(
+  "visibilitychange",
+  () => {
+
+    if (!document.hidden) {
+
+      checkHealth();
+      refreshScanner();
+
+      if (currentResult) {
+        updateCountdown();
+      }
+
+    }
+
+  }
+);
