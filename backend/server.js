@@ -1,12 +1,7 @@
-/* =========================================================
-   PO AI PREDICTOR
-   V8.4 • CREDIT-SAFE LIVE SCANNER
-   Source: Twelve Data LIVE
-   Timezone: UTC
-   ========================================================= */
+'use strict';
 
-const express = require("express");
-const cors = require("cors");
+const express = require('express');
+const cors = require('cors');
 
 const app = express();
 
@@ -14,3334 +9,2155 @@ app.use(cors());
 app.use(express.json());
 
 /* =========================================================
-   CONFIG
+   PO AI PREDICTOR
+   V8.4.1 — QUOTA-SAFE + CACHE-SAFE
+   Source: Twelve Data LIVE
    ========================================================= */
 
+const VERSION = 'V8.4.1';
 const PORT = process.env.PORT || 10000;
 
-const VERSION = "V8.4";
-const SOURCE = "Twelve Data LIVE";
-const TIMEZONE = "UTC";
-
-const API_KEY =
-  process.env.TWELVE_DATA_API_KEY || "";
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '';
 
 const TWELVE_DATA_URL =
-  "https://api.twelvedata.com/time_series";
+  process.env.TWELVE_DATA_URL ||
+  'https://api.twelvedata.com/time_series';
 
+const TIMEZONE = 'UTC';
 
-/* =========================================================
-   PAIRS
-   ========================================================= */
-
+/*
+  Supported live pairs.
+  One Twelve Data 1-minute request gives us the candles
+  needed to build 1m / 2m / 3m locally.
+*/
 const PAIRS = [
-  "EUR/USD",
-  "GBP/USD",
-  "USD/JPY",
-  "USD/CHF",
-  "AUD/USD",
-  "USD/CAD",
-  "NZD/USD",
-  "EUR/GBP",
-  "EUR/JPY",
-  "GBP/JPY",
-  "AUD/JPY",
-  "CAD/JPY",
-  "CHF/JPY",
-  "EUR/AUD",
-  "EUR/CAD",
-  "EUR/CHF",
-  "GBP/AUD",
-  "GBP/CAD",
-  "GBP/CHF",
-  "NZD/JPY",
-  "NZD/CAD",
-  "AUD/CAD",
-  "AUD/CHF",
-  "CAD/CHF"
+  'EUR/USD',
+  'GBP/USD',
+  'USD/JPY',
+  'USD/CHF',
+  'AUD/USD',
+  'USD/CAD',
+  'NZD/USD',
+  'EUR/GBP',
+  'EUR/JPY',
+  'GBP/JPY',
+  'AUD/JPY',
+  'CAD/JPY',
+  'CHF/JPY',
+  'EUR/AUD',
+  'EUR/CAD',
+  'EUR/CHF',
+  'GBP/AUD',
+  'GBP/CAD',
+  'GBP/CHF',
+  'NZD/JPY',
+  'NZD/CAD',
+  'AUD/CAD',
+  'AUD/CHF',
+  'CAD/CHF'
 ];
 
 const TIMEFRAMES = [1, 2, 3];
 
-
-/* =========================================================
-   TWELVE DATA DAILY CREDIT PROTECTION
-   ========================================================= */
-
-/*
-   Twelve Data Basic:
-   8 API credits/minute
-   800 API credits/day
-
-   We intentionally keep a reserve so that the application
-   never deliberately walks past the daily limit.
-*/
-
-const DAILY_CREDIT_LIMIT = 800;
-
-/*
-   Keep a small safety reserve.
-*/
-const DAILY_SAFETY_RESERVE = 32;
-
-const MAX_DAILY_REQUESTS =
-  DAILY_CREDIT_LIMIT - DAILY_SAFETY_RESERVE;
-
-
-/* =========================================================
-   SCANNER SETTINGS
-   ========================================================= */
-
-/*
-   8 pairs per scan.
-
-   8 requests every 15 minutes =
-   768 theoretical requests/day.
-
-   This is deliberately below the 800/day limit.
-*/
-
-const SCAN_BATCH_SIZE = 8;
-
-const SCAN_EVERY_MS =
-  15 * 60 * 1000;
-
-
-/*
-   We do not hammer the API.
-*/
-const REQUEST_DELAY_MS = 1200;
-
-
-/*
-   Market data is only considered fresh for signal
-   generation when it is recent enough.
-*/
-const MAX_DATA_AGE_SECONDS = 90;
-
-
-/*
-   Cached data can remain stored longer, but stale
-   data will not create a fresh CALL/PUT signal.
-*/
-const CACHE_RETENTION_SECONDS = 60 * 60;
-
-
-/*
-   Signal should be visible before entry.
-*/
-const ENTRY_BUFFER_SECONDS = 30;
-
-
-/*
-   Candle settings.
-*/
 const MAX_CANDLES = 180;
 const MIN_CANDLES = 60;
 
+/*
+  Scanner deliberately works in small batches.
+  This prevents a single scan from spending the whole quota.
+*/
+const SCAN_BATCH_SIZE = Math.max(
+  1,
+  Number(process.env.SCAN_BATCH_SIZE || 8)
+);
+
+/*
+  Do not scan every minute.
+  15 minutes is the V8.4 architecture.
+*/
+const SCAN_EVERY_MS =
+  Math.max(
+    1,
+    Number(process.env.SCAN_EVERY_MINUTES || 15)
+  ) * 60 * 1000;
+
+/*
+  Successful pair data remains usable for this period.
+  We never refetch a fresh pair while it is still valid.
+*/
+const CACHE_TTL_MS =
+  Math.max(
+    1,
+    Number(process.env.CACHE_TTL_MINUTES || 15)
+  ) * 60 * 1000;
+
+/*
+  Analysis results can be reused briefly by the frontend.
+*/
+const RESULT_TTL_MS =
+  Math.max(
+    1,
+    Number(process.env.RESULT_TTL_SECONDS || 30)
+  ) * 1000;
+
+/*
+  Safety limits.
+  These are backend limits, not claims about the Twelve Data plan.
+*/
+const DAILY_REQUEST_LIMIT = Math.max(
+  1,
+  Number(process.env.DAILY_REQUEST_LIMIT || 768)
+);
+
+const SAFETY_RESERVE = Math.max(
+  0,
+  Number(process.env.SAFETY_RESERVE || 32)
+);
+
+const MAX_DAILY_REQUESTS = Math.max(
+  1,
+  DAILY_REQUEST_LIMIT - SAFETY_RESERVE
+);
+
+/*
+  We intentionally stop requesting when the backend believes
+  the daily safe budget has been reached.
+*/
+const ENTRY_BUFFER_SECONDS = 30;
 
 /* =========================================================
    STATE
    ========================================================= */
 
-const cache = new Map();
+const pairCache = new Map();
+const resultCache = new Map();
 
-const failedPairs = new Map();
+let scanRunning = false;
+let scanCursor = 0;
+let lastScanAt = null;
+let lastScanError = null;
 
-const scanner = {
-  running: false,
-  cursor: 0,
-  lastScanAt: null,
-  lastScanError: null,
-  totalScanned: 0,
-  totalFailed: 0,
-  totalApiRequests: 0,
-  lastSuccessfulRequestAt: null,
-  dailyRequests: 0,
-  dailyCreditsUsed: 0,
-  dailyCreditsLeft: null,
-  quotaBlocked: false,
-  quotaBlockedAt: null,
-  quotaResetAt: null
-};
+let totalScanned = 0;
+let totalFailed = 0;
+let totalApiRequests = 0;
 
+let quotaBlocked = false;
+let providerQuotaMessage = null;
+let providerQuotaResetAt = null;
+
+let dailyRequests = 0;
+let dailyCreditsUsed = 0;
+
+let currentUtcDay = getUtcDayKey(new Date());
 
 /* =========================================================
-   DAILY RESET
+   HELPERS
    ========================================================= */
 
-function getNextUtcMidnight() {
-  const now = new Date();
+function getUtcDayKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
 
-  const next = new Date(
-    Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate() + 1,
-      0,
-      0,
-      0
-    )
-  );
-
+function getNextUtcMidnight(date = new Date()) {
+  const next = new Date(date);
+  next.setUTCDate(next.getUTCDate() + 1);
+  next.setUTCHours(0, 0, 0, 0);
   return next;
 }
 
+function resetDailyStateIfNeeded() {
+  const nowDay = getUtcDayKey(new Date());
 
-function resetDailyBudgetIfNeeded() {
-  const now = new Date();
+  if (nowDay !== currentUtcDay) {
+    currentUtcDay = nowDay;
 
-  if (!scanner.quotaResetAt) {
-    scanner.quotaResetAt =
-      getNextUtcMidnight().toISOString();
-    return;
-  }
-
-  const resetAt =
-    new Date(scanner.quotaResetAt);
-
-  if (now >= resetAt) {
-
-    scanner.dailyRequests = 0;
-    scanner.dailyCreditsUsed = 0;
-    scanner.dailyCreditsLeft = null;
-
-    scanner.quotaBlocked = false;
-    scanner.quotaBlockedAt = null;
-
-    scanner.lastScanError = null;
-
-    scanner.quotaResetAt =
-      getNextUtcMidnight().toISOString();
+    dailyRequests = 0;
+    dailyCreditsUsed = 0;
 
     /*
-      Failed pair errors are cleared after the daily reset.
+      We reset our local block at UTC midnight.
+      The provider may still have a different restriction,
+      so a provider quota error will immediately block again.
     */
-    failedPairs.clear();
+    quotaBlocked = false;
+    providerQuotaMessage = null;
+    providerQuotaResetAt = null;
+
+    console.log(
+      `[QUOTA] New UTC day ${currentUtcDay}. Local counters reset.`
+    );
   }
 }
 
+function getDailyCreditsLeft() {
+  return Math.max(
+    0,
+    MAX_DAILY_REQUESTS - dailyCreditsUsed
+  );
+}
 
-/* =========================================================
-   DAILY CREDIT CHECK
-   ========================================================= */
+function getDailyRequestsLeft() {
+  return Math.max(
+    0,
+    MAX_DAILY_REQUESTS - dailyRequests
+  );
+}
 
-function canUseApiCredit() {
+function isBudgetAvailable() {
+  resetDailyStateIfNeeded();
 
-  resetDailyBudgetIfNeeded();
-
-  if (scanner.quotaBlocked) {
+  if (quotaBlocked) {
     return false;
   }
 
-  if (
-    scanner.dailyRequests >=
-    MAX_DAILY_REQUESTS
-  ) {
-    scanner.quotaBlocked = true;
-
-    scanner.quotaBlockedAt =
-      new Date().toISOString();
-
-    scanner.lastScanError =
-      `Daily safety limit reached: ` +
-      `${scanner.dailyRequests}/${DAILY_CREDIT_LIMIT} credits used.`;
-
-    return false;
-  }
-
-  if (
-    Number.isFinite(scanner.dailyCreditsLeft) &&
-    scanner.dailyCreditsLeft <= DAILY_SAFETY_RESERVE
-  ) {
-    scanner.quotaBlocked = true;
-
-    scanner.quotaBlockedAt =
-      new Date().toISOString();
-
-    scanner.lastScanError =
-      `Twelve Data credits nearly exhausted. ` +
-      `Scanner paused until ${scanner.quotaResetAt}.`;
-
+  if (dailyRequests >= MAX_DAILY_REQUESTS) {
     return false;
   }
 
   return true;
 }
 
+function normalizePair(pair) {
+  if (!pair) return null;
+
+  const value = String(pair).trim().toUpperCase();
+
+  if (PAIRS.includes(value)) {
+    return value;
+  }
+
+  return null;
+}
+
+function normalizeTimeframe(value) {
+  const tf = Number(value);
+
+  if (TIMEFRAMES.includes(tf)) {
+    return tf;
+  }
+
+  return null;
+}
+
+function isFiniteNumber(value) {
+  return Number.isFinite(Number(value));
+}
+
+function round(value, decimals = 5) {
+  if (!Number.isFinite(value)) return null;
+
+  const factor = Math.pow(10, decimals);
+
+  return Math.round(value * factor) / factor;
+}
+
+function priceDecimals(pair) {
+  if (pair && pair.includes('JPY')) {
+    return 3;
+  }
+
+  return 5;
+}
 
 /* =========================================================
-   QUOTA ERROR DETECTION
+   QUOTA MANAGEMENT
    ========================================================= */
 
-function isQuotaError(message) {
+function blockForProviderQuota(message) {
+  quotaBlocked = true;
 
-  const text =
-    String(message || "").toLowerCase();
+  providerQuotaMessage =
+    message ||
+    'Twelve Data quota is currently unavailable.';
+
+  providerQuotaResetAt =
+    getNextUtcMidnight(new Date()).toISOString();
+
+  console.warn(
+    `[QUOTA BLOCKED] ${providerQuotaMessage}`
+  );
+}
+
+function providerErrorMessage(data, statusCode) {
+  if (!data) {
+    return `Twelve Data HTTP ${statusCode}`;
+  }
+
+  if (typeof data === 'string') {
+    return data;
+  }
 
   return (
-    text.includes("run out of api credits") ||
-    text.includes("api credits") ||
-    text.includes("daily limit") ||
-    text.includes("current limit being 800") ||
-    text.includes("credits were used")
+    data.message ||
+    data.error ||
+    data.code ||
+    `Twelve Data HTTP ${statusCode}`
   );
 }
 
+function looksLikeQuotaError(message, data) {
+  const text = [
+    message,
+    data && data.message,
+    data && data.error,
+    data && data.status,
+    data && data.code
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return (
+    text.includes('quota') ||
+    text.includes('credit') ||
+    text.includes('credits') ||
+    text.includes('rate limit') ||
+    text.includes('too many requests') ||
+    text.includes('api limit') ||
+    text.includes('daily limit') ||
+    text.includes('run out')
+  );
+}
 
 /* =========================================================
-   MARK QUOTA BLOCKED
+   CACHE
    ========================================================= */
 
-function blockQuota(message) {
+function getCachedPair(pair) {
+  const cached = pairCache.get(pair);
 
-  scanner.quotaBlocked = true;
-
-  scanner.quotaBlockedAt =
-    new Date().toISOString();
-
-  scanner.quotaResetAt =
-    getNextUtcMidnight().toISOString();
-
-  scanner.lastScanError =
-    String(message || "Twelve Data daily quota reached.");
-}
-
-
-/* =========================================================
-   UTILITY
-   ========================================================= */
-
-function sleep(ms) {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
-  );
-}
-
-
-function clamp(value, min, max) {
-  return Math.max(
-    min,
-    Math.min(max, value)
-  );
-}
-
-
-function round(value, digits = 5) {
-
-  if (!Number.isFinite(Number(value))) {
+  if (!cached) {
     return null;
   }
 
-  const factor =
-    Math.pow(10, digits);
+  if (
+    Date.now() - cached.timestamp >
+    CACHE_TTL_MS
+  ) {
+    return null;
+  }
 
-  return (
-    Math.round(
-      Number(value) * factor
-    ) / factor
-  );
+  return cached;
 }
 
-
-/* =========================================================
-   CANDLE NORMALIZATION
-   ========================================================= */
-
-function normalizeCandles(values) {
-
-  if (!Array.isArray(values)) {
-    return [];
-  }
-
-  return values
-    .map(item => {
-
-      const time =
-        item.datetime ||
-        item.time ||
-        item.timestamp;
-
-      const open =
-        Number(item.open);
-
-      const high =
-        Number(item.high);
-
-      const low =
-        Number(item.low);
-
-      const close =
-        Number(item.close);
-
-      if (
-        !time ||
-        !Number.isFinite(open) ||
-        !Number.isFinite(high) ||
-        !Number.isFinite(low) ||
-        !Number.isFinite(close)
-      ) {
-        return null;
-      }
-
-      const timestamp =
-        new Date(time).getTime();
-
-      if (!Number.isFinite(timestamp)) {
-        return null;
-      }
-
-      return {
-        time,
-        timestamp,
-        open,
-        high,
-        low,
-        close
-      };
-    })
-    .filter(Boolean)
-    .sort(
-      (a, b) =>
-        a.timestamp - b.timestamp
-    );
-}
-
-
-/* =========================================================
-   FETCH CANDLES
-   ========================================================= */
-
-async function fetchCandles(pair) {
-
-  resetDailyBudgetIfNeeded();
-
-  if (!API_KEY) {
-    throw new Error(
-      "TWELVE_DATA_API_KEY is not configured."
-    );
-  }
-
-  if (!canUseApiCredit()) {
-    throw new Error(
-      scanner.lastScanError ||
-      "Twelve Data daily quota protection is active."
-    );
-  }
-
-
-  const params = new URLSearchParams({
-    symbol: pair,
-    interval: "1min",
-    outputsize: String(MAX_CANDLES),
-    order: "ASC",
-    timezone: "UTC",
-    apikey: API_KEY
+function setCachedPair(pair, candles) {
+  pairCache.set(pair, {
+    timestamp: Date.now(),
+    candles
   });
+}
 
+function getCachedResult(key) {
+  const cached = resultCache.get(key);
 
-  const url =
-    `${TWELVE_DATA_URL}?${params.toString()}`;
+  if (!cached) {
+    return null;
+  }
 
+  if (
+    Date.now() - cached.timestamp >
+    RESULT_TTL_MS
+  ) {
+    return null;
+  }
 
-  await sleep(REQUEST_DELAY_MS);
+  return cached.result;
+}
 
+function setCachedResult(key, result) {
+  resultCache.set(key, {
+    timestamp: Date.now(),
+    result
+  });
+}
+
+/* =========================================================
+   TWELVE DATA
+   ========================================================= */
+
+async function fetchTwelveData(pair) {
+  resetDailyStateIfNeeded();
+
+  /*
+    IMPORTANT:
+    Never spend another API request while quotaBlocked.
+  */
+  if (quotaBlocked) {
+    throw new Error(
+      providerQuotaMessage ||
+      'Twelve Data quota is blocked.'
+    );
+  }
+
+  /*
+    Backend safety budget.
+  */
+  if (!isBudgetAvailable()) {
+    throw new Error(
+      'Backend daily API safety budget reached.'
+    );
+  }
+
+  if (!TWELVE_DATA_API_KEY) {
+    throw new Error(
+      'TWELVE_DATA_API_KEY is not configured.'
+    );
+  }
+
+  const url = new URL(TWELVE_DATA_URL);
+
+  url.searchParams.set('symbol', pair);
+  url.searchParams.set('interval', '1min');
+  url.searchParams.set(
+    'outputsize',
+    String(MAX_CANDLES)
+  );
+  url.searchParams.set('apikey', TWELVE_DATA_API_KEY);
+  url.searchParams.set('timezone', TIMEZONE);
+
+  totalApiRequests++;
+  dailyRequests++;
+  dailyCreditsUsed++;
+
+  console.log(
+    `[TWELVE DATA] ${pair} request #${dailyRequests}`
+  );
 
   let response;
 
   try {
-
-    response =
-      await fetch(url);
-
+    response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'PO-AI-Predictor/8.4.1'
+      }
+    });
   } catch (error) {
-
     throw new Error(
-      `${pair}: Network error: ${error.message}`
+      `Twelve Data network error: ${error.message}`
     );
   }
-
-
-  /*
-    Twelve Data exposes credit information in headers.
-  */
-
-  const creditsUsedHeader =
-    response.headers.get(
-      "api-credits-used"
-    );
-
-  const creditsLeftHeader =
-    response.headers.get(
-      "api-credits-left"
-    );
-
-
-  const creditsUsed =
-    Number(creditsUsedHeader);
-
-  const creditsLeft =
-    Number(creditsLeftHeader);
-
-
-  if (
-    Number.isFinite(creditsLeft)
-  ) {
-    scanner.dailyCreditsLeft =
-      creditsLeft;
-  }
-
-
-  scanner.totalApiRequests += 1;
-  scanner.dailyRequests += 1;
-
-  scanner.lastSuccessfulRequestAt =
-    new Date().toISOString();
-
-
-  if (
-    Number.isFinite(creditsUsed)
-  ) {
-    scanner.dailyCreditsUsed =
-      Math.max(
-        scanner.dailyCreditsUsed,
-        creditsUsed
-      );
-  } else {
-    scanner.dailyCreditsUsed =
-      scanner.dailyRequests;
-  }
-
 
   let data;
 
   try {
-
-    data =
-      await response.json();
-
+    data = await response.json();
   } catch (error) {
-
     throw new Error(
-      `${pair}: Invalid Twelve Data JSON response.`
+      `Twelve Data returned invalid JSON (HTTP ${response.status}).`
     );
   }
 
+  const providerMessage =
+    providerErrorMessage(
+      data,
+      response.status
+    );
 
   /*
-    Detect quota even if Twelve Data returns HTTP 200.
+    Detect quota before doing anything else.
   */
+  if (
+    !response.ok ||
+    data.status === 'error' ||
+    data.code ||
+    data.message
+  ) {
+    if (
+      looksLikeQuotaError(
+        providerMessage,
+        data
+      )
+    ) {
+      blockForProviderQuota(
+        providerMessage
+      );
+    }
 
-  const message =
-    data?.message ||
-    data?.code ||
-    data?.status;
-
+    throw new Error(providerMessage);
+  }
 
   if (
-    isQuotaError(message) ||
-    isQuotaError(JSON.stringify(data))
+    !Array.isArray(data.values) ||
+    data.values.length === 0
   ) {
-
-    blockQuota(
-      `${pair}: ${message || "Twelve Data quota reached."}`
-    );
-
     throw new Error(
-      `${pair}: Twelve Data daily quota reached.`
+      `Twelve Data returned no candles for ${pair}.`
     );
   }
 
+  const candles = data.values
+    .map(item => ({
+      time: new Date(item.datetime).getTime(),
+      open: Number(item.open),
+      high: Number(item.high),
+      low: Number(item.low),
+      close: Number(item.close),
+      volume: isFiniteNumber(item.volume)
+        ? Number(item.volume)
+        : null
+    }))
+    .filter(c =>
+      Number.isFinite(c.time) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    )
+    .sort((a, b) => a.time - b.time);
 
-  if (
-    !response.ok
-  ) {
-
-    throw new Error(
-      `${pair}: Twelve Data HTTP ${response.status}.`
-    );
-  }
-
-
-  if (
-    data?.status === "error"
-  ) {
-
-    throw new Error(
-      `${pair}: ${data.message || "Twelve Data error."}`
-    );
-  }
-
-
-  const values =
-    data?.values ||
-    data?.data ||
-    [];
-
-
-  const candles =
-    normalizeCandles(values);
-
-
-  if (
-    candles.length < MIN_CANDLES
-  ) {
-
+  if (candles.length < MIN_CANDLES) {
     throw new Error(
       `${pair}: insufficient candle data (${candles.length}/${MIN_CANDLES}).`
     );
   }
 
+  return candles;
+}
+
+async function getPairCandles(pair, options = {}) {
+  const forceRefresh =
+    options.forceRefresh === true;
+
+  const cached = getCachedPair(pair);
+
+  if (cached && !forceRefresh) {
+    return {
+      candles: cached.candles,
+      source: 'CACHE',
+      cachedAt: cached.timestamp
+    };
+  }
 
   /*
-    Only completed 1-minute candles.
+    If provider quota is blocked, NEVER attempt another call.
+    Return cache if one exists, otherwise throw.
   */
-
-  const now =
-    Date.now();
-
-  const completed =
-    candles.filter(
-      candle =>
-        candle.timestamp <=
-        now - 1000
-    );
-
-
-  if (
-    completed.length < MIN_CANDLES
-  ) {
+  if (quotaBlocked) {
+    if (cached) {
+      return {
+        candles: cached.candles,
+        source: 'CACHE_STALE',
+        cachedAt: cached.timestamp
+      };
+    }
 
     throw new Error(
-      `${pair}: insufficient completed candles.`
+      providerQuotaMessage ||
+      'Twelve Data quota is blocked.'
     );
   }
 
+  try {
+    const candles =
+      await fetchTwelveData(pair);
 
-  return completed.slice(
-    -MAX_CANDLES
-  );
+    setCachedPair(pair, candles);
+
+    return {
+      candles,
+      source: 'LIVE',
+      cachedAt: Date.now()
+    };
+  } catch (error) {
+    /*
+      If live request fails, use existing cache.
+    */
+    if (cached) {
+      console.warn(
+        `[CACHE FALLBACK] ${pair}: ${error.message}`
+      );
+
+      return {
+        candles: cached.candles,
+        source: 'CACHE_STALE',
+        cachedAt: cached.timestamp,
+        warning: error.message
+      };
+    }
+
+    throw error;
+  }
 }
 
-
 /* =========================================================
-   AGGREGATE TIMEFRAME
+   CANDLE AGGREGATION
    ========================================================= */
 
-function aggregateCandles(
-  candles,
-  timeframe
-) {
-
-  if (
-    timeframe === 1
-  ) {
+function aggregateCandles(candles, timeframe) {
+  if (timeframe === 1) {
     return candles.slice();
   }
 
+  const result = [];
+  const bucketMs =
+    timeframe * 60 * 1000;
 
-  const bucketMap =
-    new Map();
-
+  let bucket = null;
 
   for (const candle of candles) {
+    const bucketTime =
+      Math.floor(candle.time / bucketMs) *
+      bucketMs;
 
-    const date =
-      new Date(
-        candle.timestamp
+    if (!bucket || bucket.time !== bucketTime) {
+      if (bucket) {
+        result.push(bucket);
+      }
+
+      bucket = {
+        time: bucketTime,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume || 0,
+        count: 1
+      };
+    } else {
+      bucket.high = Math.max(
+        bucket.high,
+        candle.high
       );
 
-    const minute =
-      date.getUTCMinutes();
-
-    const bucketMinute =
-      Math.floor(
-        minute / timeframe
-      ) * timeframe;
-
-
-    const bucketStart =
-      Date.UTC(
-        date.getUTCFullYear(),
-        date.getUTCMonth(),
-        date.getUTCDate(),
-        date.getUTCHours(),
-        bucketMinute,
-        0,
-        0
+      bucket.low = Math.min(
+        bucket.low,
+        candle.low
       );
 
+      bucket.close = candle.close;
 
-    if (
-      !bucketMap.has(bucketStart)
-    ) {
+      if (Number.isFinite(candle.volume)) {
+        bucket.volume += candle.volume;
+      }
 
-      bucketMap.set(
-        bucketStart,
-        []
-      );
+      bucket.count++;
     }
-
-
-    bucketMap
-      .get(bucketStart)
-      .push(candle);
   }
 
-
-  const result = [];
-
-
-  for (
-    const [
-      timestamp,
-      group
-    ] of bucketMap
-  ) {
-
-    if (
-      group.length !== timeframe
-    ) {
-      continue;
-    }
-
-
-    group.sort(
-      (a, b) =>
-        a.timestamp -
-        b.timestamp
-    );
-
-
-    result.push({
-      time:
-        new Date(timestamp)
-          .toISOString(),
-
-      timestamp,
-
-      open:
-        group[0].open,
-
-      high:
-        Math.max(
-          ...group.map(x => x.high)
-        ),
-
-      low:
-        Math.min(
-          ...group.map(x => x.low)
-        ),
-
-      close:
-        group[group.length - 1].close
-    });
+  if (bucket) {
+    result.push(bucket);
   }
 
-
-  return result.sort(
-    (a, b) =>
-      a.timestamp -
-      b.timestamp
-  );
+  return result;
 }
 
-
 /* =========================================================
-   EMA
+   INDICATORS
    ========================================================= */
 
 function ema(values, period) {
-
   if (
+    !Array.isArray(values) ||
     values.length < period
   ) {
     return null;
   }
 
-
   const multiplier =
     2 / (period + 1);
 
+  let current = 0;
 
-  let result =
-    values
-      .slice(0, period)
-      .reduce(
-        (sum, value) =>
-          sum + value,
-        0
-      ) / period;
+  for (let i = 0; i < period; i++) {
+    current += values[i];
+  }
 
+  current /= period;
 
   for (
     let i = period;
     i < values.length;
     i++
   ) {
-
-    result =
-      (
-        values[i] -
-        result
-      ) *
+    current =
+      (values[i] - current) *
       multiplier +
-      result;
+      current;
   }
 
-
-  return result;
+  return current;
 }
 
+function emaSeries(values, period) {
+  if (
+    !Array.isArray(values) ||
+    values.length < period
+  ) {
+    return [];
+  }
 
-/* =========================================================
-   RSI
-   ========================================================= */
+  const multiplier =
+    2 / (period + 1);
+
+  const series =
+    new Array(values.length).fill(null);
+
+  let current = 0;
+
+  for (let i = 0; i < period; i++) {
+    current += values[i];
+  }
+
+  current /= period;
+
+  series[period - 1] = current;
+
+  for (
+    let i = period;
+    i < values.length;
+    i++
+  ) {
+    current =
+      (values[i] - current) *
+      multiplier +
+      current;
+
+    series[i] = current;
+  }
+
+  return series;
+}
 
 function rsi(values, period = 14) {
-
   if (
+    !Array.isArray(values) ||
     values.length <= period
   ) {
     return null;
   }
 
+  let gains = 0;
+  let losses = 0;
 
-  let gain = 0;
-  let loss = 0;
-
-
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-
+  for (let i = 1; i <= period; i++) {
     const change =
-      values[i] -
-      values[i - 1];
+      values[i] - values[i - 1];
 
     if (change >= 0) {
-      gain += change;
+      gains += change;
     } else {
-      loss -= change;
+      losses += Math.abs(change);
     }
   }
 
+  let averageGain =
+    gains / period;
 
-  let avgGain =
-    gain / period;
-
-  let avgLoss =
-    loss / period;
-
+  let averageLoss =
+    losses / period;
 
   for (
     let i = period + 1;
     i < values.length;
     i++
   ) {
-
     const change =
-      values[i] -
-      values[i - 1];
+      values[i] - values[i - 1];
 
+    const gain =
+      change > 0 ? change : 0;
 
-    const currentGain =
-      change > 0
-        ? change
-        : 0;
+    const loss =
+      change < 0 ? Math.abs(change) : 0;
 
-    const currentLoss =
-      change < 0
-        ? -change
-        : 0;
+    averageGain =
+      ((averageGain * (period - 1)) +
+        gain) /
+      period;
 
-
-    avgGain =
-      (
-        avgGain *
-        (period - 1) +
-        currentGain
-      ) / period;
-
-
-    avgLoss =
-      (
-        avgLoss *
-        (period - 1) +
-        currentLoss
-      ) / period;
+    averageLoss =
+      ((averageLoss * (period - 1)) +
+        loss) /
+      period;
   }
 
-
-  if (
-    avgLoss === 0
-  ) {
+  if (averageLoss === 0) {
     return 100;
   }
 
-
   const rs =
-    avgGain /
-    avgLoss;
+    averageGain / averageLoss;
 
-
-  return 100 -
-    100 /
-      (1 + rs);
+  return 100 - 100 / (1 + rs);
 }
 
-
-/* =========================================================
-   ATR
-   ========================================================= */
-
 function atr(candles, period = 14) {
-
   if (
+    !Array.isArray(candles) ||
     candles.length <= period
   ) {
     return null;
   }
 
-
   const trs = [];
 
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
 
-  for (
-    let i = 1;
-    i < candles.length;
-    i++
-  ) {
-
-    const current =
-      candles[i];
-
-    const previous =
-      candles[i - 1];
-
-
-    const tr =
-      Math.max(
-        current.high -
-          current.low,
-
-        Math.abs(
-          current.high -
-          previous.close
-        ),
-
-        Math.abs(
-          current.low -
-          previous.close
-        )
-      );
-
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
+    );
 
     trs.push(tr);
   }
 
-
-  if (
-    trs.length < period
-  ) {
+  if (trs.length < period) {
     return null;
   }
 
+  let value = 0;
 
-  let value =
-    trs
-      .slice(0, period)
-      .reduce(
-        (a, b) => a + b,
-        0
-      ) / period;
+  for (let i = 0; i < period; i++) {
+    value += trs[i];
+  }
 
+  value /= period;
 
   for (
     let i = period;
     i < trs.length;
     i++
   ) {
-
     value =
-      (
-        value *
-        (period - 1) +
-        trs[i]
-      ) / period;
+      ((value * (period - 1)) +
+        trs[i]) /
+      period;
   }
-
 
   return value;
 }
 
-
-/* =========================================================
-   ADX
-   ========================================================= */
-
 function adx(candles, period = 14) {
-
   if (
-    candles.length <
-    period * 2 + 1
+    !Array.isArray(candles) ||
+    candles.length < period * 2 + 1
   ) {
     return null;
   }
-
 
   const trs = [];
   const plusDM = [];
   const minusDM = [];
 
-
-  for (
-    let i = 1;
-    i < candles.length;
-    i++
-  ) {
-
-    const current =
-      candles[i];
-
-    const previous =
-      candles[i - 1];
-
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
 
     const upMove =
-      current.high -
-      previous.high;
+      current.high - previous.high;
 
     const downMove =
-      previous.low -
-      current.low;
+      previous.low - current.low;
 
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
+    );
 
-    const trueRange =
-      Math.max(
-        current.high -
-          current.low,
-
-        Math.abs(
-          current.high -
-          previous.close
-        ),
-
-        Math.abs(
-          current.low -
-          previous.close
-        )
-      );
-
-
-    trs.push(trueRange);
+    trs.push(tr);
 
     plusDM.push(
-      upMove > downMove &&
-      upMove > 0
+      upMove > downMove && upMove > 0
         ? upMove
         : 0
     );
 
     minusDM.push(
-      downMove > upMove &&
-      downMove > 0
+      downMove > upMove && downMove > 0
         ? downMove
         : 0
     );
   }
 
-
-  if (
-    trs.length < period
-  ) {
+  if (trs.length < period) {
     return null;
   }
 
+  let trSum = 0;
+  let plusSum = 0;
+  let minusSum = 0;
 
-  let atrValue =
-    trs
-      .slice(0, period)
-      .reduce(
-        (a, b) => a + b,
-        0
-      ) / period;
+  for (let i = 0; i < period; i++) {
+    trSum += trs[i];
+    plusSum += plusDM[i];
+    minusSum += minusDM[i];
+  }
 
+  const dx = [];
 
-  let plusValue =
-    plusDM
-      .slice(0, period)
-      .reduce(
-        (a, b) => a + b,
-        0
-      ) / period;
+  function pushDx() {
+    if (trSum <= 0) {
+      dx.push(0);
+      return;
+    }
 
+    const plusDI =
+      100 * (plusSum / trSum);
 
-  let minusValue =
-    minusDM
-      .slice(0, period)
-      .reduce(
-        (a, b) => a + b,
-        0
-      ) / period;
+    const minusDI =
+      100 * (minusSum / trSum);
 
+    const denominator =
+      plusDI + minusDI;
 
-  const dxValues = [];
+    const value =
+      denominator === 0
+        ? 0
+        : 100 *
+          Math.abs(
+            plusDI - minusDI
+          ) /
+          denominator;
 
+    dx.push(value);
+  }
+
+  pushDx();
 
   for (
     let i = period;
     i < trs.length;
     i++
   ) {
+    trSum =
+      trSum -
+      trSum / period +
+      trs[i];
 
-    if (i > period) {
+    plusSum =
+      plusSum -
+      plusSum / period +
+      plusDM[i];
 
-      atrValue =
-        (
-          atrValue *
-          (period - 1) +
-          trs[i]
-        ) / period;
+    minusSum =
+      minusSum -
+      minusSum / period +
+      minusDM[i];
 
-
-      plusValue =
-        (
-          plusValue *
-          (period - 1) +
-          plusDM[i]
-        ) / period;
-
-
-      minusValue =
-        (
-          minusValue *
-          (period - 1) +
-          minusDM[i]
-        ) / period;
-    }
-
-
-    const plusDI =
-      atrValue === 0
-        ? 0
-        : 100 *
-          (plusValue /
-            atrValue);
-
-
-    const minusDI =
-      atrValue === 0
-        ? 0
-        : 100 *
-          (minusValue /
-            atrValue);
-
-
-    const denominator =
-      plusDI +
-      minusDI;
-
-
-    const dx =
-      denominator === 0
-        ? 0
-        : 100 *
-          Math.abs(
-            plusDI -
-              minusDI
-          ) /
-          denominator;
-
-
-    dxValues.push(dx);
+    pushDx();
   }
 
-
-  if (
-    dxValues.length < period
-  ) {
+  if (dx.length < period) {
     return null;
   }
 
+  let adxValue = 0;
 
-  let adxValue =
-    dxValues
-      .slice(0, period)
-      .reduce(
-        (a, b) => a + b,
-        0
-      ) / period;
+  for (let i = 0; i < period; i++) {
+    adxValue += dx[i];
+  }
 
+  adxValue /= period;
 
   for (
     let i = period;
-    i < dxValues.length;
+    i < dx.length;
     i++
   ) {
-
     adxValue =
-      (
-        adxValue *
-        (period - 1) +
-        dxValues[i]
-      ) / period;
+      ((adxValue * (period - 1)) +
+        dx[i]) /
+      period;
   }
-
 
   return adxValue;
 }
 
+function standardDeviation(values) {
+  if (!values.length) {
+    return null;
+  }
 
-/* =========================================================
-   SUPPORT / RESISTANCE
-   ========================================================= */
+  const mean =
+    values.reduce(
+      (sum, value) => sum + value,
+      0
+    ) / values.length;
+
+  const variance =
+    values.reduce(
+      (sum, value) =>
+        sum +
+        Math.pow(value - mean, 2),
+      0
+    ) / values.length;
+
+  return Math.sqrt(variance);
+}
+
+function bollinger(candles, period = 20) {
+  if (candles.length < period) {
+    return null;
+  }
+
+  const closes =
+    candles
+      .slice(-period)
+      .map(c => c.close);
+
+  const middle =
+    closes.reduce(
+      (a, b) => a + b,
+      0
+    ) / period;
+
+  const sd =
+    standardDeviation(closes);
+
+  return {
+    middle,
+    upper: middle + 2 * sd,
+    lower: middle - 2 * sd
+  };
+}
 
 function supportResistance(candles) {
-
-  const recent =
-    candles.slice(-40);
-
-
-  if (!recent.length) {
+  if (candles.length < 20) {
     return {
       support: null,
       resistance: null
     };
   }
 
-
-  const support =
-    Math.min(
-      ...recent.map(
-        candle => candle.low
-      )
-    );
-
-
-  const resistance =
-    Math.max(
-      ...recent.map(
-        candle => candle.high
-      )
-    );
-
-
-  return {
-    support,
-    resistance
-  };
-}
-
-
-/* =========================================================
-   CANDLE PATTERN
-   ========================================================= */
-
-function candlePattern(candle) {
-
-  const body =
-    Math.abs(
-      candle.close -
-      candle.open
-    );
-
-
-  const range =
-    candle.high -
-    candle.low;
-
-
-  if (
-    range <= 0
-  ) {
-    return {
-      name: "NEUTRAL",
-      direction: "NEUTRAL"
-    };
-  }
-
-
-  const upperWick =
-    candle.high -
-    Math.max(
-      candle.open,
-      candle.close
-    );
-
-
-  const lowerWick =
-    Math.min(
-      candle.open,
-      candle.close
-    ) -
-    candle.low;
-
-
-  if (
-    lowerWick >
-      body * 1.8 &&
-    lowerWick >
-      upperWick * 1.2
-  ) {
-
-    return {
-      name: "BULLISH REJECTION",
-      direction: "BULLISH"
-    };
-  }
-
-
-  if (
-    upperWick >
-      body * 1.8 &&
-    upperWick >
-      lowerWick * 1.2
-  ) {
-
-    return {
-      name: "BEARISH REJECTION",
-      direction: "BEARISH"
-    };
-  }
-
-
-  if (
-    body / range < 0.2
-  ) {
-
-    return {
-      name: "DOJI",
-      direction: "NEUTRAL"
-    };
-  }
-
-
-  if (
-    candle.close >
-    candle.open
-  ) {
-
-    return {
-      name: "BULLISH CANDLE",
-      direction: "BULLISH"
-    };
-  }
-
-
-  if (
-    candle.close <
-    candle.open
-  ) {
-
-    return {
-      name: "BEARISH CANDLE",
-      direction: "BEARISH"
-    };
-  }
-
-
-  return {
-    name: "NEUTRAL",
-    direction: "NEUTRAL"
-  };
-}
-
-
-/* =========================================================
-   PRICE ACTION
-   ========================================================= */
-
-function priceAction(candles) {
-
-  if (
-    candles.length < 8
-  ) {
-    return {
-      direction: "NEUTRAL",
-      call: 0,
-      put: 0,
-      text: "INSUFFICIENT DATA"
-    };
-  }
-
-
-  const recent =
-    candles.slice(-6);
-
-
-  let bullish = 0;
-  let bearish = 0;
-
-
-  for (
-    const candle of recent
-  ) {
-
-    if (
-      candle.close >
-      candle.open
-    ) {
-      bullish++;
-    }
-
-    if (
-      candle.close <
-      candle.open
-    ) {
-      bearish++;
-    }
-  }
-
-
-  const last =
-    candles[candles.length - 1];
-
-
-  const previous =
-    candles[candles.length - 4];
-
-
-  if (
-    last.close >
-    previous.close
-  ) {
-    bullish++;
-  }
-
-
-  if (
-    last.close <
-    previous.close
-  ) {
-    bearish++;
-  }
-
-
-  if (
-    bullish > bearish
-  ) {
-
-    return {
-      direction: "BULLISH",
-      call: 10,
-      put: 0,
-      text: "BULLISH PRICE ACTION"
-    };
-  }
-
-
-  if (
-    bearish > bullish
-  ) {
-
-    return {
-      direction: "BEARISH",
-      call: 0,
-      put: 10,
-      text: "BEARISH PRICE ACTION"
-    };
-  }
-
-
-  return {
-    direction: "NEUTRAL",
-    call: 0,
-    put: 0,
-    text: "MIXED PRICE ACTION"
-  };
-}
-
-
-/* =========================================================
-   ENTRY / EXPIRY
-   ========================================================= */
-
-function buildEntryExpiry(
-  timeframe
-) {
-
-  const now =
-    new Date();
-
-
-  const tf =
-    Number(timeframe);
-
-
-  const minute =
-    now.getUTCMinutes();
-
-
-  const second =
-    now.getUTCSeconds();
-
-
-  let nextMinute =
-    Math.floor(
-      minute / tf
-    ) * tf +
-    tf;
-
-
-  let entry =
-    new Date(
-      Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        now.getUTCHours(),
-        nextMinute,
-        0,
-        0
-      )
-    );
-
-
-  /*
-    Make sure entry is at least 30 seconds away.
-  */
-
-  let secondsUntil =
-    Math.floor(
-      (
-        entry.getTime() -
-        now.getTime()
-      ) / 1000
-    );
-
-
-  if (
-    secondsUntil <
-    ENTRY_BUFFER_SECONDS
-  ) {
-
-    entry =
-      new Date(
-        entry.getTime() +
-        tf * 60 * 1000
+  const window =
+    candles.slice(-50);
+
+  let support = Infinity;
+  let resistance = -Infinity;
+
+  for (const candle of window) {
+    support =
+      Math.min(support, candle.low);
+
+    resistance =
+      Math.max(
+        resistance,
+        candle.high
       );
   }
 
-
-  const expiry =
-    new Date(
-      entry.getTime() +
-      tf * 60 * 1000
-    );
-
-
-  secondsUntil =
-    Math.max(
-      0,
-      Math.floor(
-        (
-          entry.getTime() -
-          now.getTime()
-        ) / 1000
-      )
-    );
-
-
   return {
-    entryTime:
-      entry.toISOString(),
+    support:
+      Number.isFinite(support)
+        ? support
+        : null,
 
-    expiryTime:
-      expiry.toISOString(),
-
-    entryInSeconds:
-      secondsUntil
+    resistance:
+      Number.isFinite(resistance)
+        ? resistance
+        : null
   };
 }
-
 
 /* =========================================================
    MARKET ANALYSIS
    ========================================================= */
 
-function analyzeCandles(
+function calculateMarketAnalysis(
   pair,
   timeframe,
   candles
 ) {
-
   const tfCandles =
     aggregateCandles(
       candles,
       timeframe
     );
 
-
   if (
     tfCandles.length <
-    MIN_CANDLES / timeframe
+    MIN_CANDLES
   ) {
-
-    return null;
+    throw new Error(
+      `${pair} ${timeframe}m: insufficient aggregated candles.`
+    );
   }
 
-
   const closes =
-    tfCandles.map(
-      candle =>
-        candle.close
-    );
+    tfCandles.map(c => c.close);
 
+  const current =
+    tfCandles[tfCandles.length - 1];
+
+  const currentPrice =
+    current.close;
 
   const ema9Value =
-    ema(
-      closes,
-      9
-    );
-
+    ema(closes, 9);
 
   const ema21Value =
-    ema(
-      closes,
-      21
-    );
-
+    ema(closes, 21);
 
   const rsiValue =
-    rsi(
-      closes,
-      14
-    );
-
-
-  const atrValue =
-    atr(
-      tfCandles,
-      14
-    );
-
+    rsi(closes, 14);
 
   const adxValue =
-    adx(
-      tfCandles,
-      14
-    );
+    adx(tfCandles, 14);
 
+  const atrValue =
+    atr(tfCandles, 14);
+
+  const bb =
+    bollinger(tfCandles, 20);
 
   const sr =
     supportResistance(
       tfCandles
     );
 
-
-  const last =
-    tfCandles[
-      tfCandles.length - 1
-    ];
-
-
-  const previous =
-    tfCandles[
-      tfCandles.length - 2
-    ];
-
-
   if (
-    !last ||
-    !previous ||
     !Number.isFinite(ema9Value) ||
     !Number.isFinite(ema21Value) ||
-    !Number.isFinite(rsiValue) ||
-    !Number.isFinite(adxValue)
+    !Number.isFinite(rsiValue)
   ) {
-
-    return null;
+    throw new Error(
+      `${pair} ${timeframe}m: indicators unavailable.`
+    );
   }
-
 
   let callScore = 0;
   let putScore = 0;
 
-  const reasonList = [];
+  const reasons = [];
 
+  /* ---------------- EMA TREND ---------------- */
 
-  /* EMA */
-
-  if (
-    ema9Value >
-    ema21Value
-  ) {
-
-    callScore += 22;
-
-    reasonList.push(
-      "EMA 9 above EMA 21"
-    );
-
-  } else if (
-    ema9Value <
-    ema21Value
-  ) {
-
-    putScore += 22;
-
-    reasonList.push(
-      "EMA 9 below EMA 21"
-    );
+  if (ema9Value > ema21Value) {
+    callScore += 30;
+    reasons.push('EMA9 above EMA21');
+  } else if (ema9Value < ema21Value) {
+    putScore += 30;
+    reasons.push('EMA9 below EMA21');
   }
 
-
-  /* RSI */
+  /* ---------------- RSI ---------------- */
 
   if (
     rsiValue >= 52 &&
     rsiValue <= 68
   ) {
-
-    callScore += 18;
-
-    reasonList.push(
-      "RSI supports bullish momentum"
-    );
-
+    callScore += 20;
+    reasons.push('RSI supports bullish momentum');
   } else if (
     rsiValue <= 48 &&
     rsiValue >= 32
   ) {
-
-    putScore += 18;
-
-    reasonList.push(
-      "RSI supports bearish momentum"
-    );
-
-  } else if (
-    rsiValue > 70
-  ) {
-
+    putScore += 20;
+    reasons.push('RSI supports bearish momentum');
+  } else if (rsiValue > 70) {
     putScore += 8;
-
-    reasonList.push(
-      "RSI is overbought"
-    );
-
-  } else if (
-    rsiValue < 30
-  ) {
-
+    reasons.push('RSI is overbought');
+  } else if (rsiValue < 30) {
     callScore += 8;
-
-    reasonList.push(
-      "RSI is oversold"
-    );
+    reasons.push('RSI is oversold');
   }
 
+  /* ---------------- PRICE MOMENTUM ---------------- */
 
-  /* ADX */
+  const lookback =
+    Math.min(5, closes.length - 1);
+
+  const previousPrice =
+    closes[
+      closes.length - 1 - lookback
+    ];
+
+  const momentum =
+    currentPrice - previousPrice;
+
+  if (momentum > 0) {
+    callScore += 20;
+    reasons.push('Short-term momentum bullish');
+  } else if (momentum < 0) {
+    putScore += 20;
+    reasons.push('Short-term momentum bearish');
+  }
+
+  /* ---------------- ADX ---------------- */
 
   if (
+    Number.isFinite(adxValue) &&
     adxValue >= 20
   ) {
-
-    if (
-      ema9Value >
-      ema21Value
-    ) {
-
-      callScore += 16;
-
-    } else if (
-      ema9Value <
-      ema21Value
-    ) {
-
-      putScore += 16;
+    if (ema9Value > ema21Value) {
+      callScore += 15;
+    } else {
+      putScore += 15;
     }
 
-
-    reasonList.push(
-      `ADX confirms trend strength (${adxValue.toFixed(1)})`
+    reasons.push(
+      `ADX confirms trend (${round(adxValue, 1)})`
     );
-
   } else {
-
-    reasonList.push(
-      `ADX indicates weak trend (${adxValue.toFixed(1)})`
-    );
+    reasons.push('ADX indicates weak trend');
   }
 
-
-  /* Candle */
-
-  const candle =
-    candlePattern(last);
-
+  /* ---------------- SUPPORT / RESISTANCE ---------------- */
 
   if (
-    candle.direction ===
-    "BULLISH"
+    Number.isFinite(sr.support) &&
+    Number.isFinite(sr.resistance)
   ) {
+    const range =
+      sr.resistance - sr.support;
 
-    callScore += 10;
+    if (range > 0) {
+      const position =
+        (currentPrice - sr.support) /
+        range;
 
-    reasonList.push(
-      candle.name
-    );
+      /*
+        Avoid calling a CALL immediately into resistance
+        or PUT immediately into support.
+      */
+      if (
+        ema9Value > ema21Value &&
+        position < 0.78
+      ) {
+        callScore += 10;
+      }
 
-  } else if (
-    candle.direction ===
-    "BEARISH"
-  ) {
-
-    putScore += 10;
-
-    reasonList.push(
-      candle.name
-    );
-  }
-
-
-  /* Price action */
-
-  const pa =
-    priceAction(
-      tfCandles
-    );
-
-
-  callScore +=
-    pa.call;
-
-  putScore +=
-    pa.put;
-
-
-  reasonList.push(
-    pa.text
-  );
-
-
-  /* Support / resistance location */
-
-  const range =
-    sr.resistance -
-    sr.support;
-
-
-  let location =
-    "MID_RANGE";
-
-
-  if (
-    range > 0
-  ) {
-
-    const position =
-      (
-        last.close -
-        sr.support
-      ) / range;
-
-
-    if (
-      position < 0.20
-    ) {
-
-      location =
-        "NEAR_SUPPORT";
-
-      callScore += 8;
-
-      reasonList.push(
-        "Price is near support"
-      );
-
-    } else if (
-      position > 0.80
-    ) {
-
-      location =
-        "NEAR_RESISTANCE";
-
-      putScore += 8;
-
-      reasonList.push(
-        "Price is near resistance"
-      );
+      if (
+        ema9Value < ema21Value &&
+        position > 0.22
+      ) {
+        putScore += 10;
+      }
     }
   }
 
+  /* ---------------- BOLLINGER / VOLATILITY ---------------- */
 
-  /* Price direction */
+  let marketCondition =
+    'RANGING';
 
-  if (
-    last.close >
-    previous.close
-  ) {
+  if (bb && atrValue) {
+    const width =
+      bb.upper - bb.lower;
 
-    callScore += 6;
+    const relativeWidth =
+      currentPrice !== 0
+        ? width / currentPrice
+        : 0;
 
-  } else if (
-    last.close <
-    previous.close
-  ) {
-
-    putScore += 6;
+    if (
+      relativeWidth < 0.0008
+    ) {
+      marketCondition =
+        'LOW_VOLATILITY_RANGE';
+    } else if (
+      ema9Value > ema21Value
+    ) {
+      marketCondition =
+        'UPTREND';
+    } else if (
+      ema9Value < ema21Value
+    ) {
+      marketCondition =
+        'DOWNTREND';
+    }
   }
 
-
-  callScore =
-    clamp(
+  const strongest =
+    Math.max(
       callScore,
-      0,
-      100
+      putScore
     );
-
-
-  putScore =
-    clamp(
-      putScore,
-      0,
-      100
-    );
-
 
   const difference =
     Math.abs(
-      callScore -
-      putScore
+      callScore - putScore
     );
 
-
-  let signal =
-    "NO TRADE";
-
-
-  let confidence =
-    Math.max(
-      callScore,
-      putScore
-    );
-
+  let signal = 'NO TRADE';
 
   /*
-    Conservative signal threshold.
+    V8.4.1 deliberately requires both:
+      - enough directional score
+      - enough separation between CALL and PUT
   */
-
   if (
-    callScore >= 65 &&
-    difference >= 15 &&
-    callScore > putScore
+    strongest >= 65 &&
+    difference >= 15
   ) {
+    signal =
+      callScore > putScore
+        ? 'CALL'
+        : 'PUT';
+  }
 
-    signal = "CALL";
+  let confidence = 40;
 
-  } else if (
-    putScore >= 65 &&
-    difference >= 15 &&
-    putScore > callScore
-  ) {
-
-    signal = "PUT";
-
+  if (signal === 'CALL') {
+    confidence = Math.min(
+      95,
+      Math.round(
+        50 +
+        callScore * 0.45 +
+        difference * 0.25
+      )
+    );
+  } else if (signal === 'PUT') {
+    confidence = Math.min(
+      95,
+      Math.round(
+        50 +
+        putScore * 0.45 +
+        difference * 0.25
+      )
+    );
   } else {
-
-    signal = "NO TRADE";
-  }
-
-
-  /* Trend */
-
-  let trend =
-    "RANGING";
-
-
-  if (
-    ema9Value >
-      ema21Value &&
-    adxValue >= 20
-  ) {
-
-    trend =
-      "UPTREND";
-
-  } else if (
-    ema9Value <
-      ema21Value &&
-    adxValue >= 20
-  ) {
-
-    trend =
-      "DOWNTREND";
-
-  } else if (
-    ema9Value >
-    ema21Value
-  ) {
-
-    trend =
-      "MILD UPTREND";
-
-  } else if (
-    ema9Value <
-    ema21Value
-  ) {
-
-    trend =
-      "MILD DOWNTREND";
-  }
-
-
-  /*
-    Entry/expiry.
-  */
-
-  const schedule =
-    buildEntryExpiry(
-      timeframe
+    confidence = Math.min(
+      69,
+      Math.max(
+        40,
+        Math.round(
+          40 +
+          strongest * 0.30
+        )
+      )
     );
-
+  }
 
   /*
-    Data age.
+    Entry is the next timeframe boundary.
+    This keeps ENTRY and EXPIRY synchronized to UTC.
   */
+  const now =
+    new Date();
 
-  const lastCandleTimestamp =
-    last.timestamp;
+  const tfMs =
+    timeframe *
+    60 *
+    1000;
 
+  let entryTime =
+    Math.ceil(
+      now.getTime() / tfMs
+    ) * tfMs;
 
-  const ageSeconds =
+  /*
+    If the next boundary is less than 30 seconds away,
+    use the following boundary.
+  */
+  if (
+    entryTime -
+      now.getTime() <
+    ENTRY_BUFFER_SECONDS * 1000
+  ) {
+    entryTime += tfMs;
+  }
+
+  const expiryTime =
+    entryTime + tfMs;
+
+  const entryInSeconds =
     Math.max(
       0,
-      Math.floor(
-        (
-          Date.now() -
-          lastCandleTimestamp
-        ) / 1000
+      Math.ceil(
+        (entryTime -
+          now.getTime()) /
+          1000
       )
     );
 
-
-  const fresh =
-    ageSeconds <=
-    MAX_DATA_AGE_SECONDS;
-
-
-  /*
-    Never issue a CALL/PUT from stale market data.
-  */
-
-  if (
-    !fresh
-  ) {
-
-    signal =
-      "NO TRADE";
-
-    confidence =
-      Math.min(
-        confidence,
-        40
-      );
-
-    reasonList.push(
-      `Market data is stale (${ageSeconds}s)`
-    );
-  }
-
-
-  /*
-    Do not generate an entry too close to now.
-  */
-
-  if (
-    schedule.entryInSeconds <
-    ENTRY_BUFFER_SECONDS
-  ) {
-
-    signal =
-      "NO TRADE";
-
-    confidence =
-      Math.min(
-        confidence,
-        40
-      );
-
-    reasonList.push(
-      "Entry buffer is too short"
-    );
-  }
-
-
-  /*
-    NO TRADE confidence remains informative,
-    but never pretends to be a win probability.
-  */
-
-  if (
-    signal === "NO TRADE"
-  ) {
-
-    confidence =
-      clamp(
-        Math.max(
-          callScore,
-          putScore
-        ),
-        0,
-        69
-      );
-  } else {
-
-    confidence =
-      clamp(
-        Math.max(
-          callScore,
-          putScore
-        ),
-        70,
-        95
-      );
-  }
-
-
   return {
-
     pair,
-
     timeframe,
-
     signal,
-
     confidence,
 
-    trend,
-
-    callScore:
+    currentPrice:
       round(
-        callScore,
-        0
-      ),
-
-    putScore:
-      round(
-        putScore,
-        0
-      ),
-
-    difference:
-      round(
-        difference,
-        0
-      ),
-
-    entryPrice:
-      round(
-        last.close,
-        5
+        currentPrice,
+        priceDecimals(pair)
       ),
 
     entryTime:
-      schedule.entryTime,
+      new Date(entryTime).toISOString(),
 
     expiryTime:
-      schedule.expiryTime,
+      new Date(expiryTime).toISOString(),
 
-    entryInSeconds:
-      schedule.entryInSeconds,
+    entryInSeconds,
 
-    support:
-      round(
-        sr.support,
-        5
+    marketCondition,
+
+    callScore:
+      Math.min(
+        100,
+        Math.round(callScore)
       ),
 
-    resistance:
-      round(
-        sr.resistance,
-        5
+    putScore:
+      Math.min(
+        100,
+        Math.round(putScore)
       ),
 
-    ema9:
-      round(
-        ema9Value,
-        5
-      ),
+    indicators: {
+      ema9:
+        round(
+          ema9Value,
+          priceDecimals(pair)
+        ),
 
-    ema21:
-      round(
-        ema21Value,
-        5
-      ),
+      ema21:
+        round(
+          ema21Value,
+          priceDecimals(pair)
+        ),
 
-    rsi:
-      round(
-        rsiValue,
-        2
-      ),
+      rsi14:
+        round(rsiValue, 2),
 
-    adx:
-      round(
-        adxValue,
-        2
-      ),
+      adx14:
+        Number.isFinite(adxValue)
+          ? round(adxValue, 2)
+          : null,
 
-    atr:
-      round(
-        atrValue,
-        5
-      ),
+      atr14:
+        Number.isFinite(atrValue)
+          ? round(
+              atrValue,
+              priceDecimals(pair)
+            )
+          : null,
 
-    candlestick:
-      candle.name,
+      support:
+        Number.isFinite(sr.support)
+          ? round(
+              sr.support,
+              priceDecimals(pair)
+            )
+          : null,
 
-    candlestickDirection:
-      candle.direction,
+      resistance:
+        Number.isFinite(sr.resistance)
+          ? round(
+              sr.resistance,
+              priceDecimals(pair)
+            )
+          : null,
 
-    priceAction:
-      pa.text,
+      bollingerUpper:
+        bb
+          ? round(
+              bb.upper,
+              priceDecimals(pair)
+            )
+          : null,
 
-    priceActionCall:
-      pa.call,
+      bollingerMiddle:
+        bb
+          ? round(
+              bb.middle,
+              priceDecimals(pair)
+            )
+          : null,
 
-    priceActionPut:
-      pa.put,
+      bollingerLower:
+        bb
+          ? round(
+              bb.lower,
+              priceDecimals(pair)
+            )
+          : null
+    },
 
-    location,
-
-    freshness:
-      {
-        fresh,
-        ageSeconds
-      },
-
-    candlesUsed:
+    candles:
       tfCandles.length,
 
-    lastCandle:
-      last.time,
+    source: 'Twelve Data LIVE',
+
+    analysisTime:
+      new Date().toISOString(),
 
     reasons:
-      reasonList,
-
-    generatedAt:
-      new Date().toISOString()
+      reasons.slice(0, 6)
   };
 }
 
-
 /* =========================================================
-   RANK RESULTS
+   BEST RESULT SELECTION
    ========================================================= */
 
 function rankResult(result) {
-
   if (!result) {
     return -Infinity;
   }
 
-
-  let score =
-    Number(
-      result.confidence || 0
+  if (
+    result.signal === 'NO TRADE'
+  ) {
+    return (
+      result.confidence * 0.35
     );
+  }
 
+  const score =
+    result.confidence +
+    Math.abs(
+      result.callScore -
+      result.putScore
+    ) *
+      0.6;
+
+  let bonus = 0;
 
   if (
-    result.signal === "CALL" ||
-    result.signal === "PUT"
+    result.marketCondition ===
+      'UPTREND' &&
+    result.signal === 'CALL'
   ) {
-
-    score += 25;
+    bonus += 8;
   }
-
 
   if (
-    result.freshness?.fresh
+    result.marketCondition ===
+      'DOWNTREND' &&
+    result.signal === 'PUT'
   ) {
-
-    score += 15;
+    bonus += 8;
   }
-
 
   if (
-    Number(result.adx) >= 25
+    result.indicators.adx14 !== null &&
+    result.indicators.adx14 >= 25
   ) {
-
-    score += 8;
+    bonus += 5;
   }
 
-
-  score +=
-    Math.min(
-      20,
-      Number(
-        result.difference || 0
-      )
-    );
-
-
-  return score;
+  return score + bonus;
 }
 
-
-/* =========================================================
-   CACHE RESULT
-   ========================================================= */
-
-function cacheResult(
-  pair,
-  result
-) {
-
-  if (!result) {
-    return;
-  }
-
-
-  cache.set(
-    pair,
-    {
-      pair,
-      result,
-      savedAt:
-        Date.now()
-    }
-  );
-}
-
-
-/* =========================================================
-   CLEAN CACHE
-   ========================================================= */
-
-function cleanupCache() {
-
-  const now =
-    Date.now();
-
-
-  for (
-    const [
-      pair,
-      item
-    ] of cache
-  ) {
-
-    if (
-      now -
-        item.savedAt >
-      CACHE_RETENTION_SECONDS *
-        1000
-    ) {
-
-      cache.delete(pair);
-    }
-  }
-}
-
-
-/* =========================================================
-   BEST FROM CACHE
-   ========================================================= */
-
-function bestFromCache(
-  signalOnly = false
-) {
-
-  cleanupCache();
-
-
-  const results = [];
-
-
-  for (
-    const item of cache.values()
-  ) {
-
-    if (!item?.result) {
-      continue;
-    }
-
-
-    const result =
-      item.result;
-
-
-    if (
-      !result.freshness?.fresh
-    ) {
-      continue;
-    }
-
-
-    if (
-      signalOnly &&
-      !(
-        result.signal === "CALL" ||
-        result.signal === "PUT"
-      )
-    ) {
-      continue;
-    }
-
-
-    results.push(result);
-  }
-
-
+function chooseBest(results) {
   if (!results.length) {
     return null;
   }
 
+  const sorted =
+    results
+      .slice()
+      .sort(
+        (a, b) =>
+          rankResult(b) -
+          rankResult(a)
+      );
 
-  results.sort(
-    (a, b) =>
-      rankResult(b) -
-      rankResult(a)
-  );
-
-
-  return results[0];
+  return sorted[0];
 }
 
+/* =========================================================
+   PAIR ANALYSIS
+   ========================================================= */
+
+async function analyzePair(
+  pair,
+  options = {}
+) {
+  const normalized =
+    normalizePair(pair);
+
+  if (!normalized) {
+    throw new Error(
+      `Unsupported pair: ${pair}`
+    );
+  }
+
+  const data =
+    await getPairCandles(
+      normalized,
+      options
+    );
+
+  const results = [];
+
+  for (const timeframe of TIMEFRAMES) {
+    const key =
+      `${normalized}:${timeframe}`;
+
+    const cachedResult =
+      getCachedResult(key);
+
+    if (
+      cachedResult &&
+      !options.forceRefresh
+    ) {
+      results.push(
+        cachedResult
+      );
+      continue;
+    }
+
+    const result =
+      calculateMarketAnalysis(
+        normalized,
+        timeframe,
+        data.candles
+      );
+
+    result.dataSource =
+      data.source;
+
+    if (data.warning) {
+      result.dataWarning =
+        data.warning;
+    }
+
+    setCachedResult(
+      key,
+      result
+    );
+
+    results.push(result);
+  }
+
+  return {
+    pair: normalized,
+    source: data.source,
+    cachedAt: data.cachedAt,
+    results
+  };
+}
 
 /* =========================================================
-   SCAN BATCH
+   SCANNER
    ========================================================= */
 
 async function scanBatch() {
+  resetDailyStateIfNeeded();
 
-  resetDailyBudgetIfNeeded();
-
-
-  if (
-    scanner.running
-  ) {
-
+  if (scanRunning) {
     return {
-      ok: false,
       skipped: true,
-      reason: "scan_already_running"
+      reason: 'scan_already_running'
     };
   }
 
-
-  if (
-    scanner.quotaBlocked
-  ) {
-
+  /*
+    Do not start a provider scan while quota is blocked.
+  */
+  if (quotaBlocked) {
     return {
-      ok: false,
       skipped: true,
-      reason: "daily_quota_blocked"
+      reason: 'provider_quota_blocked'
     };
   }
 
+  /*
+    Do not consume requests after backend budget.
+  */
+  if (!isBudgetAvailable()) {
+    return {
+      skipped: true,
+      reason: 'daily_budget_reached'
+    };
+  }
 
-  scanner.running = true;
-  scanner.lastScanError = null;
+  scanRunning = true;
 
+  const startedAt =
+    new Date().toISOString();
 
-  const batch = [];
-
+  const batch =
+    [];
 
   for (
     let i = 0;
     i < SCAN_BATCH_SIZE;
     i++
   ) {
-
     const index =
-      (
-        scanner.cursor +
-        i
-      ) % PAIRS.length;
-
+      (scanCursor + i) %
+      PAIRS.length;
 
     batch.push(
       PAIRS[index]
     );
   }
 
-
-  let scannedThisBatch = 0;
-  let failedThisBatch = 0;
-
+  let scannedThisRun = 0;
+  let failedThisRun = 0;
 
   try {
-
-    for (
-      const pair of batch
-    ) {
-
-      if (
-        !canUseApiCredit()
-      ) {
-
+    for (const pair of batch) {
+      /*
+        If quota gets blocked during a pair,
+        stop immediately.
+      */
+      if (quotaBlocked) {
         break;
       }
 
-
       try {
-
-        const candles =
-          await fetchCandles(
-            pair
+        const analysis =
+          await analyzePair(
+            pair,
+            {
+              forceRefresh: true
+            }
           );
 
+        scannedThisRun++;
+        totalScanned++;
 
-        for (
-          const timeframe of TIMEFRAMES
-        ) {
-
-          const result =
-            analyzeCandles(
-              pair,
-              timeframe,
-              candles
-            );
-
-
-          if (result) {
-
-            cacheResult(
-              pair,
-              result
-            );
-          }
-        }
-
-
-        scanner.totalScanned++;
-        scannedThisBatch++;
-
-
-        failedPairs.delete(
-          pair
+        console.log(
+          `[SCAN] ${pair} OK (${analysis.source})`
         );
-
-
       } catch (error) {
+        failedThisRun++;
+        totalFailed++;
 
-        scanner.totalFailed++;
-        failedThisBatch++;
+        lastScanError =
+          `${pair}: ${error.message}`;
 
-
-        const message =
-          error?.message ||
-          String(error);
-
-
-        failedPairs.set(
-          pair,
-          {
-            pair,
-            error: message,
-            at:
-              new Date().toISOString()
-          }
+        console.warn(
+          `[SCAN] ${lastScanError}`
         );
-
-
-        scanner.lastScanError =
-          message;
-
 
         /*
-          Critical:
-          once daily quota is detected,
-          STOP immediately.
+          Critical quota protection:
+          do not continue requesting more pairs.
         */
-
-        if (
-          isQuotaError(message) ||
-          scanner.quotaBlocked
-        ) {
-
-          blockQuota(
-            message
-          );
-
+        if (quotaBlocked) {
           break;
         }
       }
     }
 
+    scanCursor =
+      (scanCursor +
+        batch.length) %
+      PAIRS.length;
 
-    scanner.cursor =
-      (
-        scanner.cursor +
-        batch.length
-      ) % PAIRS.length;
-
-
-    scanner.lastScanAt =
+    lastScanAt =
       new Date().toISOString();
 
-
     return {
-      ok: true,
-
-      scanned:
-        scannedThisBatch,
-
-      failed:
-        failedThisBatch,
-
-      batch,
-
-      cursor:
-        scanner.cursor,
-
-      quotaBlocked:
-        scanner.quotaBlocked
+      skipped: false,
+      startedAt,
+      completedAt: lastScanAt,
+      scannedThisRun,
+      failedThisRun,
+      scanCursor,
+      quotaBlocked
     };
-
-
   } finally {
-
-    scanner.running = false;
+    scanRunning = false;
   }
 }
 
-
 /* =========================================================
-   SCANNER RESPONSE
+   ROUTES
    ========================================================= */
 
-function scannerState() {
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    name: 'PO AI Predictor',
+    version: VERSION,
+    source: 'Twelve Data LIVE',
+    status: quotaBlocked
+      ? 'QUOTA_BLOCKED'
+      : 'ONLINE',
+    endpoints: [
+      '/api/health',
+      '/api/analyze',
+      '/api/best',
+      '/api/scan',
+      '/api/scan/status'
+    ]
+  });
+});
 
-  resetDailyBudgetIfNeeded();
+/* ---------------------------------------------------------
+   HEALTH
+   --------------------------------------------------------- */
 
-  cleanupCache();
-
+app.get('/api/health', (req, res) => {
+  resetDailyStateIfNeeded();
 
   const cachedPairs =
-    cache.size;
+    Array.from(
+      pairCache.entries()
+    ).filter(
+      ([, value]) =>
+        Date.now() -
+          value.timestamp <=
+        CACHE_TTL_MS
+    ).length;
 
+  const cachedResults =
+    Array.from(
+      resultCache.entries()
+    ).filter(
+      ([, value]) =>
+        Date.now() -
+          value.timestamp <=
+        RESULT_TTL_MS
+    ).length;
 
-  let cachedResults = 0;
+  res.json({
+    ok: true,
+    version: VERSION,
+    source: 'Twelve Data LIVE',
+    timezone: TIMEZONE,
 
+    pairs: PAIRS.length,
+    supportedTimeframes:
+      TIMEFRAMES,
 
-  for (
-    const item of cache.values()
-  ) {
+    cachedPairs,
+    cachedResults,
 
-    if (
-      item?.result
-    ) {
-      cachedResults++;
-    }
-  }
-
-
-  const freshSignal =
-    bestFromCache(true);
-
-
-  const freshAny =
-    bestFromCache(false);
-
-
-  return {
-
-    scanRunning:
-      scanner.running,
-
-    scanCursor:
-      scanner.cursor,
-
+    scanRunning,
+    scanCursor,
     scanBatchSize:
       SCAN_BATCH_SIZE,
 
-    scanEveryMs:
-      SCAN_EVERY_MS,
+    scanEveryMinutes:
+      SCAN_EVERY_MS / 60000,
 
-    lastScanAt:
-      scanner.lastScanAt,
+    cacheTtlMinutes:
+      CACHE_TTL_MS / 60000,
 
-    lastScanError:
-      scanner.lastScanError,
+    lastScanAt,
+    lastScanError,
 
-    totalScanned:
-      scanner.totalScanned,
-
-    totalFailed:
-      scanner.totalFailed,
-
-    totalApiRequests:
-      scanner.totalApiRequests,
-
-    cachedPairs,
-
-    cachedResults,
-
-    best:
-      freshAny,
-
-    bestSignal:
-      freshSignal,
-
-    failedPairs:
-      Array.from(
-        failedPairs.values()
-      ).slice(-10),
+    totalScanned,
+    totalFailed,
+    totalApiRequests,
 
     apiBudget: {
-
       dailyLimit:
-        DAILY_CREDIT_LIMIT,
+        DAILY_REQUEST_LIMIT,
 
       safetyReserve:
-        DAILY_SAFETY_RESERVE,
+        SAFETY_RESERVE,
 
       maxDailyRequests:
         MAX_DAILY_REQUESTS,
 
-      dailyRequests:
-        scanner.dailyRequests,
+      dailyRequests,
 
-      dailyCreditsUsed:
-        scanner.dailyCreditsUsed,
+      dailyCreditsUsed,
 
       dailyCreditsLeft:
-        scanner.dailyCreditsLeft,
+        getDailyCreditsLeft(),
 
-      quotaBlocked:
-        scanner.quotaBlocked,
+      dailyRequestsLeft:
+        getDailyRequestsLeft(),
 
-      quotaBlockedAt:
-        scanner.quotaBlockedAt,
+      quotaBlocked,
+
+      providerQuotaMessage,
 
       quotaResetAt:
-        scanner.quotaResetAt
+        providerQuotaResetAt
     },
 
     time:
       new Date().toISOString()
-  };
-}
+  });
+});
 
-
-/* =========================================================
-   HEALTH
-   ========================================================= */
-
-app.get(
-  "/api/health",
-  (req, res) => {
-
-    resetDailyBudgetIfNeeded();
-
-    cleanupCache();
-
-
-    res.json({
-
-      ok: true,
-
-      version:
-        VERSION,
-
-      source:
-        SOURCE,
-
-      timezone:
-        TIMEZONE,
-
-      pairs:
-        PAIRS.length,
-
-      supportedTimeframes:
-        TIMEFRAMES,
-
-      cachedPairs:
-        cache.size,
-
-      cachedResults:
-        Array.from(
-          cache.values()
-        ).filter(
-          x => x?.result
-        ).length,
-
-      scanRunning:
-        scanner.running,
-
-      scanCursor:
-        scanner.cursor,
-
-      scanBatchSize:
-        SCAN_BATCH_SIZE,
-
-      scanEveryMinutes:
-        SCAN_EVERY_MS /
-        60000,
-
-      lastScanAt:
-        scanner.lastScanAt,
-
-      lastScanError:
-        scanner.lastScanError,
-
-      totalScanned:
-        scanner.totalScanned,
-
-      totalFailed:
-        scanner.totalFailed,
-
-      totalApiRequests:
-        scanner.totalApiRequests,
-
-      apiBudget: {
-
-        dailyLimit:
-          DAILY_CREDIT_LIMIT,
-
-        safetyReserve:
-          DAILY_SAFETY_RESERVE,
-
-        maxDailyRequests:
-          MAX_DAILY_REQUESTS,
-
-        dailyRequests:
-          scanner.dailyRequests,
-
-        dailyCreditsUsed:
-          scanner.dailyCreditsUsed,
-
-        dailyCreditsLeft:
-          scanner.dailyCreditsLeft,
-
-        quotaBlocked:
-          scanner.quotaBlocked,
-
-        quotaResetAt:
-          scanner.quotaResetAt
-      },
-
-      time:
-        new Date().toISOString()
-    });
-  }
-);
-
-
-/* =========================================================
-   SCANNER ENDPOINT
-   ========================================================= */
+/* ---------------------------------------------------------
+   SCAN STATUS
+   --------------------------------------------------------- */
 
 app.get(
-  "/api/scanner",
+  '/api/scan/status',
   (req, res) => {
+    resetDailyStateIfNeeded();
 
     res.json({
       ok: true,
       version: VERSION,
-      source: SOURCE,
-      ...scannerState()
-    });
-  }
-);
-
-
-/* =========================================================
-   MAIN ANALYZE ENDPOINT
-   ========================================================= */
-
-app.get(
-  "/api/analyze",
-  async (req, res) => {
-
-    resetDailyBudgetIfNeeded();
-    cleanupCache();
-
-
-    /*
-      1. Fresh signal already cached.
-    */
-
-    const cachedSignal =
-      bestFromCache(true);
-
-
-    if (cachedSignal) {
-
-      return res.json({
-
-        ok: true,
-
-        version:
-          VERSION,
-
-        source:
-          SOURCE,
-
-        mode:
-          "CACHE",
-
-        best:
-          cachedSignal,
-
-        scanner:
-          scannerState(),
-
-        time:
-          new Date().toISOString()
-      });
-    }
-
-
-    /*
-      2. If no signal, try existing fresh result.
-    */
-
-    const cachedAny =
-      bestFromCache(false);
-
-
-    if (cachedAny) {
-
-      return res.json({
-
-        ok: true,
-
-        version:
-          VERSION,
-
-        source:
-          SOURCE,
-
-        mode:
-          "CACHE_NO_SIGNAL",
-
-        best:
-          cachedAny,
-
-        scanner:
-          scannerState(),
-
-        time:
-          new Date().toISOString()
-      });
-    }
-
-
-    /*
-      3. If daily quota is blocked, do NOT call Twelve Data.
-    */
-
-    if (
-      scanner.quotaBlocked
-    ) {
-
-      return res.status(503).json({
-
-        ok: false,
-
-        version:
-          VERSION,
-
-        error:
-          "Live data quota is currently exhausted. Scanner is safely paused until the next UTC reset.",
-
-        quotaBlocked:
-          true,
-
-        quotaResetAt:
-          scanner.quotaResetAt,
-
-        scanner:
-          scannerState(),
-
-        time:
-          new Date().toISOString()
-      });
-    }
-
-
-    /*
-      4. Perform one controlled batch.
-    */
-
-    await scanBatch();
-
-
-    /*
-      5. Select the strongest fresh signal.
-    */
-
-    const freshSignal =
-      bestFromCache(true);
-
-
-    if (freshSignal) {
-
-      return res.json({
-
-        ok: true,
-
-        version:
-          VERSION,
-
-        source:
-          SOURCE,
-
-        mode:
-          "SCAN",
-
-        best:
-          freshSignal,
-
-        scanner:
-          scannerState(),
-
-        time:
-          new Date().toISOString()
-      });
-    }
-
-
-    /*
-      6. Maybe we have a fresh NO TRADE result.
-    */
-
-    const freshAny =
-      bestFromCache(false);
-
-
-    if (freshAny) {
-
-      return res.json({
-
-        ok: true,
-
-        version:
-          VERSION,
-
-        source:
-          SOURCE,
-
-        mode:
-          "SCAN_NO_SIGNAL",
-
-        best:
-          freshAny,
-
-        scanner:
-          scannerState(),
-
-        time:
-          new Date().toISOString()
-      });
-    }
-
-
-    /*
-      7. Nothing fresh.
-    */
-
-    const message =
-      scanner.quotaBlocked
-
-        ? "Live data quota is exhausted. Scanner is paused until the next UTC reset."
-
-        : "No fresh market analysis available yet. Scanner is waiting for valid live data.";
-
-
-    return res.status(503).json({
-
-      ok: false,
-
-      version:
-        VERSION,
-
-      error:
-        message,
-
-      quotaBlocked:
-        scanner.quotaBlocked,
-
+      scanRunning,
+      scanCursor,
+      scanBatchSize:
+        SCAN_BATCH_SIZE,
+      pairs: PAIRS.length,
+      lastScanAt,
+      lastScanError,
+      quotaBlocked,
+      providerQuotaMessage,
       quotaResetAt:
-        scanner.quotaResetAt,
-
-      lastScanAt:
-        scanner.lastScanAt,
-
-      lastScanError:
-        scanner.lastScanError,
-
-      scanner:
-        scannerState(),
-
+        providerQuotaResetAt,
+      cachedPairs:
+        pairCache.size,
+      cachedResults:
+        resultCache.size,
       time:
         new Date().toISOString()
     });
   }
 );
 
-
-/* =========================================================
-   ANALYZE SPECIFIC PAIR
-   ========================================================= */
+/* ---------------------------------------------------------
+   MANUAL SCAN
+   --------------------------------------------------------- */
 
 app.get(
-  "/api/analyze/:pair",
+  '/api/scan',
   async (req, res) => {
+    try {
+      const result =
+        await scanBatch();
+
+      res.json({
+        ok: true,
+        version: VERSION,
+        ...result
+      });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        version: VERSION,
+        error: error.message
+      });
+    }
+  }
+);
+
+/* ---------------------------------------------------------
+   ANALYZE ONE PAIR
+   --------------------------------------------------------- */
+
+app.get(
+  '/api/analyze',
+  async (req, res) => {
+    resetDailyStateIfNeeded();
 
     const pair =
-      decodeURIComponent(
-        req.params.pair
+      normalizePair(
+        req.query.pair
       );
 
-
-    if (
-      !PAIRS.includes(pair)
-    ) {
-
+    if (!pair) {
       return res.status(400).json({
-
         ok: false,
-
         error:
-          `Unsupported pair: ${pair}`,
-
-        supportedPairs:
-          PAIRS
+          'Valid pair is required.',
+        supportedPairs: PAIRS
       });
     }
 
+    try {
+      const analysis =
+        await analyzePair(
+          pair,
+          {
+            forceRefresh:
+              req.query.refresh === '1'
+          }
+        );
 
-    resetDailyBudgetIfNeeded();
+      res.json({
+        ok: true,
+        version: VERSION,
+        ...analysis
+      });
+    } catch (error) {
+      const status =
+        quotaBlocked
+          ? 429
+          : 500;
 
+      res.status(status).json({
+        ok: false,
+        version: VERSION,
+        pair,
+        error: error.message,
+        quotaBlocked,
+        quotaResetAt:
+          providerQuotaResetAt,
+        time:
+          new Date().toISOString()
+      });
+    }
+  }
+);
+
+/* ---------------------------------------------------------
+   BEST RESULT
+   --------------------------------------------------------- */
+
+app.get(
+  '/api/best',
+  async (req, res) => {
+    resetDailyStateIfNeeded();
+
+    const results = [];
 
     /*
-      Use fresh cache first.
+      Prefer already cached results.
+      This endpoint does NOT automatically make
+      24 fresh Twelve Data requests.
     */
+    for (const [
+      key,
+      value
+    ] of resultCache.entries()) {
+      if (
+        Date.now() -
+          value.timestamp >
+        RESULT_TTL_MS
+      ) {
+        continue;
+      }
 
-    const cached =
-      cache.get(pair);
+      if (value.result) {
+        results.push(
+          value.result
+        );
+      }
+    }
 
-
+    /*
+      If cache has no results, perform ONE controlled scan batch.
+      Never scan all 24 pairs from this endpoint.
+    */
     if (
-      cached?.result &&
-      cached.result.freshness?.fresh
+      results.length === 0 &&
+      !quotaBlocked
     ) {
+      try {
+        await scanBatch();
+      } catch (error) {
+        lastScanError =
+          error.message;
+      }
 
-      return res.json({
+      for (const [
+        ,
+        value
+      ] of resultCache.entries()) {
+        if (
+          Date.now() -
+            value.timestamp <=
+          RESULT_TTL_MS
+        ) {
+          if (value.result) {
+            results.push(
+              value.result
+            );
+          }
+        }
+      }
+    }
 
-        ok: true,
+    const best =
+      chooseBest(results);
 
-        version:
-          VERSION,
-
-        source:
-          SOURCE,
-
-        mode:
-          "CACHE",
-
-        pair,
-
-        best:
-          cached.result,
-
-        results:
-          [cached.result],
-
+    if (!best) {
+      return res.status(503).json({
+        ok: false,
+        version: VERSION,
+        error:
+          quotaBlocked
+            ? (
+                providerQuotaMessage ||
+                'Twelve Data quota is blocked.'
+              )
+            : 'No selected market is currently available.',
+        quotaBlocked,
+        quotaResetAt:
+          providerQuotaResetAt,
+        cachedResults:
+          results.length,
         time:
           new Date().toISOString()
       });
     }
 
+    res.json({
+      ok: true,
+      version: VERSION,
+      selectedMarket: best,
+      scannedResults:
+        results.length,
+      quotaBlocked,
+      time:
+        new Date().toISOString()
+    });
+  }
+);
 
-    /*
-      Do not request if quota blocked.
-    */
+/* ---------------------------------------------------------
+   COMPATIBILITY ROUTE
+   --------------------------------------------------------- */
 
-    if (
-      scanner.quotaBlocked
-    ) {
-
-      return res.status(503).json({
-
-        ok: false,
-
-        error:
-          "Twelve Data daily quota is exhausted.",
-
-        quotaResetAt:
-          scanner.quotaResetAt
-      });
-    }
-
-
+app.get(
+  '/api/selected',
+  async (req, res) => {
     try {
-
-      const candles =
-        await fetchCandles(
-          pair
-        );
-
-
       const results = [];
 
-
-      for (
-        const timeframe of TIMEFRAMES
-      ) {
-
-        const result =
-          analyzeCandles(
-            pair,
-            timeframe,
-            candles
-          );
-
-
-        if (result) {
-
-          results.push(
-            result
-          );
+      for (const [
+        ,
+        value
+      ] of resultCache.entries()) {
+        if (
+          Date.now() -
+            value.timestamp <=
+          RESULT_TTL_MS
+        ) {
+          if (value.result) {
+            results.push(
+              value.result
+            );
+          }
         }
       }
 
+      const best =
+        chooseBest(results);
 
-      if (
-        !results.length
-      ) {
-
+      if (!best) {
         return res.status(503).json({
-
           ok: false,
-
           error:
-            "Unable to create valid analysis from current candles."
+            quotaBlocked
+              ? (
+                  providerQuotaMessage ||
+                  'Twelve Data quota is blocked.'
+                )
+              : 'No selected market is currently available.',
+          quotaBlocked,
+          quotaResetAt:
+            providerQuotaResetAt
         });
       }
 
-
-      results.sort(
-        (a, b) =>
-          rankResult(b) -
-          rankResult(a)
-      );
-
-
-      const best =
-        results[0];
-
-
-      cacheResult(
-        pair,
-        best
-      );
-
-
       res.json({
-
         ok: true,
-
-        version:
-          VERSION,
-
-        source:
-          SOURCE,
-
-        mode:
-          "PAIR",
-
-        pair,
-
-        best,
-
-        results,
-
-        time:
-          new Date().toISOString()
+        version: VERSION,
+        selectedMarket: best
       });
-
-
     } catch (error) {
-
-      const message =
-        error?.message ||
-        String(error);
-
-
-      if (
-        isQuotaError(message)
-      ) {
-
-        blockQuota(
-          message
-        );
-      }
-
-
-      res.status(503).json({
-
+      res.status(500).json({
         ok: false,
-
-        pair,
-
-        error:
-          message,
-
-        quotaBlocked:
-          scanner.quotaBlocked,
-
-        quotaResetAt:
-          scanner.quotaResetAt
+        error: error.message
       });
     }
   }
 );
-
-
-/* =========================================================
-   ROOT
-   ========================================================= */
-
-app.get(
-  "/",
-  (req, res) => {
-
-    res.json({
-
-      ok: true,
-
-      name:
-        "PO AI Predictor API",
-
-      version:
-        VERSION,
-
-      source:
-        SOURCE,
-
-      timezone:
-        TIMEZONE,
-
-      status:
-        scanner.quotaBlocked
-          ? "QUOTA_PAUSED"
-          : "ONLINE",
-
-      endpoints: [
-        "/api/health",
-        "/api/scanner",
-        "/api/analyze",
-        "/api/analyze/:pair"
-      ],
-
-      time:
-        new Date().toISOString()
-    });
-  }
-);
-
 
 /* =========================================================
    404
@@ -3349,75 +2165,23 @@ app.get(
 
 app.use(
   (req, res) => {
-
     res.status(404).json({
-
       ok: false,
-
-      error:
-        "Endpoint not found.",
-
-      path:
-        req.path
+      error: 'Endpoint not found.',
+      version: VERSION
     });
   }
 );
 
-
 /* =========================================================
-   GLOBAL ERROR HANDLER
-   ========================================================= */
-
-app.use(
-  (
-    error,
-    req,
-    res,
-    next
-  ) => {
-
-    console.error(
-      "[GLOBAL ERROR]",
-      error
-    );
-
-
-    if (
-      res.headersSent
-    ) {
-      return next(error);
-    }
-
-
-    res.status(500).json({
-
-      ok: false,
-
-      version:
-        VERSION,
-
-      error:
-        "Internal server error."
-    });
-  }
-);
-
-
-/* =========================================================
-   START SERVER
+   SERVER
    ========================================================= */
 
 app.listen(
   PORT,
   () => {
-
-    scanner.quotaResetAt =
-      getNextUtcMidnight()
-        .toISOString();
-
-
     console.log(
-      "================================================="
+      '=============================================='
     );
 
     console.log(
@@ -3425,11 +2189,11 @@ app.listen(
     );
 
     console.log(
-      `Source: ${SOURCE}`
+      'Source: Twelve Data LIVE'
     );
 
     console.log(
-      `Timezone: ${TIMEZONE}`
+      `Port: ${PORT}`
     );
 
     console.log(
@@ -3437,19 +2201,7 @@ app.listen(
     );
 
     console.log(
-      `Timeframes: ${TIMEFRAMES.join(", ")}`
-    );
-
-    console.log(
-      `Daily limit: ${DAILY_CREDIT_LIMIT}`
-    );
-
-    console.log(
-      `Safety reserve: ${DAILY_SAFETY_RESERVE}`
-    );
-
-    console.log(
-      `Max daily requests: ${MAX_DAILY_REQUESTS}`
+      `Timeframes: ${TIMEFRAMES.join(', ')} minutes`
     );
 
     console.log(
@@ -3461,100 +2213,89 @@ app.listen(
     );
 
     console.log(
-      `Next UTC reset: ${scanner.quotaResetAt}`
+      `Cache TTL: ${CACHE_TTL_MS / 60000} minutes`
     );
 
     console.log(
-      "================================================="
+      `Daily safe request budget: ${MAX_DAILY_REQUESTS}`
+    );
+
+    console.log(
+      `API key configured: ${Boolean(
+        TWELVE_DATA_API_KEY
+      )}`
+    );
+
+    console.log(
+      '=============================================='
     );
   }
 );
-
 
 /* =========================================================
    AUTOMATIC SCANNER
    ========================================================= */
 
 /*
-   Start after a short delay so Render has time to boot.
+  Delayed startup prevents Render restart from immediately
+  consuming an API request.
 */
-
 setTimeout(
   async () => {
-
     try {
+      console.log(
+        '[SCANNER] Initial controlled scan starting...'
+      );
 
       await scanBatch();
-
     } catch (error) {
+      lastScanError =
+        error.message;
 
       console.error(
-        "[INITIAL SCAN ERROR]",
-        error
+        '[SCANNER] Initial scan error:',
+        error.message
       );
     }
-
   },
-  5000
+  10000
 );
-
 
 /*
-   Rotate through the 24 supported pairs.
-
-   IMPORTANT:
-   This interval is intentionally 15 minutes so the
-   free 800/day quota is not consumed immediately.
+  Every 15 minutes:
+  - check quota
+  - scan only one small batch
+  - never scan all 24 at once
 */
-
 setInterval(
   async () => {
+    resetDailyStateIfNeeded();
 
-    resetDailyBudgetIfNeeded();
-
-
-    if (
-      scanner.quotaBlocked
-    ) {
-
+    if (quotaBlocked) {
+      console.log(
+        '[SCANNER] Skipped — Twelve Data quota blocked.'
+      );
       return;
     }
 
-
-    if (
-      scanner.running
-    ) {
-
+    if (scanRunning) {
+      console.log(
+        '[SCANNER] Skipped — previous scan still running.'
+      );
       return;
     }
-
 
     try {
-
       await scanBatch();
-
     } catch (error) {
+      lastScanError =
+        error.message;
 
       console.error(
-        "[SCHEDULED SCAN ERROR]",
-        error
+        '[SCANNER] Error:',
+        error.message
       );
     }
-
   },
   SCAN_EVERY_MS
-);
-
-
-/* =========================================================
-   PERIODIC DAILY RESET CHECK
-   ========================================================= */
-
-setInterval(
-  () => {
-
-    resetDailyBudgetIfNeeded();
-
-  },
-  60 * 1000
 );
