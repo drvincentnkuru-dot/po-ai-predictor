@@ -8,7 +8,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-const VERSION = "V8.3.3";
+const VERSION = "V8.3.4";
 const SOURCE = "Twelve Data LIVE";
 const TIMEZONE = "UTC";
 
@@ -57,11 +57,32 @@ const TIMEFRAMES = [1, 2, 3];
 const MAX_CANDLES = 180;
 const MIN_CANDLES = 60;
 
-const SCAN_BATCH_SIZE = 8;
+/*
+ * Twelve Data account limit observed:
+ * 8 API credits / minute.
+ *
+ * We deliberately stay below the limit.
+ */
+const API_CREDITS_PER_MINUTE = 8;
+
+/*
+ * One batch = 8 pairs.
+ */
+const SCAN_BATCH_SIZE =
+  API_CREDITS_PER_MINUTE;
+
+/*
+ * One batch per UTC minute.
+ */
 const SCAN_EVERY_MS = 60000;
 
 const FETCH_TIMEOUT_MS = 12000;
-const REQUEST_DELAY_MS = 150;
+
+/*
+ * Small delay between requests.
+ * This is NOT used to bypass the minute limit.
+ */
+const REQUEST_DELAY_MS = 1000;
 
 const ENTRY_BUFFER_SECONDS = 30;
 
@@ -82,23 +103,39 @@ const cache = new Map();
 const failedPairs = new Map();
 
 let scanCursor = 0;
+
 let scanRunning = false;
+
 let lastScanAt = null;
+
 let lastScanError = null;
+
 let totalScanned = 0;
+
 let totalFailed = 0;
+
+let totalApiRequests = 0;
+
+let currentMinuteKey = null;
+
+let requestsThisMinute = 0;
 
 
 /* =========================================================
-   HELPERS
+   BASIC HELPERS
 ========================================================= */
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
 }
 
 function round(value, digits = 5) {
@@ -106,7 +143,9 @@ function round(value, digits = 5) {
     return null;
   }
 
-  return Number(value.toFixed(digits));
+  return Number(
+    value.toFixed(digits)
+  );
 }
 
 function nowMs() {
@@ -131,54 +170,183 @@ function cacheKey(pair, timeframe) {
 
 
 /* =========================================================
+   API MINUTE BUDGET
+========================================================= */
+
+function getMinuteKey() {
+  const now = new Date();
+
+  return (
+    now.getUTCFullYear() +
+    "-" +
+    String(
+      now.getUTCMonth() + 1
+    ).padStart(2, "0") +
+    "-" +
+    String(
+      now.getUTCDate()
+    ).padStart(2, "0") +
+    "T" +
+    String(
+      now.getUTCHours()
+    ).padStart(2, "0") +
+    ":" +
+    String(
+      now.getUTCMinutes()
+    ).padStart(2, "0")
+  );
+}
+
+function refreshMinuteBudget() {
+  const key =
+    getMinuteKey();
+
+  if (
+    currentMinuteKey !== key
+  ) {
+    currentMinuteKey = key;
+
+    requestsThisMinute = 0;
+  }
+}
+
+function canUseApiCredit() {
+  refreshMinuteBudget();
+
+  return (
+    requestsThisMinute <
+    API_CREDITS_PER_MINUTE
+  );
+}
+
+function registerApiRequest() {
+  refreshMinuteBudget();
+
+  requestsThisMinute += 1;
+
+  totalApiRequests += 1;
+}
+
+function millisecondsUntilNextMinute() {
+  const now = new Date();
+
+  const next =
+    new Date(
+      now.getTime()
+    );
+
+  next.setUTCSeconds(0, 0);
+
+  next.setUTCMinutes(
+    next.getUTCMinutes() + 1
+  );
+
+  return Math.max(
+    1000,
+    next.getTime() -
+      now.getTime()
+  );
+}
+
+async function waitForApiBudget() {
+  refreshMinuteBudget();
+
+  if (
+    requestsThisMinute <
+    API_CREDITS_PER_MINUTE
+  ) {
+    return true;
+  }
+
+  const waitMs =
+    millisecondsUntilNextMinute();
+
+  console.log(
+    `[API LIMIT] 8 credits used. Waiting ${Math.ceil(waitMs / 1000)}s for next UTC minute.`
+  );
+
+  await sleep(waitMs + 250);
+
+  refreshMinuteBudget();
+
+  return (
+    requestsThisMinute <
+    API_CREDITS_PER_MINUTE
+  );
+}
+
+
+/* =========================================================
    TIME
 ========================================================= */
 
 function nextEntryTime(
   timeframe,
-  minimumBufferSeconds = ENTRY_BUFFER_SECONDS
+  minimumBufferSeconds =
+    ENTRY_BUFFER_SECONDS
 ) {
-  const now = nowMs();
+  const now =
+    nowMs();
 
   const timeframeMs =
-    timeframe * 60 * 1000;
+    timeframe *
+    60 *
+    1000;
 
   let next =
-    Math.floor(now / timeframeMs) *
+    Math.floor(
+      now / timeframeMs
+    ) *
       timeframeMs +
     timeframeMs;
 
   const minimum =
     now +
-    minimumBufferSeconds * 1000;
+    minimumBufferSeconds *
+      1000;
 
-  while (next < minimum) {
+  while (
+    next < minimum
+  ) {
     next += timeframeMs;
   }
 
   return next;
 }
 
-function buildEntryExpiry(timeframe) {
+function buildEntryExpiry(
+  timeframe
+) {
   const entryMs =
-    nextEntryTime(timeframe);
+    nextEntryTime(
+      timeframe
+    );
 
   const expiryMs =
     entryMs +
-    timeframe * 60 * 1000;
+    timeframe *
+      60 *
+      1000;
 
   return {
     entryTime:
-      new Date(entryMs).toISOString(),
+      new Date(
+        entryMs
+      ).toISOString(),
 
     expiryTime:
-      new Date(expiryMs).toISOString(),
+      new Date(
+        expiryMs
+      ).toISOString(),
 
     entryInSeconds:
       Math.max(
         0,
         Math.ceil(
-          (entryMs - nowMs()) / 1000
+          (
+            entryMs -
+            nowMs()
+          ) / 1000
         )
       )
   };
@@ -186,9 +354,13 @@ function buildEntryExpiry(timeframe) {
 
 function parseTimeMs(value) {
   const parsed =
-    Date.parse(value || "");
+    Date.parse(
+      value || ""
+    );
 
-  return Number.isFinite(parsed)
+  return Number.isFinite(
+    parsed
+  )
     ? parsed
     : null;
 }
@@ -198,50 +370,60 @@ function parseTimeMs(value) {
    CACHE VALIDATION
 ========================================================= */
 
-function isResultFresh(result) {
+function isResultFresh(
+  result
+) {
   if (!result) {
     return false;
   }
 
-  if (result.freshness?.stale === true) {
+  if (
+    result.freshness?.stale ===
+    true
+  ) {
     return false;
   }
 
   const generatedMs =
-    parseTimeMs(result.generatedAt);
+    parseTimeMs(
+      result.generatedAt
+    );
 
   if (!generatedMs) {
     return false;
   }
 
   const ageSeconds =
-    (nowMs() - generatedMs) / 1000;
+    (
+      nowMs() -
+      generatedMs
+    ) / 1000;
 
-  if (
-    ageSeconds >
+  return (
+    ageSeconds <=
     HARD_STALE_SECONDS
-  ) {
-    return false;
-  }
-
-  return true;
+  );
 }
 
-function isEntryStillValid(result) {
+function isEntryStillValid(
+  result
+) {
   if (!result) {
     return false;
   }
 
   const entryMs =
-    parseTimeMs(result.entryTime);
+    parseTimeMs(
+      result.entryTime
+    );
 
   if (!entryMs) {
     return false;
   }
 
-  const now = nowMs();
-
-  if (now >= entryMs) {
+  if (
+    nowMs() >= entryMs
+  ) {
     return false;
   }
 
@@ -249,14 +431,19 @@ function isEntryStillValid(result) {
     Math.max(
       0,
       Math.ceil(
-        (entryMs - now) / 1000
+        (
+          entryMs -
+          nowMs()
+        ) / 1000
       )
     );
 
   return true;
 }
 
-function isUsableCachedResult(result) {
+function isUsableCachedResult(
+  result
+) {
   return (
     result &&
     isResultFresh(result) &&
@@ -265,9 +452,16 @@ function isUsableCachedResult(result) {
 }
 
 function cleanupExpiredCache() {
-  for (const [key, value] of cache.entries()) {
+  for (
+    const [
+      key,
+      value
+    ] of cache.entries()
+  ) {
     if (
-      !isUsableCachedResult(value)
+      !isUsableCachedResult(
+        value
+      )
     ) {
       cache.delete(key);
     }
@@ -276,34 +470,45 @@ function cleanupExpiredCache() {
 
 
 /* =========================================================
-   TWELVE DATA FETCH
+   TWELVE DATA
 ========================================================= */
 
-/*
- * IMPORTANT:
- *
- * Twelve Data Forex symbols are sent in the original
- * "BASE/QUOTE" format.
- *
- * Example:
- * EUR/USD
- * CAD/CHF
- *
- * We DO NOT convert CAD/CHF -> CADCHF.
- */
-
-async function fetchCandles(pair) {
+async function fetchCandles(
+  pair
+) {
   if (!API_KEY) {
     throw new Error(
       "TWELVE_DATA_API_KEY is not configured"
     );
   }
 
+  /*
+   * Do NOT convert:
+   * CAD/CHF -> CADCHF
+   *
+   * Twelve Data receives the real Forex symbol.
+   */
   const normalized =
     normalizePair(pair);
 
+  /*
+   * Respect the local API budget.
+   */
+  const budgetAvailable =
+    await waitForApiBudget();
+
+  if (!budgetAvailable) {
+    throw new Error(
+      `${normalized}: API minute budget unavailable`
+    );
+  }
+
+  registerApiRequest();
+
   const symbol =
-    encodeURIComponent(normalized);
+    encodeURIComponent(
+      normalized
+    );
 
   const url =
     "https://api.twelvedata.com/time_series" +
@@ -312,40 +517,49 @@ async function fetchCandles(pair) {
     `&outputsize=${MAX_CANDLES}` +
     "&order=ASC" +
     "&timezone=UTC" +
-    `&apikey=${encodeURIComponent(API_KEY)}`;
+    `&apikey=${encodeURIComponent(
+      API_KEY
+    )}`;
 
   const controller =
     new AbortController();
 
   const timeout =
     setTimeout(
-      () => controller.abort(),
+      () => {
+        controller.abort();
+      },
       FETCH_TIMEOUT_MS
     );
 
   try {
     const response =
-      await fetch(url, {
-        method: "GET",
-        signal: controller.signal,
-        headers: {
-          Accept: "application/json"
-        }
-      });
+      await fetch(
+        url,
+        {
+          method: "GET",
+          signal:
+            controller.signal,
 
-    /*
-     * Read JSON even when HTTP status is not 200.
-     * This lets us expose the real Twelve Data message.
-     */
+          headers: {
+            Accept:
+              "application/json"
+          }
+        }
+      );
+
     let json = null;
 
     try {
-      json = await response.json();
+      json =
+        await response.json();
     } catch {
       json = null;
     }
 
-    if (!response.ok) {
+    if (
+      !response.ok
+    ) {
       const message =
         json?.message ||
         `Twelve Data HTTP ${response.status}`;
@@ -356,8 +570,8 @@ async function fetchCandles(pair) {
     }
 
     if (
-      json &&
-      json.status === "error"
+      json?.status ===
+      "error"
     ) {
       throw new Error(
         `${normalized}: ${
@@ -368,8 +582,9 @@ async function fetchCandles(pair) {
     }
 
     if (
-      !json ||
-      !Array.isArray(json.values)
+      !Array.isArray(
+        json?.values
+      )
     ) {
       throw new Error(
         `${normalized}: No candle values returned`
@@ -381,61 +596,86 @@ async function fetchCandles(pair) {
 
     const candles =
       json.values
-        .map(candle => {
-          /*
-           * Twelve Data returns UTC datetime when
-           * timezone=UTC is requested.
-           */
-          const rawDatetime =
-            String(
-              candle.datetime || ""
-            );
 
-          const time =
-            Date.parse(
-              rawDatetime.endsWith("Z")
-                ? rawDatetime
-                : `${rawDatetime}Z`
-            );
+        .map(
+          candle => {
+            const rawDatetime =
+              String(
+                candle.datetime ||
+                ""
+              );
 
-          return {
-            time,
+            const time =
+              Date.parse(
+                rawDatetime.endsWith(
+                  "Z"
+                )
+                  ? rawDatetime
+                  : `${rawDatetime}Z`
+              );
 
-            datetime:
-              Number.isFinite(time)
-                ? new Date(time).toISOString()
-                : null,
+            return {
+              time,
 
-            open:
-              Number(candle.open),
+              datetime:
+                Number.isFinite(
+                  time
+                )
+                  ? new Date(
+                      time
+                    ).toISOString()
+                  : null,
 
-            high:
-              Number(candle.high),
+              open:
+                Number(
+                  candle.open
+                ),
 
-            low:
-              Number(candle.low),
+              high:
+                Number(
+                  candle.high
+                ),
 
-            close:
-              Number(candle.close),
+              low:
+                Number(
+                  candle.low
+                ),
 
-            volume:
-              Number(candle.volume || 0)
-          };
-        })
+              close:
+                Number(
+                  candle.close
+                ),
 
-        /*
-         * Keep only valid candles.
-         */
-        .filter(candle =>
-          Number.isFinite(candle.time) &&
-          Number.isFinite(candle.open) &&
-          Number.isFinite(candle.high) &&
-          Number.isFinite(candle.low) &&
-          Number.isFinite(candle.close)
+              volume:
+                Number(
+                  candle.volume ||
+                    0
+                )
+            };
+          }
+        )
+
+        .filter(
+          candle =>
+            Number.isFinite(
+              candle.time
+            ) &&
+            Number.isFinite(
+              candle.open
+            ) &&
+            Number.isFinite(
+              candle.high
+            ) &&
+            Number.isFinite(
+              candle.low
+            ) &&
+            Number.isFinite(
+              candle.close
+            )
         )
 
         /*
-         * Do not analyze an unfinished current candle.
+         * Completed candles only.
          */
         .filter(
           candle =>
@@ -448,7 +688,9 @@ async function fetchCandles(pair) {
             a.time - b.time
         )
 
-        .slice(-MAX_CANDLES);
+        .slice(
+          -MAX_CANDLES
+        );
 
     if (
       candles.length <
@@ -474,38 +716,53 @@ async function fetchCandles(pair) {
     throw error;
 
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(
+      timeout
+    );
   }
 }
 
 
 /* =========================================================
-   CANDLE AGGREGATION
+   AGGREGATION
 ========================================================= */
 
 function aggregateCandles(
   candles,
   timeframe
 ) {
-  if (timeframe === 1) {
+  if (
+    timeframe === 1
+  ) {
     return candles.slice();
   }
 
   const timeframeMs =
-    timeframe * 60 * 1000;
+    timeframe *
+    60 *
+    1000;
 
   const groups =
     new Map();
 
-  for (const candle of candles) {
+  for (
+    const candle
+    of candles
+  ) {
     const bucket =
       Math.floor(
         candle.time /
           timeframeMs
-      ) * timeframeMs;
+      ) *
+      timeframeMs;
 
-    if (!groups.has(bucket)) {
-      groups.set(bucket, []);
+    if (
+      !groups.has(bucket)
+    ) {
+      groups.set(
+        bucket,
+        []
+      );
     }
 
     groups
@@ -516,12 +773,12 @@ function aggregateCandles(
   const output = [];
 
   for (
-    const [bucket, group]
+    const [
+      bucket,
+      group
+    ]
     of groups.entries()
   ) {
-    /*
-     * Only use complete timeframe groups.
-     */
     if (
       group.length !==
       timeframe
@@ -538,14 +795,18 @@ function aggregateCandles(
       group[0];
 
     const last =
-      group[group.length - 1];
+      group[
+        group.length - 1
+      ];
 
     output.push({
-      time: bucket,
+      time:
+        bucket,
 
       datetime:
-        new Date(bucket)
-          .toISOString(),
+        new Date(
+          bucket
+        ).toISOString(),
 
       open:
         first.open,
@@ -571,9 +832,15 @@ function aggregateCandles(
 
       volume:
         group.reduce(
-          (sum, candle) =>
+          (
+            sum,
+            candle
+          ) =>
             sum +
-            (candle.volume || 0),
+            (
+              candle.volume ||
+              0
+            ),
           0
         )
     });
@@ -584,7 +851,9 @@ function aggregateCandles(
       (a, b) =>
         a.time - b.time
     )
-    .slice(-MAX_CANDLES);
+    .slice(
+      -MAX_CANDLES
+    );
 }
 
 
@@ -604,15 +873,21 @@ function ema(
   }
 
   const multiplier =
-    2 / (period + 1);
+    2 /
+    (period + 1);
 
   let result =
     values
-      .slice(0, period)
+      .slice(
+        0,
+        period
+      )
       .reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
-      ) / period;
+      ) /
+    period;
 
   for (
     let i = period;
@@ -620,7 +895,10 @@ function ema(
     i++
   ) {
     result =
-      (values[i] - result) *
+      (
+        values[i] -
+        result
+      ) *
         multiplier +
       result;
   }
@@ -656,11 +934,15 @@ function rsi(
       values[i] -
       values[i - 1];
 
-    if (change >= 0) {
+    if (
+      change >= 0
+    ) {
       gains += change;
     } else {
       losses +=
-        Math.abs(change);
+        Math.abs(
+          change
+        );
     }
   }
 
@@ -671,7 +953,8 @@ function rsi(
     losses / period;
 
   for (
-    let i = period + 1;
+    let i =
+      period + 1;
     i < values.length;
     i++
   ) {
@@ -686,7 +969,9 @@ function rsi(
 
     const loss =
       change < 0
-        ? Math.abs(change)
+        ? Math.abs(
+            change
+          )
         : 0;
 
     avgGain =
@@ -694,26 +979,32 @@ function rsi(
         avgGain *
           (period - 1) +
         gain
-      ) / period;
+      ) /
+      period;
 
     avgLoss =
       (
         avgLoss *
           (period - 1) +
         loss
-      ) / period;
+      ) /
+      period;
   }
 
-  if (avgLoss === 0) {
+  if (
+    avgLoss === 0
+  ) {
     return 100;
   }
 
   const rs =
-    avgGain / avgLoss;
+    avgGain /
+    avgLoss;
 
   return (
     100 -
-    100 / (1 + rs)
+    100 /
+      (1 + rs)
   );
 }
 
@@ -774,11 +1065,16 @@ function atr(
 
   let result =
     trs
-      .slice(0, period)
+      .slice(
+        0,
+        period
+      )
       .reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
-      ) / period;
+      ) /
+    period;
 
   for (
     let i = period;
@@ -790,7 +1086,8 @@ function atr(
         result *
           (period - 1) +
         trs[i]
-      ) / period;
+      ) /
+      period;
   }
 
   return result;
@@ -878,27 +1175,42 @@ function adx(
 
   let trAvg =
     trs
-      .slice(0, period)
+      .slice(
+        0,
+        period
+      )
       .reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
-      ) / period;
+      ) /
+    period;
 
   let plusAvg =
     plusDM
-      .slice(0, period)
+      .slice(
+        0,
+        period
+      )
       .reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
-      ) / period;
+      ) /
+    period;
 
   let minusAvg =
     minusDM
-      .slice(0, period)
+      .slice(
+        0,
+        period
+      )
       .reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
-      ) / period;
+      ) /
+    period;
 
   const dxValues = [];
 
@@ -912,23 +1224,28 @@ function adx(
         trAvg *
           (period - 1) +
         trs[i]
-      ) / period;
+      ) /
+      period;
 
     plusAvg =
       (
         plusAvg *
           (period - 1) +
         plusDM[i]
-      ) / period;
+      ) /
+      period;
 
     minusAvg =
       (
         minusAvg *
           (period - 1) +
         minusDM[i]
-      ) / period;
+      ) /
+      period;
 
-    if (trAvg === 0) {
+    if (
+      trAvg === 0
+    ) {
       continue;
     }
 
@@ -971,11 +1288,16 @@ function adx(
 
   let adxValue =
     dxValues
-      .slice(0, period)
+      .slice(
+        0,
+        period
+      )
       .reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
-      ) / period;
+      ) /
+    period;
 
   for (
     let i = period;
@@ -987,7 +1309,8 @@ function adx(
         adxValue *
           (period - 1) +
         dxValues[i]
-      ) / period;
+      ) /
+      period;
   }
 
   return adxValue;
@@ -1004,7 +1327,9 @@ function supportResistance(
   const recent =
     candles.slice(-40);
 
-  if (!recent.length) {
+  if (
+    !recent.length
+  ) {
     return {
       support: null,
       resistance: null
@@ -1095,7 +1420,8 @@ function candlePattern(
     return {
       name:
         "BULLISH ENGULFING",
-      direction: "CALL",
+      direction:
+        "CALL",
       strength: 8
     };
   }
@@ -1113,7 +1439,8 @@ function candlePattern(
     return {
       name:
         "BEARISH ENGULFING",
-      direction: "PUT",
+      direction:
+        "PUT",
       strength: 8
     };
   }
@@ -1128,8 +1455,10 @@ function candlePattern(
         range * 0.55
   ) {
     return {
-      name: "HAMMER",
-      direction: "CALL",
+      name:
+        "HAMMER",
+      direction:
+        "CALL",
       strength: 6
     };
   }
@@ -1146,7 +1475,8 @@ function candlePattern(
     return {
       name:
         "SHOOTING STAR",
-      direction: "PUT",
+      direction:
+        "PUT",
       strength: 6
     };
   }
@@ -1160,7 +1490,8 @@ function candlePattern(
     return {
       name:
         "BULLISH PIN BAR",
-      direction: "CALL",
+      direction:
+        "CALL",
       strength: 5
     };
   }
@@ -1174,7 +1505,8 @@ function candlePattern(
     return {
       name:
         "BEARISH PIN BAR",
-      direction: "PUT",
+      direction:
+        "PUT",
       strength: 5
     };
   }
@@ -1203,8 +1535,12 @@ function candlePattern(
     range * 0.15
   ) {
     return {
-      name: "DOJI",
-      direction: "NONE",
+      name:
+        "DOJI",
+
+      direction:
+        "NONE",
+
       strength: 0
     };
   }
@@ -1368,10 +1704,18 @@ function priceActionScore(
 
   return {
     call:
-      clamp(call, 0, 25),
+      clamp(
+        call,
+        0,
+        25
+      ),
 
     put:
-      clamp(put, 0, 25),
+      clamp(
+        put,
+        0,
+        25
+      ),
 
     description:
       call > put
@@ -1419,7 +1763,9 @@ function classifyTrend(
       return "STRONG UPTREND";
     }
 
-    if (difference > 0) {
+    if (
+      difference > 0
+    ) {
       return "UPTREND";
     }
   }
@@ -1434,7 +1780,9 @@ function classifyTrend(
       return "STRONG DOWNTREND";
     }
 
-    if (difference > 0) {
+    if (
+      difference > 0
+    ) {
       return "DOWNTREND";
     }
   }
@@ -1454,10 +1802,18 @@ function locationAnalysis(
   atrValue
 ) {
   if (
-    !Number.isFinite(price) ||
-    !Number.isFinite(support) ||
-    !Number.isFinite(resistance) ||
-    !Number.isFinite(atrValue)
+    !Number.isFinite(
+      price
+    ) ||
+    !Number.isFinite(
+      support
+    ) ||
+    !Number.isFinite(
+      resistance
+    ) ||
+    !Number.isFinite(
+      atrValue
+    )
   ) {
     return {
       blocked: false,
@@ -1468,13 +1824,16 @@ function locationAnalysis(
   }
 
   const distanceSupport =
-    price - support;
+    price -
+    support;
 
   const distanceResistance =
-    resistance - price;
+    resistance -
+    price;
 
   const totalRange =
-    resistance - support;
+    resistance -
+    support;
 
   if (
     totalRange <
@@ -1547,7 +1906,7 @@ function locationAnalysis(
 
 
 /* =========================================================
-   ANALYZE CANDLES
+   ANALYSIS
 ========================================================= */
 
 function analyzeCandles(
@@ -1563,7 +1922,8 @@ function analyzeCandles(
 
   if (
     candles.length <
-    MIN_CANDLES / timeframe
+    MIN_CANDLES /
+      timeframe
   ) {
     return null;
   }
@@ -1575,19 +1935,34 @@ function analyzeCandles(
     );
 
   const ema9Value =
-    ema(closes, 9);
+    ema(
+      closes,
+      9
+    );
 
   const ema21Value =
-    ema(closes, 21);
+    ema(
+      closes,
+      21
+    );
 
   const rsiValue =
-    rsi(closes, 14);
+    rsi(
+      closes,
+      14
+    );
 
   const atrValue =
-    atr(candles, 14);
+    atr(
+      candles,
+      14
+    );
 
   const adxValue =
-    adx(candles, 14);
+    adx(
+      candles,
+      14
+    );
 
   const last =
     candles[
@@ -1652,10 +2027,7 @@ function analyzeCandles(
   let putScore = 0;
 
 
-  /* =======================================================
-     EMA
-  ======================================================= */
-
+  /* EMA */
   if (
     Number.isFinite(
       ema9Value
@@ -1669,7 +2041,9 @@ function analyzeCandles(
       ema21Value
     ) {
       callScore += 28;
-    } else if (
+    }
+
+    if (
       ema9Value <
       ema21Value
     ) {
@@ -1678,10 +2052,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     RSI
-  ======================================================= */
-
+  /* RSI */
   if (
     Number.isFinite(
       rsiValue
@@ -1715,10 +2086,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     ADX
-  ======================================================= */
-
+  /* ADX */
   if (
     Number.isFinite(
       adxValue
@@ -1751,10 +2119,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     PRICE VS EMA21
-  ======================================================= */
-
+  /* PRICE VS EMA */
   if (
     Number.isFinite(
       ema21Value
@@ -1776,10 +2141,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     SUPPORT / RESISTANCE
-  ======================================================= */
-
+  /* SUPPORT / RESISTANCE */
   if (
     Number.isFinite(
       sr.support
@@ -1810,10 +2172,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     CANDLE PATTERN
-  ======================================================= */
-
+  /* CANDLE */
   if (
     pattern.direction ===
     "CALL"
@@ -1831,10 +2190,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     PRICE ACTION
-  ======================================================= */
-
+  /* PRICE ACTION */
   callScore +=
     pa.call;
 
@@ -1844,14 +2200,18 @@ function analyzeCandles(
 
   callScore =
     clamp(
-      Math.round(callScore),
+      Math.round(
+        callScore
+      ),
       0,
       100
     );
 
   putScore =
     clamp(
-      Math.round(putScore),
+      Math.round(
+        putScore
+      ),
       0,
       100
     );
@@ -1874,13 +2234,15 @@ function analyzeCandles(
     callScore >= 65 &&
     difference >= 15
   ) {
-    signal = "CALL";
+    signal =
+      "CALL";
 
   } else if (
     putScore >= 65 &&
     difference >= 15
   ) {
-    signal = "PUT";
+    signal =
+      "PUT";
   }
 
 
@@ -1923,10 +2285,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     LOCATION FILTER
-  ======================================================= */
-
+  /* LOCATION */
   if (
     signal !== "NO TRADE" &&
     location.blocked
@@ -1936,10 +2295,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     FRESHNESS FILTER
-  ======================================================= */
-
+  /* FRESHNESS */
   if (
     !dataFresh ||
     stale
@@ -1949,19 +2305,13 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     ENTRY / EXPIRY
-  ======================================================= */
-
   const schedule =
     buildEntryExpiry(
       timeframe
     );
 
 
-  /* =======================================================
-     CONFIDENCE
-  ======================================================= */
+  /* CONFIDENCE */
 
   let confidence;
 
@@ -1975,7 +2325,8 @@ function analyzeCandles(
           (
             callScore -
             65
-          ) * 0.9 +
+          ) *
+            0.9 +
           difference *
             0.35
         ),
@@ -1993,7 +2344,8 @@ function analyzeCandles(
           (
             putScore -
             65
-          ) * 0.9 +
+          ) *
+            0.9 +
           difference *
             0.35
         ),
@@ -2008,7 +2360,8 @@ function analyzeCandles(
           Math.max(
             callScore,
             putScore
-          ) * 0.65
+          ) *
+            0.65
         ),
         40,
         69
@@ -2016,9 +2369,7 @@ function analyzeCandles(
   }
 
 
-  /* =======================================================
-     REASONS
-  ======================================================= */
+  /* REASONS */
 
   const reasons = [];
 
@@ -2051,14 +2402,17 @@ function analyzeCandles(
   }
 
   if (
-    pattern.name !== "NONE"
+    pattern.name !==
+    "NONE"
   ) {
     reasons.push(
       pattern.name
     );
   }
 
-  if (!dataFresh) {
+  if (
+    !dataFresh
+  ) {
     reasons.push(
       `DATA AGE ${Math.round(
         lastCandleAgeSeconds
@@ -2066,32 +2420,36 @@ function analyzeCandles(
     );
   }
 
-  if (stale) {
+  if (
+    stale
+  ) {
     reasons.push(
       "HARD STALE DATA"
     );
   }
 
 
-  /* =======================================================
-     RESULT
-  ======================================================= */
-
   return {
     pair,
+
     timeframe,
 
     signal,
+
     confidence,
 
     trend,
 
     callScore,
+
     putScore,
+
     difference,
 
     entryPrice:
-      round(last.close),
+      round(
+        last.close
+      ),
 
     entryTime:
       schedule.entryTime,
@@ -2103,25 +2461,42 @@ function analyzeCandles(
       schedule.entryInSeconds,
 
     support:
-      round(sr.support),
+      round(
+        sr.support
+      ),
 
     resistance:
-      round(sr.resistance),
+      round(
+        sr.resistance
+      ),
 
     ema9:
-      round(ema9Value),
+      round(
+        ema9Value
+      ),
 
     ema21:
-      round(ema21Value),
+      round(
+        ema21Value
+      ),
 
     rsi:
-      round(rsiValue, 2),
+      round(
+        rsiValue,
+        2
+      ),
 
     adx:
-      round(adxValue, 2),
+      round(
+        adxValue,
+        2
+      ),
 
     atr:
-      round(atrValue, 6),
+      round(
+        atrValue,
+        6
+      ),
 
     candlestick:
       pattern.name,
@@ -2179,7 +2554,9 @@ async function analyzePair(
   pair
 ) {
   const normalized =
-    normalizePair(pair);
+    normalizePair(
+      pair
+    );
 
   const rawCandles =
     await fetchCandles(
@@ -2211,13 +2588,11 @@ async function analyzePair(
       result
     );
 
-    results.push(result);
+    results.push(
+      result
+    );
   }
 
-  /*
-   * Pair succeeded.
-   * Remove previous failure state.
-   */
   failedPairs.delete(
     normalized
   );
@@ -2253,7 +2628,8 @@ function rankResult(
   }
 
   if (
-    (result.adx || 0) >= 25
+    (result.adx || 0) >=
+    25
   ) {
     score += 8;
   }
@@ -2268,10 +2644,12 @@ function rankResult(
   if (
     result.signal === "CALL" &&
     (
-      result.priceActionCall || 0
+      result.priceActionCall ||
+      0
     ) >
     (
-      result.priceActionPut || 0
+      result.priceActionPut ||
+      0
     )
   ) {
     score += 8;
@@ -2280,10 +2658,12 @@ function rankResult(
   if (
     result.signal === "PUT" &&
     (
-      result.priceActionPut || 0
+      result.priceActionPut ||
+      0
     ) >
     (
-      result.priceActionCall || 0
+      result.priceActionCall ||
+      0
     )
   ) {
     score += 8;
@@ -2319,7 +2699,7 @@ function rankResult(
 
 
 /* =========================================================
-   BEST FROM CACHE
+   BEST CACHE
 ========================================================= */
 
 function bestFromCache(
@@ -2353,10 +2733,14 @@ function bestFromCache(
       continue;
     }
 
-    usable.push(result);
+    usable.push(
+      result
+    );
   }
 
-  if (!usable.length) {
+  if (
+    !usable.length
+  ) {
     return null;
   }
 
@@ -2371,16 +2755,20 @@ function bestFromCache(
 
 
 /* =========================================================
-   SCAN ONE BATCH
+   SCANNER
 ========================================================= */
 
 async function scanBatch() {
-  if (scanRunning) {
+  if (
+    scanRunning
+  ) {
     return;
   }
 
   scanRunning = true;
-  lastScanError = null;
+
+  lastScanError =
+    null;
 
   const startIndex =
     scanCursor;
@@ -2393,18 +2781,49 @@ async function scanBatch() {
     );
 
   if (
-    selectedPairs.length === 0
+    selectedPairs.length ===
+    0
   ) {
     scanCursor = 0;
+
     scanRunning = false;
+
     return;
   }
 
+  console.log(
+    `[SCAN] Starting batch: ${selectedPairs.join(", ")}`
+  );
+
+  let successful =
+    0;
+
+  let failed =
+    0;
+
   try {
     for (
-      const pair
-      of selectedPairs
+      let i = 0;
+      i <
+      selectedPairs.length;
+      i++
     ) {
+      const pair =
+        selectedPairs[i];
+
+      /*
+       * Never exceed the account budget.
+       */
+      if (
+        !canUseApiCredit()
+      ) {
+        console.log(
+          `[SCAN] API budget reached before ${pair}.`
+        );
+
+        break;
+      }
+
       try {
         await analyzePair(
           pair
@@ -2412,14 +2831,21 @@ async function scanBatch() {
 
         totalScanned += 1;
 
-      } catch (error) {
+        successful += 1;
+
+      } catch (
+        error
+      ) {
         totalFailed += 1;
+
+        failed += 1;
 
         failedPairs.set(
           pair,
           {
             error:
               error.message,
+
             at:
               isoNow()
           }
@@ -2428,18 +2854,30 @@ async function scanBatch() {
         lastScanError =
           error.message;
 
-        /*
-         * IMPORTANT:
-         * A failed pair does NOT stop
-         * the scanner.
-         */
+        console.log(
+          `[SCAN ERROR] ${error.message}`
+        );
       }
 
-      await sleep(
-        REQUEST_DELAY_MS
-      );
+      /*
+       * Spread requests instead of firing them
+       * simultaneously.
+       */
+      if (
+        i <
+        selectedPairs.length -
+          1
+      ) {
+        await sleep(
+          REQUEST_DELAY_MS
+        );
+      }
     }
 
+    /*
+     * Move cursor by the number of pairs
+     * selected for this batch.
+     */
     scanCursor =
       startIndex +
       selectedPairs.length;
@@ -2454,7 +2892,13 @@ async function scanBatch() {
     lastScanAt =
       isoNow();
 
-  } catch (error) {
+    console.log(
+      `[SCAN] Completed batch. Success=${successful}, Failed=${failed}, NextCursor=${scanCursor}`
+    );
+
+  } catch (
+    error
+  ) {
     lastScanError =
       error.message;
 
@@ -2468,28 +2912,36 @@ async function scanBatch() {
    INITIAL SCAN
 ========================================================= */
 
-setTimeout(() => {
-  scanBatch().catch(
-    error => {
-      lastScanError =
-        error.message;
-    }
-  );
-}, 1000);
+setTimeout(
+  () => {
+    scanBatch()
+      .catch(
+        error => {
+          lastScanError =
+            error.message;
+        }
+      );
+  },
+  1500
+);
 
 
 /* =========================================================
    REPEATING SCANNER
 ========================================================= */
 
-setInterval(() => {
-  scanBatch().catch(
-    error => {
-      lastScanError =
-        error.message;
-    }
-  );
-}, SCAN_EVERY_MS);
+setInterval(
+  () => {
+    scanBatch()
+      .catch(
+        error => {
+          lastScanError =
+            error.message;
+        }
+      );
+  },
+  SCAN_EVERY_MS
+);
 
 
 /* =========================================================
@@ -2517,6 +2969,9 @@ app.get(
       pairs:
         PAIRS.length,
 
+      apiCreditsPerMinute:
+        API_CREDITS_PER_MINUTE,
+
       time:
         isoNow()
     });
@@ -2533,6 +2988,8 @@ app.get(
   (req, res) => {
     cleanupExpiredCache();
 
+    refreshMinuteBudget();
+
     res.json({
       ok: true,
 
@@ -2548,11 +3005,14 @@ app.get(
       cachedPairs:
         new Set(
           [...cache.keys()]
-            .map(key =>
-              key.substring(
-                0,
-                key.lastIndexOf("_")
-              )
+            .map(
+              key =>
+                key.substring(
+                  0,
+                  key.lastIndexOf(
+                    "_"
+                  )
+                )
             )
         ).size,
 
@@ -2574,15 +3034,44 @@ app.get(
 
       totalFailed,
 
-      failedPairs:
-        [...failedPairs.entries()]
-          .map(
-            ([pair, info]) => ({
-              pair,
-              error: info.error,
-              at: info.at
-            })
+      totalApiRequests,
+
+      apiBudget: {
+        creditsPerMinute:
+          API_CREDITS_PER_MINUTE,
+
+        requestsThisMinute,
+
+        remainingThisMinute:
+          Math.max(
+            0,
+            API_CREDITS_PER_MINUTE -
+              requestsThisMinute
           ),
+
+        minute:
+          currentMinuteKey
+      },
+
+      failedPairs:
+        [
+          ...failedPairs.entries()
+        ].map(
+          (
+            [
+              pair,
+              info
+            ]
+          ) => ({
+            pair,
+
+            error:
+              info.error,
+
+            at:
+              info.at
+          })
+        ),
 
       timezone:
         TIMEZONE,
@@ -2610,7 +3099,9 @@ app.get(
       },
 
       apiKeyConfigured:
-        Boolean(API_KEY),
+        Boolean(
+          API_KEY
+        ),
 
       supportedTimeframes:
         TIMEFRAMES
@@ -2628,12 +3119,15 @@ app.get(
   (req, res) => {
     cleanupExpiredCache();
 
+    refreshMinuteBudget();
+
     const best =
       bestFromCache();
 
     const bestSignal =
       bestFromCache({
-        signalOnly: true
+        signalOnly:
+          true
       });
 
     res.json({
@@ -2653,6 +3147,8 @@ app.get(
 
       totalFailed,
 
+      totalApiRequests,
+
       cachedResults:
         cache.size,
 
@@ -2660,15 +3156,39 @@ app.get(
 
       lastScanError,
 
+      apiBudget: {
+        creditsPerMinute:
+          API_CREDITS_PER_MINUTE,
+
+        requestsThisMinute,
+
+        remainingThisMinute:
+          Math.max(
+            0,
+            API_CREDITS_PER_MINUTE -
+              requestsThisMinute
+          )
+      },
+
       failedPairs:
-        [...failedPairs.entries()]
-          .map(
-            ([pair, info]) => ({
+        [
+          ...failedPairs.entries()
+        ].map(
+          (
+            [
               pair,
-              error: info.error,
-              at: info.at
-            })
-          ),
+              info
+            ]
+          ) => ({
+            pair,
+
+            error:
+              info.error,
+
+            at:
+              info.at
+          })
+        ),
 
       best,
 
@@ -2687,19 +3207,26 @@ app.get(
 
 app.get(
   "/api/analyze",
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       cleanupExpiredCache();
 
       /*
-       * First: valid live signal.
+       * First use an existing valid signal.
+       * This costs ZERO API credits.
        */
       const bestSignal =
         bestFromCache({
-          signalOnly: true
+          signalOnly:
+            true
         });
 
-      if (bestSignal) {
+      if (
+        bestSignal
+      ) {
         return res.json({
           ok: true,
 
@@ -2721,12 +3248,14 @@ app.get(
       }
 
       /*
-       * Second: valid NO TRADE result.
+       * Otherwise use any valid result.
        */
       const bestAny =
         bestFromCache();
 
-      if (bestAny) {
+      if (
+        bestAny
+      ) {
         return res.json({
           ok: true,
 
@@ -2748,7 +3277,8 @@ app.get(
       }
 
       /*
-       * Third: run a new batch.
+       * Only when cache is empty:
+       * run one controlled batch.
        */
       await scanBatch();
 
@@ -2756,7 +3286,8 @@ app.get(
 
       const freshSignal =
         bestFromCache({
-          signalOnly: true
+          signalOnly:
+            true
         });
 
       const freshAny =
@@ -2766,7 +3297,9 @@ app.get(
         !freshSignal &&
         !freshAny
       ) {
-        return res.status(503).json({
+        return res.status(
+          503
+        ).json({
           ok: false,
 
           version:
@@ -2782,14 +3315,24 @@ app.get(
           lastScanError,
 
           failedPairs:
-            [...failedPairs.entries()]
-              .map(
-                ([pair, info]) => ({
+            [
+              ...failedPairs.entries()
+            ].map(
+              (
+                [
                   pair,
-                  error: info.error,
-                  at: info.at
-                })
-              ),
+                  info
+                ]
+              ) => ({
+                pair,
+
+                error:
+                  info.error,
+
+                at:
+                  info.at
+              })
+            ),
 
           time:
             isoNow()
@@ -2816,8 +3359,12 @@ app.get(
           isoNow()
       });
 
-    } catch (error) {
-      return res.status(500).json({
+    } catch (
+      error
+    ) {
+      return res.status(
+        500
+      ).json({
         ok: false,
 
         version:
@@ -2835,12 +3382,15 @@ app.get(
 
 
 /* =========================================================
-   ANALYZE SPECIFIC PAIR
+   SPECIFIC PAIR
 ========================================================= */
 
 app.get(
   "/api/analyze/:pair",
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const pair =
         normalizePair(
@@ -2850,9 +3400,13 @@ app.get(
         );
 
       if (
-        !PAIRS.includes(pair)
+        !PAIRS.includes(
+          pair
+        )
       ) {
-        return res.status(400).json({
+        return res.status(
+          400
+        ).json({
           ok: false,
 
           error:
@@ -2887,7 +3441,9 @@ app.get(
       if (
         !validResults.length
       ) {
-        return res.status(503).json({
+        return res.status(
+          503
+        ).json({
           ok: false,
 
           version:
@@ -2924,8 +3480,12 @@ app.get(
           isoNow()
       });
 
-    } catch (error) {
-      return res.status(500).json({
+    } catch (
+      error
+    ) {
+      return res.status(
+        500
+      ).json({
         ok: false,
 
         version:
@@ -2947,8 +3507,13 @@ app.get(
 ========================================================= */
 
 app.use(
-  (req, res) => {
-    res.status(404).json({
+  (
+    req,
+    res
+  ) => {
+    res.status(
+      404
+    ).json({
       ok: false,
 
       error:
@@ -2985,7 +3550,11 @@ app.listen(
     );
 
     console.log(
-      `[SCAN] ${SCAN_BATCH_SIZE} pairs every ${SCAN_EVERY_MS / 1000}s`
+      `[API BUDGET] ${API_CREDITS_PER_MINUTE} credits/minute`
+    );
+
+    console.log(
+      `[SCAN] ${SCAN_BATCH_SIZE} pairs per UTC minute`
     );
 
     console.log(
