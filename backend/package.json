@@ -1,7 +1,7 @@
 {
   "name": "po-ai-predictor-backend",
-  "version": "6.0.0",
-  "description": "PO AI Predictor backend - LIVE Twelve Data + OTC OTCharts",
+  "version": "8.3.1",
+  "description": "PO AI Predictor backend - LIVE Twelve Data smart price-action scanner",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
