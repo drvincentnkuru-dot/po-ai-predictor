@@ -3,2061 +3,1791 @@
 /*
 ===========================================================
  PO AI PREDICTOR
- V8.5 • SMART LIVE SCANNER FRONTEND
+ V8.6.1 • SMART LIVE SCANNER FRONTEND
+===========================================================
 
- NEW:
- - Candlestick pattern display
- - Market psychology display
- - Buyer / seller pressure
- - Trend conviction
- - Rejection / indecision
- - Pattern confirmation
- - Psychology confirmation
+BACKEND:
+https://po-ai-predictor-api.onrender.com
 
- Backend:
- https://po-ai-predictor-api.onrender.com
+FLOW:
+
+ANALYZE MARKET
+      ↓
+GET /api/best
+      ↓
+SELECTED MARKET
+      ↓
+CALL / PUT / NO TRADE
+      ↓
+ENTRY COUNTDOWN
+      ↓
+EXPIRY
+      ↓
+WIN / LOSS / DRAW
+      ↓
+PERFORMANCE
+
 ===========================================================
 */
 
 const API_URL =
-    'https://po-ai-predictor-api.onrender.com';
+  'https://po-ai-predictor-api.onrender.com';
 
-const BEST_URL =
-    `${API_URL}/api/best`;
+const REFRESH_INTERVAL =
+  10000;
 
-const HEALTH_URL =
-    `${API_URL}/api/health`;
+const COUNTDOWN_INTERVAL =
+  1000;
 
-const SCAN_STATUS_URL =
-    `${API_URL}/api/scan/status`;
+const HISTORY_LIMIT =
+  20;
 
+let selectedMarket =
+  null;
 
-/* =========================================================
-   DOM
-========================================================= */
+let refreshTimer =
+  null;
 
-const el = {
-    backendStatus:
-        document.getElementById('backendStatus'),
+let countdownTimer =
+  null;
 
-    analyzeBtn:
-        document.getElementById('analyzeBtn'),
-
-    errorBox:
-        document.getElementById('errorBox'),
-
-    signalCard:
-        document.getElementById('signalCard'),
-
-    selectedPair:
-        document.getElementById('selectedPair'),
-
-    trendBadge:
-        document.getElementById('trendBadge'),
-
-    signalBadge:
-        document.getElementById('signalBadge'),
-
-    confidence:
-        document.getElementById('confidence'),
-
-    timeframe:
-        document.getElementById('timeframe'),
-
-    countdown:
-        document.getElementById('countdown'),
-
-    entryTime:
-        document.getElementById('entryTime'),
-
-    expiryTime:
-        document.getElementById('expiryTime'),
-
-    entryPrice:
-        document.getElementById('entryPrice'),
-
-    callScore:
-        document.getElementById('callScore'),
-
-    putScore:
-        document.getElementById('putScore'),
-
-    support:
-        document.getElementById('support'),
-
-    resistance:
-        document.getElementById('resistance'),
-
-    dataAge:
-        document.getElementById('dataAge'),
-
-    ema9:
-        document.getElementById('ema9'),
-
-    ema21:
-        document.getElementById('ema21'),
-
-    rsi:
-        document.getElementById('rsi'),
-
-    adx:
-        document.getElementById('adx'),
-
-    reasons:
-        document.getElementById('reasons'),
-
-    scanInfo:
-        document.getElementById('scanInfo'),
-
-    scanner:
-        document.getElementById('scanner')
-};
-
-
-/* =========================================================
-   STATE
-========================================================= */
-
-let currentResult = null;
-
-let countdownTimer = null;
-let healthTimer = null;
-let scannerTimer = null;
-
-let analyzing = false;
-
-let insightBox = null;
-
+let analyzing =
+  false;
 
 /* =========================================================
    HELPERS
 ========================================================= */
 
+function $(selector) {
+  return document.querySelector(
+    selector
+  );
+}
+
 function escapeHtml(value) {
-    return String(value ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
+  return String(
+    value ?? ''
+  )
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
 }
 
+function formatNumber(
+  value,
+  decimals = 5
+) {
+  const number =
+    Number(value);
 
-function safeNumber(value, decimals = 5) {
-    const n = Number(value);
+  if (
+    !Number.isFinite(number)
+  ) {
+    return '—';
+  }
 
-    if (!Number.isFinite(n)) {
-        return '—';
-    }
-
-    return n.toFixed(decimals);
+  return number.toFixed(
+    decimals
+  );
 }
 
+function formatTime(
+  iso
+) {
+  if (!iso) {
+    return '—';
+  }
 
-function percent(value) {
-    const n = Number(value);
+  const date =
+    new Date(iso);
 
-    if (!Number.isFinite(n)) {
-        return '—';
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return '—';
+  }
+
+  return date.toLocaleTimeString(
+    [],
+    {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
     }
-
-    return `${Math.round(n)}%`;
+  );
 }
 
+function formatDateTime(
+  iso
+) {
+  if (!iso) {
+    return '—';
+  }
 
-function formatPrice(value, pair = '') {
-    const n = Number(value);
+  const date =
+    new Date(iso);
 
-    if (!Number.isFinite(n)) {
-        return '—';
-    }
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return '—';
+  }
 
-    const normalizedPair =
-        String(pair || '')
-            .toUpperCase();
-
-    const decimals =
-        normalizedPair.includes('JPY')
-            ? 3
-            : 5;
-
-    return n.toFixed(decimals);
+  return date.toLocaleString(
+    []
+  );
 }
 
+function formatCountdown(
+  seconds
+) {
+  const value =
+    Math.max(
+      0,
+      Math.floor(
+        Number(seconds) || 0
+      )
+    );
 
-function formatTimeframe(minutes) {
-    const n = Number(minutes);
+  const minutes =
+    Math.floor(
+      value / 60
+    );
 
-    if (!Number.isFinite(n)) {
-        return '—';
-    }
+  const secs =
+    value % 60;
 
-    return `${n} MIN`;
+  return (
+    String(minutes).padStart(
+      2,
+      '0'
+    ) +
+    ':' +
+    String(secs).padStart(
+      2,
+      '0'
+    )
+  );
 }
 
+/* =========================================================
+   FIND EXISTING UI ELEMENT
+========================================================= */
 
-function formatUTC(value) {
-    if (!value) {
-        return '—';
+function findElement(
+  ids = [],
+  selectors = []
+) {
+  for (const id of ids) {
+    const element =
+      document.getElementById(
+        id
+      );
+
+    if (element) {
+      return element;
     }
+  }
 
-    const d = new Date(value);
+  for (
+    const selector
+    of selectors
+  ) {
+    const element =
+      $(selector);
 
-    if (Number.isNaN(d.getTime())) {
-        return String(value);
+    if (element) {
+      return element;
     }
+  }
 
-    return d.toLocaleString(
-        'en-GB',
-        {
-            timeZone: 'UTC',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false
-        }
-    ) + ' UTC';
+  return null;
 }
 
+/* =========================================================
+   CREATE/ENSURE UI
+========================================================= */
 
-function shortUTC(value) {
-    if (!value) {
-        return '—';
-    }
+function ensureV861UI() {
+  let root =
+    document.getElementById(
+      'po-v861-status'
+    );
 
-    const d = new Date(value);
+  if (!root) {
+    root =
+      document.createElement(
+        'div'
+      );
 
-    if (Number.isNaN(d.getTime())) {
-        return String(value);
-    }
+    root.id =
+      'po-v861-status';
 
-    return d.toLocaleTimeString(
-        'en-GB',
-        {
-            timeZone: 'UTC',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false
-        }
-    ) + ' UTC';
-}
+    root.style.marginTop =
+      '16px';
 
+    root.style.padding =
+      '14px';
 
-function secondsUntil(value) {
-    if (!value) {
-        return null;
-    }
+    root.style.borderRadius =
+      '12px';
+
+    root.style.border =
+      '1px solid rgba(255,255,255,.12)';
 
     const target =
-        new Date(value).getTime();
+      document.querySelector(
+        'main'
+      ) ||
+      document.body;
 
-    if (!Number.isFinite(target)) {
-        return null;
-    }
-
-    return Math.floor(
-        (
-            target -
-            Date.now()
-        ) / 1000
+    target.appendChild(
+      root
     );
+  }
+
+  let performanceBox =
+    document.getElementById(
+      'po-v861-performance'
+    );
+
+  if (!performanceBox) {
+    performanceBox =
+      document.createElement(
+        'div'
+      );
+
+    performanceBox.id =
+      'po-v861-performance';
+
+    performanceBox.style.marginTop =
+      '12px';
+
+    root.appendChild(
+      performanceBox
+    );
+  }
+
+  let historyBox =
+    document.getElementById(
+      'po-v861-history'
+    );
+
+  if (!historyBox) {
+    historyBox =
+      document.createElement(
+        'div'
+      );
+
+    historyBox.id =
+      'po-v861-history';
+
+    historyBox.style.marginTop =
+      '12px';
+
+    root.appendChild(
+      historyBox
+    );
+  }
+
+  return {
+    root,
+    performanceBox,
+    historyBox
+  };
 }
 
+/* =========================================================
+   API REQUEST
+========================================================= */
 
-function formatCountdown(seconds) {
-    if (!Number.isFinite(seconds)) {
-        return '—';
-    }
-
-    if (seconds <= 0) {
-        return 'ENTER NOW';
-    }
-
-    const min =
-        Math.floor(seconds / 60);
-
-    const sec =
-        seconds % 60;
-
-    if (min > 0) {
-        return `${min}m ${String(sec).padStart(2, '0')}s`;
-    }
-
-    return `${sec}s`;
-}
-
-
-function clearCountdown() {
-    if (countdownTimer) {
-        clearInterval(
-            countdownTimer
-        );
-
-        countdownTimer = null;
-    }
-}
-
-
-function clearError() {
-    if (!el.errorBox) {
-        return;
-    }
-
-    el.errorBox.textContent = '';
-    el.errorBox.style.display = 'none';
-}
-
-
-function showError(message) {
-    if (!el.errorBox) {
-        return;
-    }
-
-    el.errorBox.textContent =
-        message;
-
-    el.errorBox.style.display =
-        'block';
-}
-
-
-function setBackendStatus(
-    text,
-    online = false
+async function apiGet(
+  endpoint
 ) {
-    if (!el.backendStatus) {
-        return;
-    }
-
-    el.backendStatus.textContent =
-        text;
-
-    el.backendStatus.classList.toggle(
-        'online',
-        online
+  const response =
+    await fetch(
+      `${API_URL}${endpoint}`,
+      {
+        method: 'GET',
+        headers: {
+          Accept:
+            'application/json'
+        },
+        cache: 'no-store'
+      }
     );
 
-    el.backendStatus.classList.toggle(
-        'offline',
-        !online
+  let data;
+
+  try {
+    data =
+      await response.json();
+  } catch (error) {
+    throw new Error(
+      `Backend returned invalid JSON (${response.status}).`
     );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data.error ||
+      `Backend HTTP ${response.status}`
+    );
+  }
+
+  return data;
 }
 
+/* =========================================================
+   STATUS
+========================================================= */
 
-function setLoading(loading) {
-    analyzing = loading;
-
-    if (!el.analyzeBtn) {
-        return;
-    }
-
-    el.analyzeBtn.disabled =
-        loading;
-
-    if (loading) {
-        el.analyzeBtn.dataset.originalText =
-            el.analyzeBtn.textContent ||
-            'ANALYZE MARKET';
-
-        el.analyzeBtn.textContent =
-            'SCANNING LIVE MARKET...';
-
-        el.analyzeBtn.classList.add(
-            'loading'
-        );
-    } else {
-        el.analyzeBtn.textContent =
-            el.analyzeBtn.dataset.originalText ||
-            'ANALYZE MARKET';
-
-        el.analyzeBtn.classList.remove(
-            'loading'
-        );
-    }
-}
-
-
-function showSignalCard(
-    show = true
+function setStatus(
+  text,
+  type = 'normal'
 ) {
-    if (!el.signalCard) {
-        return;
-    }
+  const element =
+    findElement(
+      [
+        'status',
+        'statusText',
+        'connectionStatus',
+        'marketStatus'
+      ],
+      [
+        '.status',
+        '.status-text',
+        '.connection-status'
+      ]
+    );
 
-    el.signalCard.style.display =
-        show ? '' : 'none';
+  if (!element) {
+    return;
+  }
+
+  element.textContent =
+    text;
+
+  element.dataset.status =
+    type;
 }
-
 
 /* =========================================================
    SIGNAL
 ========================================================= */
 
-function normalizeSignal(signal) {
-    const value =
-        String(signal || '')
-            .trim()
-            .toUpperCase();
-
-    if (value === 'CALL') {
-        return 'CALL';
-    }
-
-    if (value === 'PUT') {
-        return 'PUT';
-    }
-
-    return 'NO TRADE';
-}
-
-
-function normalizeTrend(condition) {
-    const value =
-        String(condition || '')
-            .trim()
-            .toUpperCase();
-
-    switch (value) {
-        case 'UPTREND':
-            return 'UPTREND';
-
-        case 'DOWNTREND':
-            return 'DOWNTREND';
-
-        case 'LOW_VOLATILITY_RANGE':
-            return 'LOW VOLATILITY RANGE';
-
-        case 'RANGING':
-            return 'RANGING';
-
-        default:
-            return (
-                value ||
-                'MARKET CONDITION —'
-            );
-    }
-}
-
-
-function applySignalBadge(signal) {
-    if (!el.signalBadge) {
-        return;
-    }
-
-    const normalized =
-        normalizeSignal(signal);
-
-    el.signalBadge.textContent =
-        normalized;
-
-    el.signalBadge.classList.remove(
-        'call',
-        'put',
-        'no-trade',
-        'CALL',
-        'PUT',
-        'NO-TRADE'
+function setSignal(
+  signal
+) {
+  const element =
+    findElement(
+      [
+        'signal',
+        'signalValue',
+        'tradeSignal'
+      ],
+      [
+        '.signal',
+        '.signal-value'
+      ]
     );
 
-    if (normalized === 'CALL') {
-        el.signalBadge.classList.add(
-            'call'
-        );
-    } else if (
-        normalized === 'PUT'
-    ) {
-        el.signalBadge.classList.add(
-            'put'
-        );
-    } else {
-        el.signalBadge.classList.add(
-            'no-trade'
-        );
-    }
-}
+  if (!element) {
+    return;
+  }
 
+  element.textContent =
+    signal || '—';
+
+  element.classList.remove(
+    'call',
+    'put',
+    'no-trade'
+  );
+
+  if (
+    signal === 'CALL'
+  ) {
+    element.classList.add(
+      'call'
+    );
+  } else if (
+    signal === 'PUT'
+  ) {
+    element.classList.add(
+      'put'
+    );
+  } else {
+    element.classList.add(
+      'no-trade'
+    );
+  }
+}
 
 /* =========================================================
-   DYNAMIC INSIGHT PANEL
+   CONFIDENCE
 ========================================================= */
 
-function ensureInsightBox() {
-    if (insightBox) {
-        return insightBox;
-    }
-
-    /*
-      If #reasons exists, put the new panel directly
-      after it. Otherwise attach it to signalCard.
-    */
-    const parent =
-        el.reasons?.parentElement ||
-        el.signalCard ||
-        document.body;
-
-    insightBox =
-        document.createElement('div');
-
-    insightBox.id =
-        'v85MarketInsights';
-
-    insightBox.style.marginTop =
-        '14px';
-
-    insightBox.style.display =
-        'block';
-
-    parent.appendChild(
-        insightBox
+function setConfidence(
+  confidence
+) {
+  const element =
+    findElement(
+      [
+        'confidence',
+        'confidenceValue',
+        'aiConfidence'
+      ],
+      [
+        '.confidence',
+        '.confidence-value'
+      ]
     );
 
-    return insightBox;
+  if (!element) {
+    return;
+  }
+
+  if (
+    confidence === null ||
+    confidence === undefined
+  ) {
+    element.textContent =
+      '—';
+    return;
+  }
+
+  element.textContent =
+    `${confidence}%`;
 }
-
-
-function insightClass(direction) {
-    const value =
-        String(direction || '')
-            .toUpperCase();
-
-    if (
-        value.includes('BULLISH') ||
-        value.includes('BUYER')
-    ) {
-        return 'bullish';
-    }
-
-    if (
-        value.includes('BEARISH') ||
-        value.includes('SELLER')
-    ) {
-        return 'bearish';
-    }
-
-    return 'neutral';
-}
-
-
-function renderMarketInsights(result) {
-    const box =
-        ensureInsightBox();
-
-    if (!box) {
-        return;
-    }
-
-    const patterns =
-        Array.isArray(
-            result?.candlestickPatterns
-        )
-            ? result.candlestickPatterns
-            : [];
-
-    const summary =
-        result?.patternSummary ||
-        {};
-
-    const psychology =
-        result?.marketPsychology ||
-        {};
-
-    const confirmation =
-        result?.confirmation ||
-        {};
-
-    const patternNames =
-        Array.isArray(summary.names)
-            ? summary.names
-            : [];
-
-    const patternDirection =
-        summary.direction ||
-        'NEUTRAL';
-
-    const psychologySentiment =
-        psychology.sentiment ||
-        'BALANCED';
-
-    const patternText =
-        patternNames.length
-            ? patternNames
-                .map(name =>
-                    escapeHtml(name)
-                )
-                .join(' • ')
-            : 'No strong named pattern';
-
-    const psychologyDescription =
-        psychology.description ||
-        'No psychology summary returned.';
-
-    const rejection =
-        psychology.rejection ||
-        'NONE';
-
-    const conviction =
-        Number.isFinite(
-            Number(
-                psychology.conviction
-            )
-        )
-            ? Math.round(
-                Number(
-                    psychology.conviction
-                )
-            )
-            : null;
-
-    const buyerPressure =
-        Number.isFinite(
-            Number(
-                psychology.buyerPressure
-            )
-        )
-            ? Math.round(
-                Number(
-                    psychology.buyerPressure
-                )
-            )
-            : null;
-
-    const sellerPressure =
-        Number.isFinite(
-            Number(
-                psychology.sellerPressure
-            )
-        )
-            ? Math.round(
-                Number(
-                    psychology.sellerPressure
-                )
-            )
-            : null;
-
-    const indecision =
-        Number.isFinite(
-            Number(
-                psychology.indecision
-            )
-        )
-            ? Math.round(
-                Number(
-                    psychology.indecision
-                )
-            )
-            : null;
-
-    const patternScore =
-        Number.isFinite(
-            Number(
-                result?.patternScore
-            )
-        )
-            ? Math.round(
-                Number(
-                    result.patternScore
-                )
-            )
-            : 0;
-
-    const psychologyScore =
-        Number.isFinite(
-            Number(
-                result?.psychologyScore
-            )
-        )
-            ? Math.round(
-                Number(
-                    result.psychologyScore
-                )
-            )
-            : 0;
-
-    box.innerHTML = `
-        <div class="v85-insights"
-             style="
-                border:1px solid rgba(128,128,128,.25);
-                border-radius:14px;
-                padding:14px;
-                margin-top:12px;
-             ">
-
-            <div style="
-                font-weight:700;
-                margin-bottom:12px;
-            ">
-                MARKET PRICE-ACTION INSIGHTS
-            </div>
-
-            <div style="
-                display:grid;
-                grid-template-columns:
-                    repeat(auto-fit,minmax(210px,1fr));
-                gap:10px;
-            ">
-
-                <div class="v85-insight-card"
-                     style="
-                        padding:12px;
-                        border-radius:10px;
-                        border:1px solid rgba(128,128,128,.18);
-                     ">
-
-                    <div style="
-                        font-weight:700;
-                        margin-bottom:7px;
-                    ">
-                        CANDLESTICK PATTERN
-                    </div>
-
-                    <div class="${insightClass(patternDirection)}"
-                         style="
-                            font-weight:700;
-                            margin-bottom:5px;
-                         ">
-                        ${escapeHtml(patternDirection)}
-                    </div>
-
-                    <div style="
-                        font-size:.9rem;
-                        margin-bottom:6px;
-                    ">
-                        ${patternText}
-                    </div>
-
-                    <div style="
-                        font-size:.82rem;
-                        opacity:.75;
-                    ">
-                        Confirmation:
-                        ${escapeHtml(String(patternScore))}
-                    </div>
-                </div>
-
-
-                <div class="v85-insight-card"
-                     style="
-                        padding:12px;
-                        border-radius:10px;
-                        border:1px solid rgba(128,128,128,.18);
-                     ">
-
-                    <div style="
-                        font-weight:700;
-                        margin-bottom:7px;
-                    ">
-                        MARKET PSYCHOLOGY
-                    </div>
-
-                    <div class="${insightClass(psychologySentiment)}"
-                         style="
-                            font-weight:700;
-                            margin-bottom:5px;
-                         ">
-                        ${escapeHtml(psychologySentiment)}
-                    </div>
-
-                    <div style="
-                        font-size:.88rem;
-                        line-height:1.4;
-                        margin-bottom:7px;
-                    ">
-                        ${escapeHtml(psychologyDescription)}
-                    </div>
-
-                    <div style="
-                        font-size:.82rem;
-                        opacity:.82;
-                    ">
-                        Buyers:
-                        <strong>
-                            ${buyerPressure !== null
-                                ? `${buyerPressure}%`
-                                : '—'}
-                        </strong>
-                        &nbsp;|&nbsp;
-                        Sellers:
-                        <strong>
-                            ${sellerPressure !== null
-                                ? `${sellerPressure}%`
-                                : '—'}
-                        </strong>
-                    </div>
-                </div>
-
-
-                <div class="v85-insight-card"
-                     style="
-                        padding:12px;
-                        border-radius:10px;
-                        border:1px solid rgba(128,128,128,.18);
-                     ">
-
-                    <div style="
-                        font-weight:700;
-                        margin-bottom:7px;
-                    ">
-                        MARKET BEHAVIOR
-                    </div>
-
-                    <div style="
-                        font-size:.88rem;
-                        line-height:1.7;
-                    ">
-                        <div>
-                            Conviction:
-                            <strong>
-                                ${conviction !== null
-                                    ? `${conviction}%`
-                                    : '—'}
-                            </strong>
-                        </div>
-
-                        <div>
-                            Rejection:
-                            <strong>
-                                ${escapeHtml(rejection)}
-                            </strong>
-                        </div>
-
-                        <div>
-                            Indecision:
-                            <strong>
-                                ${indecision !== null
-                                    ? `${indecision}%`
-                                    : '—'}
-                            </strong>
-                        </div>
-
-                        <div>
-                            Pattern confirmation:
-                            <strong>
-                                ${patternScore}
-                            </strong>
-                        </div>
-
-                        <div>
-                            Psychology confirmation:
-                            <strong>
-                                ${psychologyScore}
-                            </strong>
-                        </div>
-                    </div>
-                </div>
-
-            </div>
-
-            ${
-                patterns.length
-                    ? `
-                        <div style="
-                            margin-top:12px;
-                            font-size:.85rem;
-                            opacity:.82;
-                        ">
-                            Detected:
-                            ${patterns
-                                .slice(0, 5)
-                                .map(pattern => `
-                                    <span style="
-                                        display:inline-block;
-                                        margin:3px 4px 3px 0;
-                                        padding:4px 7px;
-                                        border-radius:7px;
-                                        border:1px solid rgba(128,128,128,.2);
-                                    ">
-                                        ${escapeHtml(
-                                            pattern.name
-                                        )}
-                                    </span>
-                                `)
-                                .join('')}
-                        </div>
-                    `
-                    : ''
-            }
-
-            <div style="
-                margin-top:10px;
-                font-size:.75rem;
-                opacity:.62;
-            ">
-                Price-action psychology is inferred from recent
-                OHLC candles; it is not direct order-book sentiment.
-            </div>
-
-        </div>
-    `;
-}
-
 
 /* =========================================================
-   REASON ENGINE
+   PAIR
 ========================================================= */
 
-function buildFallbackReasons(result) {
-    const reasons = [];
-
-    const signal =
-        normalizeSignal(
-            result?.signal
-        );
-
-    const indicators =
-        result?.indicators || {};
-
-    const ema9 =
-        Number(indicators.ema9);
-
-    const ema21 =
-        Number(indicators.ema21);
-
-    const rsi =
-        Number(indicators.rsi14);
-
-    const adx =
-        Number(indicators.adx14);
-
-    const currentPrice =
-        Number(
-            result?.currentPrice
-        );
-
-    const support =
-        Number(
-            indicators.support
-        );
-
-    const resistance =
-        Number(
-            indicators.resistance
-        );
-
-    const callScore =
-        Number(
-            result?.callScore
-        );
-
-    const putScore =
-        Number(
-            result?.putScore
-        );
-
-    if (
-        signal === 'CALL'
-    ) {
-        if (
-            Number.isFinite(ema9) &&
-            Number.isFinite(ema21) &&
-            ema9 > ema21
-        ) {
-            reasons.push(
-                'EMA9 is above EMA21, supporting bullish momentum.'
-            );
-        }
-
-        if (
-            Number.isFinite(rsi)
-        ) {
-            reasons.push(
-                `RSI14 is ${rsi.toFixed(1)}.`
-            );
-        }
-
-        if (
-            Number.isFinite(adx)
-        ) {
-            reasons.push(
-                `ADX14 is ${adx.toFixed(1)}.`
-            );
-        }
-
-        if (
-            Number.isFinite(
-                currentPrice
-            ) &&
-            Number.isFinite(
-                resistance
-            ) &&
-            resistance >
-                currentPrice
-        ) {
-            reasons.push(
-                `Price is below resistance at ${formatPrice(
-                    resistance,
-                    result.pair
-                )}.`
-            );
-        }
-
-        if (
-            Number.isFinite(callScore) &&
-            Number.isFinite(putScore)
-        ) {
-            reasons.push(
-                `CALL score ${Math.round(callScore)}% is above PUT score ${Math.round(putScore)}%.`
-            );
-        }
-    }
-
-    if (
-        signal === 'PUT'
-    ) {
-        if (
-            Number.isFinite(ema9) &&
-            Number.isFinite(ema21) &&
-            ema9 < ema21
-        ) {
-            reasons.push(
-                'EMA9 is below EMA21, supporting bearish momentum.'
-            );
-        }
-
-        if (
-            Number.isFinite(rsi)
-        ) {
-            reasons.push(
-                `RSI14 is ${rsi.toFixed(1)}.`
-            );
-        }
-
-        if (
-            Number.isFinite(adx)
-        ) {
-            reasons.push(
-                `ADX14 is ${adx.toFixed(1)}.`
-            );
-        }
-
-        if (
-            Number.isFinite(
-                currentPrice
-            ) &&
-            Number.isFinite(
-                support
-            ) &&
-            currentPrice >
-                support
-        ) {
-            reasons.push(
-                `Price is above support at ${formatPrice(
-                    support,
-                    result.pair
-                )}.`
-            );
-        }
-
-        if (
-            Number.isFinite(callScore) &&
-            Number.isFinite(putScore)
-        ) {
-            reasons.push(
-                `PUT score ${Math.round(putScore)}% is above CALL score ${Math.round(callScore)}%.`
-            );
-        }
-    }
-
-    if (
-        signal === 'NO TRADE'
-    ) {
-        reasons.push(
-            'Available indicators are not sufficiently aligned for a high-confidence CALL or PUT.'
-        );
-
-        if (
-            Number.isFinite(callScore) &&
-            Number.isFinite(putScore)
-        ) {
-            reasons.push(
-                `CALL score ${Math.round(callScore)}% vs PUT score ${Math.round(putScore)}%.`
-            );
-        }
-    }
-
-    return reasons;
-}
-
-
-function getReasons(result) {
-    const backendReasons =
-        result?.reasons;
-
-    if (
-        Array.isArray(
-            backendReasons
-        )
-    ) {
-        const clean =
-            backendReasons
-                .map(item => {
-                    if (
-                        typeof item ===
-                        'string'
-                    ) {
-                        return item.trim();
-                    }
-
-                    if (
-                        item &&
-                        typeof item ===
-                        'object'
-                    ) {
-                        return (
-                            item.reason ||
-                            item.message ||
-                            item.text ||
-                            ''
-                        )
-                            .toString()
-                            .trim();
-                    }
-
-                    return '';
-                })
-                .filter(Boolean);
-
-        if (
-            clean.length > 0
-        ) {
-            return clean;
-        }
-    }
-
-    return buildFallbackReasons(
-        result
+function setPair(
+  pair
+) {
+  const element =
+    findElement(
+      [
+        'pair',
+        'pairValue',
+        'selectedPair'
+      ],
+      [
+        '.pair',
+        '.pair-value'
+      ]
     );
+
+  if (!element) {
+    return;
+  }
+
+  element.textContent =
+    pair || '—';
 }
-
-
-function renderReasons(result) {
-    if (!el.reasons) {
-        return;
-    }
-
-    const reasons =
-        getReasons(result);
-
-    if (!reasons.length) {
-        el.reasons.innerHTML =
-            '<div class="reason-item">No detailed reason returned by backend.</div>';
-
-        return;
-    }
-
-    el.reasons.innerHTML =
-        reasons
-            .map(reason => `
-                <div class="reason-item">
-                    <span class="reason-dot">•</span>
-                    <span>${escapeHtml(reason)}</span>
-                </div>
-            `)
-            .join('');
-}
-
 
 /* =========================================================
-   DATA AGE
+   TIMEFRAME
 ========================================================= */
 
-function renderDataAge(result) {
-    if (!el.dataAge) {
-        return;
-    }
+function setTimeframe(
+  timeframe
+) {
+  const element =
+    findElement(
+      [
+        'timeframe',
+        'timeframeValue',
+        'selectedTimeframe'
+      ],
+      [
+        '.timeframe',
+        '.timeframe-value'
+      ]
+    );
 
-    const timestamp =
-        result?.lastCandle ||
-        result?.analysisTime ||
-        null;
+  if (!element) {
+    return;
+  }
 
-    if (!timestamp) {
-        el.dataAge.textContent =
-            '—';
-
-        return;
-    }
-
-    const d =
-        new Date(timestamp);
-
-    if (
-        Number.isNaN(
-            d.getTime()
-        )
-    ) {
-        el.dataAge.textContent =
-            '—';
-
-        return;
-    }
-
-    const ageSeconds =
-        Math.max(
-            0,
-            Math.floor(
-                (
-                    Date.now() -
-                    d.getTime()
-                ) / 1000
-            )
-        );
-
-    if (
-        result?.lastCandle
-    ) {
-        el.dataAge.textContent =
-            `${ageSeconds}s old`;
-    } else {
-        el.dataAge.textContent =
-            `analysis ${ageSeconds}s ago`;
-    }
+  element.textContent =
+    timeframe
+      ? `${timeframe} MIN`
+      : '—';
 }
-
 
 /* =========================================================
-   RENDER SELECTED MARKET
+   ENTRY
 ========================================================= */
 
-function renderSignal(result) {
-    if (!result) {
-        return;
-    }
-
-    currentResult =
-        result;
-
-    const pair =
-        result.pair || '—';
-
-    const signal =
-        normalizeSignal(
-            result.signal
-        );
-
-    const trend =
-        normalizeTrend(
-            result.marketCondition
-        );
-
-    const indicators =
-        result.indicators || {};
-
-    showSignalCard(true);
-
-    if (el.selectedPair) {
-        el.selectedPair.textContent =
-            pair;
-    }
-
-    if (el.trendBadge) {
-        el.trendBadge.textContent =
-            trend;
-    }
-
-    applySignalBadge(
-        signal
+function setEntry(
+  iso
+) {
+  const element =
+    findElement(
+      [
+        'entry',
+        'entryTime',
+        'entryValue'
+      ],
+      [
+        '.entry',
+        '.entry-time'
+      ]
     );
 
-    if (el.confidence) {
-        el.confidence.textContent =
-            percent(
-                result.confidence
-            );
-    }
+  if (!element) {
+    return;
+  }
 
-    if (el.timeframe) {
-        el.timeframe.textContent =
-            formatTimeframe(
-                result.timeframe
-            );
-    }
-
-    if (el.entryTime) {
-        el.entryTime.textContent =
-            formatUTC(
-                result.entryTime
-            );
-    }
-
-    if (el.expiryTime) {
-        el.expiryTime.textContent =
-            formatUTC(
-                result.expiryTime
-            );
-    }
-
-    if (el.entryPrice) {
-        el.entryPrice.textContent =
-            formatPrice(
-                result.currentPrice,
-                pair
-            );
-    }
-
-    if (el.callScore) {
-        el.callScore.textContent =
-            percent(
-                result.callScore
-            );
-    }
-
-    if (el.putScore) {
-        el.putScore.textContent =
-            percent(
-                result.putScore
-            );
-    }
-
-    if (el.support) {
-        el.support.textContent =
-            formatPrice(
-                indicators.support,
-                pair
-            );
-    }
-
-    if (el.resistance) {
-        el.resistance.textContent =
-            formatPrice(
-                indicators.resistance,
-                pair
-            );
-    }
-
-    if (el.ema9) {
-        el.ema9.textContent =
-            formatPrice(
-                indicators.ema9,
-                pair
-            );
-    }
-
-    if (el.ema21) {
-        el.ema21.textContent =
-            formatPrice(
-                indicators.ema21,
-                pair
-            );
-    }
-
-    if (el.rsi) {
-        el.rsi.textContent =
-            safeNumber(
-                indicators.rsi14,
-                1
-            );
-    }
-
-    if (el.adx) {
-        el.adx.textContent =
-            safeNumber(
-                indicators.adx14,
-                1
-            );
-    }
-
-    renderReasons(
-        result
+  element.textContent =
+    formatTime(
+      iso
     );
-
-    renderDataAge(
-        result
-    );
-
-    /*
-      NEW V8.5
-    */
-    renderMarketInsights(
-        result
-    );
-
-    if (el.scanInfo) {
-        const source =
-            result.source ||
-            'Twelve Data LIVE';
-
-        el.scanInfo.textContent =
-            `${pair} selected from ${source}`;
-    }
-
-    startCountdown();
 }
 
+/* =========================================================
+   EXPIRY
+========================================================= */
+
+function setExpiry(
+  iso
+) {
+  const element =
+    findElement(
+      [
+        'expiry',
+        'expiryTime',
+        'expiryValue'
+      ],
+      [
+        '.expiry',
+        '.expiry-time'
+      ]
+    );
+
+  if (!element) {
+    return;
+  }
+
+  element.textContent =
+    formatTime(
+      iso
+    );
+}
+
+/* =========================================================
+   CURRENT PRICE
+========================================================= */
+
+function setCurrentPrice(
+  price
+) {
+  const element =
+    findElement(
+      [
+        'currentPrice',
+        'price',
+        'priceValue'
+      ],
+      [
+        '.current-price',
+        '.price-value'
+      ]
+    );
+
+  if (!element) {
+    return;
+  }
+
+  element.textContent =
+    formatNumber(
+      price,
+      5
+    );
+}
+
+/* =========================================================
+   RESULT STATUS
+========================================================= */
+
+function setResultStatus(
+  result
+) {
+  const element =
+    findElement(
+      [
+        'resultStatus',
+        'tradeResult',
+        'result'
+      ],
+      [
+        '.result-status',
+        '.trade-result'
+      ]
+    );
+
+  if (!element) {
+    return;
+  }
+
+  element.textContent =
+    result || 'PENDING';
+
+  element.classList.remove(
+    'win',
+    'loss',
+    'draw',
+    'pending'
+  );
+
+  const normalized =
+    String(
+      result ||
+        'PENDING'
+    ).toUpperCase();
+
+  if (
+    normalized === 'WIN'
+  ) {
+    element.classList.add(
+      'win'
+    );
+  } else if (
+    normalized === 'LOSS'
+  ) {
+    element.classList.add(
+      'loss'
+    );
+  } else if (
+    normalized === 'DRAW'
+  ) {
+    element.classList.add(
+      'draw'
+    );
+  } else {
+    element.classList.add(
+      'pending'
+    );
+  }
+}
 
 /* =========================================================
    COUNTDOWN
 ========================================================= */
 
-function startCountdown() {
-    clearCountdown();
-
-    updateCountdown();
-
-    countdownTimer =
-        setInterval(
-            () => {
-                updateCountdown();
-            },
-            1000
-        );
-}
-
-
 function updateCountdown() {
-    if (!el.countdown) {
-        return;
-    }
-
-    if (!currentResult) {
-        el.countdown.textContent =
-            '—';
-
-        return;
-    }
-
-    const seconds =
-        secondsUntil(
-            currentResult.entryTime
-        );
-
-    if (
-        seconds === null
-    ) {
-        el.countdown.textContent =
-            '—';
-
-        return;
-    }
-
-    if (
-        seconds <= 0
-    ) {
-        el.countdown.textContent =
-            'ENTER NOW';
-
-        if (
-            seconds < -5
-        ) {
-            clearCountdown();
-        }
-
-        return;
-    }
-
-    el.countdown.textContent =
-        formatCountdown(
-            seconds
-        );
-}
-
-
-/* =========================================================
-   LOADING
-========================================================= */
-
-function renderLoading() {
-    showSignalCard(true);
-
-    if (el.selectedPair) {
-        el.selectedPair.textContent =
-            'SCANNING 24 LIVE PAIRS...';
-    }
-
-    if (el.trendBadge) {
-        el.trendBadge.textContent =
-            'AI SELECTING';
-    }
-
-    if (el.signalBadge) {
-        el.signalBadge.textContent =
-            'SCANNING...';
-
-        el.signalBadge.classList.remove(
-            'call',
-            'put',
-            'no-trade'
-        );
-    }
-
-    const fields = [
-        el.confidence,
-        el.timeframe,
-        el.entryTime,
-        el.expiryTime,
-        el.entryPrice,
-        el.callScore,
-        el.putScore,
-        el.support,
-        el.resistance,
-        el.ema9,
-        el.ema21,
-        el.rsi,
-        el.adx
-    ];
-
-    fields.forEach(
-        field => {
-            if (field) {
-                field.textContent =
-                    '—';
-            }
-        }
+  const element =
+    findElement(
+      [
+        'countdown',
+        'entryCountdown',
+        'timer',
+        'entryTimer'
+      ],
+      [
+        '.countdown',
+        '.entry-countdown',
+        '.timer'
+      ]
     );
 
-    if (el.countdown) {
-        el.countdown.textContent =
-            'Finding strongest setup...';
-    }
+  if (!element) {
+    return;
+  }
 
-    if (el.reasons) {
-        el.reasons.innerHTML = `
-            <div class="reason-item">
-                <span class="reason-dot">•</span>
-                <span>
-                    Scanning live markets and comparing the available setups...
-                </span>
-            </div>
-        `;
-    }
+  if (
+    !selectedMarket ||
+    !selectedMarket.entryTime
+  ) {
+    element.textContent =
+      '—';
 
-    if (el.scanInfo) {
-        el.scanInfo.textContent =
-            'Smart scanner is selecting the strongest available setup...';
-    }
+    return;
+  }
 
-    if (insightBox) {
-        insightBox.innerHTML = '';
-    }
+  const entry =
+    new Date(
+      selectedMarket.entryTime
+    ).getTime();
+
+  const expiry =
+    new Date(
+      selectedMarket.expiryTime
+    ).getTime();
+
+  const now =
+    Date.now();
+
+  if (
+    now <
+    entry
+  ) {
+    const seconds =
+      Math.ceil(
+        (
+          entry -
+          now
+        ) / 1000
+      );
+
+    element.textContent =
+      `ENTRY IN ${formatCountdown(seconds)}`;
+
+    return;
+  }
+
+  if (
+    now <
+    expiry
+  ) {
+    const seconds =
+      Math.ceil(
+        (
+          expiry -
+          now
+        ) / 1000
+      );
+
+    element.textContent =
+      `EXPIRY IN ${formatCountdown(seconds)}`;
+
+    return;
+  }
+
+  element.textContent =
+    'EXPIRED — SETTLING';
 }
 
-
 /* =========================================================
-   ERROR
+   MARKET CONDITION
 ========================================================= */
 
-function renderErrorState(
-    message
+function setMarketCondition(
+  condition
 ) {
-    clearCountdown();
+  const element =
+    findElement(
+      [
+        'marketCondition',
+        'condition',
+        'marketConditionValue'
+      ],
+      [
+        '.market-condition',
+        '.condition'
+      ]
+    );
 
-    currentResult =
-        null;
+  if (!element) {
+    return;
+  }
 
-    if (el.signalBadge) {
-        el.signalBadge.textContent =
-            'ERROR';
-
-        el.signalBadge.classList.remove(
-            'call',
-            'put',
-            'no-trade'
-        );
-    }
-
-    if (el.countdown) {
-        el.countdown.textContent =
-            '—';
-    }
-
-    if (el.reasons) {
-        el.reasons.innerHTML = `
-            <div class="reason-item">
-                <span class="reason-dot">!</span>
-                <span>${escapeHtml(message)}</span>
-            </div>
-        `;
-    }
-
-    if (insightBox) {
-        insightBox.innerHTML =
-            '';
-    }
+  element.textContent =
+    condition || '—';
 }
 
-
 /* =========================================================
-   FETCH
+   RENDER SELECTED MARKET
 ========================================================= */
 
-async function fetchJson(
-    url,
-    options = {}
+function renderSelectedMarket(
+  market
 ) {
-    const response =
-        await fetch(
-            url,
-            {
-                cache: 'no-store',
-                ...options
-            }
-        );
+  selectedMarket =
+    market || null;
 
-    let data = null;
+  if (!market) {
+    setPair('—');
+    setTimeframe(null);
+    setSignal('NO TRADE');
+    setConfidence(null);
+    setCurrentPrice(null);
+    setEntry(null);
+    setExpiry(null);
+    setResultStatus(
+      'PENDING'
+    );
+    setMarketCondition(
+      '—'
+    );
 
-    try {
-        data =
-            await response.json();
-    } catch (error) {
-        throw new Error(
-            `Backend returned invalid JSON (${response.status}).`
-        );
-    }
+    return;
+  }
 
-    if (!response.ok) {
-        const message =
-            data?.error ||
-            data?.message ||
-            `Backend request failed with HTTP ${response.status}.`;
+  setPair(
+    market.pair
+  );
 
-        throw new Error(
-            message
-        );
-    }
+  setTimeframe(
+    market.timeframe
+  );
 
-    return data;
+  setSignal(
+    market.signal
+  );
+
+  setConfidence(
+    market.confidence
+  );
+
+  setCurrentPrice(
+    market.currentPrice
+  );
+
+  setEntry(
+    market.entryTime
+  );
+
+  setExpiry(
+    market.expiryTime
+  );
+
+  setResultStatus(
+    market.resultStatus ||
+    'PENDING'
+  );
+
+  setMarketCondition(
+    market.marketCondition
+  );
+
+  updateCountdown();
+
+  renderDetailedStatus(
+    market
+  );
 }
 
-
 /* =========================================================
-   HEALTH
+   DETAILED STATUS
 ========================================================= */
 
-async function checkHealth() {
-    try {
-        const data =
-            await fetchJson(
-                HEALTH_URL
-            );
+function renderDetailedStatus(
+  market
+) {
+  const ui =
+    ensureV861UI();
 
-        if (data?.ok) {
-            const version =
-                data.version
-                    ? ` ${data.version}`
-                    : '';
+  const signal =
+    market.signal ||
+    'NO TRADE';
 
-            setBackendStatus(
-                `LIVE${version}`,
-                true
-            );
+  const result =
+    market.resultStatus ||
+    'PENDING';
 
-            return data;
-        }
+  const signalClass =
+    signal === 'CALL'
+      ? 'call'
+      : signal === 'PUT'
+        ? 'put'
+        : 'no-trade';
 
-        throw new Error(
-            'Backend health check failed.'
-        );
+  const resultClass =
+    result === 'WIN'
+      ? 'win'
+      : result === 'LOSS'
+        ? 'loss'
+        : result === 'DRAW'
+          ? 'draw'
+          : 'pending';
 
-    } catch (error) {
+  ui.root.innerHTML = `
+    <div style="font-weight:700;font-size:16px;margin-bottom:10px;">
+      V8.6.1 LIVE SIGNAL
+    </div>
 
-        setBackendStatus(
-            'BACKEND OFFLINE',
-            false
-        );
+    <div style="
+      display:grid;
+      grid-template-columns:repeat(2,minmax(0,1fr));
+      gap:8px;
+    ">
+      <div>
+        <small>PAIR</small><br>
+        <strong>${escapeHtml(
+          market.pair
+        )}</strong>
+      </div>
 
-        return null;
+      <div>
+        <small>TIMEFRAME</small><br>
+        <strong>${escapeHtml(
+          market.timeframe
+        )} MIN</strong>
+      </div>
+
+      <div>
+        <small>SIGNAL</small><br>
+        <strong class="${signalClass}">
+          ${escapeHtml(signal)}
+        </strong>
+      </div>
+
+      <div>
+        <small>CONFIDENCE</small><br>
+        <strong>${escapeHtml(
+          market.confidence
+        )}%</strong>
+      </div>
+
+      <div>
+        <small>ENTRY</small><br>
+        <strong>${escapeHtml(
+          formatTime(
+            market.entryTime
+          )
+        )}</strong>
+      </div>
+
+      <div>
+        <small>EXPIRY</small><br>
+        <strong>${escapeHtml(
+          formatTime(
+            market.expiryTime
+          )
+        )}</strong>
+      </div>
+
+      <div>
+        <small>CURRENT PRICE</small><br>
+        <strong>${escapeHtml(
+          formatNumber(
+            market.currentPrice
+          )
+        )}</strong>
+      </div>
+
+      <div>
+        <small>RESULT</small><br>
+        <strong class="${resultClass}">
+          ${escapeHtml(result)}
+        </strong>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <small>MARKET CONDITION</small><br>
+      <strong>${escapeHtml(
+        market.marketCondition ||
+        '—'
+      )}</strong>
+    </div>
+
+    <div id="v861-countdown"
+         style="
+           margin-top:12px;
+           font-weight:700;
+           font-size:18px;
+         ">
+      —
+    </div>
+
+    ${
+      market.entryPrice !== null &&
+      market.entryPrice !== undefined
+        ? `
+          <div style="margin-top:8px;">
+            <small>ENTRY PRICE</small><br>
+            <strong>${escapeHtml(
+              formatNumber(
+                market.entryPrice
+              )
+            )}</strong>
+          </div>
+        `
+        : ''
     }
+
+    ${
+      market.exitPrice !== null &&
+      market.exitPrice !== undefined
+        ? `
+          <div style="margin-top:8px;">
+            <small>EXIT PRICE</small><br>
+            <strong>${escapeHtml(
+              formatNumber(
+                market.exitPrice
+              )
+            )}</strong>
+          </div>
+        `
+        : ''
+    }
+
+    <div style="
+      margin-top:10px;
+      opacity:.7;
+      font-size:12px;
+    ">
+      Signal ID:
+      ${escapeHtml(
+        market.signalId ||
+        '—'
+      )}
+    </div>
+  `;
+
+  /*
+  Restore the performance/history containers
+  after replacing root contents.
+  */
+  renderPerformance(
+    window.__v861Performance ||
+      null
+  );
+
+  renderHistory(
+    window.__v861History ||
+      []
+  );
+
+  updateDynamicCountdown();
 }
 
-
 /* =========================================================
-   SCANNER
+   DYNAMIC COUNTDOWN
 ========================================================= */
 
-function renderScanner(data) {
-    if (!el.scanner) {
-        return;
-    }
+function updateDynamicCountdown() {
+  const element =
+    document.getElementById(
+      'v861-countdown'
+    );
 
-    if (!data) {
-        el.scanner.textContent =
-            'Scanner status unavailable.';
+  if (!element) {
+    return;
+  }
 
-        return;
-    }
+  if (
+    !selectedMarket
+  ) {
+    element.textContent =
+      '—';
 
-    const running =
-        data.scanRunning === true;
+    return;
+  }
 
-    const cachedPairs =
-        Number.isFinite(
-            Number(
-                data.cachedPairs
-            )
-        )
-            ? Number(
-                data.cachedPairs
-            )
-            : 0;
+  const entry =
+    new Date(
+      selectedMarket.entryTime
+    ).getTime();
 
-    const cachedResults =
-        Number.isFinite(
-            Number(
-                data.cachedResults
-            )
-        )
-            ? Number(
-                data.cachedResults
-            )
-            : 0;
+  const expiry =
+    new Date(
+      selectedMarket.expiryTime
+    ).getTime();
 
-    const cursor =
-        Number.isFinite(
-            Number(
-                data.scanCursor
-            )
-        )
-            ? Number(
-                data.scanCursor
-            )
-            : null;
+  const now =
+    Date.now();
 
-    const batchSize =
-        Number.isFinite(
-            Number(
-                data.scanBatchSize
-            )
-        )
-            ? Number(
-                data.scanBatchSize
-            )
-            : null;
+  if (
+    now <
+    entry
+  ) {
+    const seconds =
+      Math.ceil(
+        (
+          entry -
+          now
+        ) / 1000
+      );
 
-    const quotaBlocked =
-        data.quotaBlocked === true;
+    element.textContent =
+      `ENTRY IN ${formatCountdown(seconds)}`;
 
-    let status =
-        running
-            ? 'SCANNING'
-            : 'READY';
+    return;
+  }
 
-    if (quotaBlocked) {
-        status =
-            'QUOTA BLOCKED';
-    }
+  if (
+    now <
+    expiry
+  ) {
+    const seconds =
+      Math.ceil(
+        (
+          expiry -
+          now
+        ) / 1000
+      );
 
-    el.scanner.innerHTML = `
-        <div class="scanner-status">
-            <strong>
-                ${escapeHtml(status)}
-            </strong>
-        </div>
+    element.textContent =
+      `EXPIRY IN ${formatCountdown(seconds)}`;
 
-        <div class="scanner-line">
-            Cached pairs:
-            <strong>
-                ${cachedPairs}
-            </strong>
-        </div>
+    return;
+  }
 
-        <div class="scanner-line">
-            Cached results:
-            <strong>
-                ${cachedResults}
-            </strong>
-        </div>
+  element.textContent =
+    'EXPIRED — WAITING FOR RESULT';
+}
 
-        <div class="scanner-line">
-            Batch size:
-            <strong>
-                ${batchSize ?? '—'}
-            </strong>
-        </div>
+/* =========================================================
+   PERFORMANCE
+========================================================= */
 
-        <div class="scanner-line">
-            Scan cursor:
-            <strong>
-                ${cursor ?? '—'}
-            </strong>
-        </div>
+function renderPerformance(
+  performance
+) {
+  const box =
+    document.getElementById(
+      'po-v861-performance'
+    );
+
+  if (!box) {
+    return;
+  }
+
+  if (!performance) {
+    box.innerHTML = `
+      <div style="font-weight:700;">
+        PERFORMANCE
+      </div>
+      <div style="opacity:.7;">
+        Waiting for settled signals...
+      </div>
     `;
+
+    return;
+  }
+
+  const {
+    total = 0,
+    pending = 0,
+    wins = 0,
+    losses = 0,
+    draws = 0,
+    settled = 0,
+    decisive = 0,
+    winRate = null
+  } = performance;
+
+  box.innerHTML = `
+    <div style="
+      font-weight:700;
+      margin-bottom:8px;
+    ">
+      PERFORMANCE
+    </div>
+
+    <div style="
+      display:grid;
+      grid-template-columns:repeat(4,minmax(0,1fr));
+      gap:6px;
+      font-size:13px;
+    ">
+      <div>
+        <small>TOTAL</small><br>
+        <strong>${total}</strong>
+      </div>
+
+      <div>
+        <small>PENDING</small><br>
+        <strong>${pending}</strong>
+      </div>
+
+      <div>
+        <small>WIN</small><br>
+        <strong>${wins}</strong>
+      </div>
+
+      <div>
+        <small>LOSS</small><br>
+        <strong>${losses}</strong>
+      </div>
+
+      <div>
+        <small>DRAW</small><br>
+        <strong>${draws}</strong>
+      </div>
+
+      <div>
+        <small>SETTLED</small><br>
+        <strong>${settled}</strong>
+      </div>
+
+      <div>
+        <small>DECISIVE</small><br>
+        <strong>${decisive}</strong>
+      </div>
+
+      <div>
+        <small>WIN RATE</small><br>
+        <strong>${
+          winRate === null
+            ? '—'
+            : `${winRate}%`
+        }</strong>
+      </div>
+    </div>
+  `;
 }
-
-
-async function refreshScanner() {
-    try {
-        const data =
-            await fetchJson(
-                SCAN_STATUS_URL
-            );
-
-        renderScanner(
-            data
-        );
-
-        return data;
-
-    } catch (error) {
-
-        if (el.scanner) {
-            el.scanner.textContent =
-                'Scanner status unavailable.';
-        }
-
-        return null;
-    }
-}
-
 
 /* =========================================================
-   MAIN ANALYZE
+   HISTORY
+========================================================= */
+
+function renderHistory(
+  signals
+) {
+  const box =
+    document.getElementById(
+      'po-v861-history'
+    );
+
+  if (!box) {
+    return;
+  }
+
+  if (
+    !signals ||
+    !signals.length
+  ) {
+    box.innerHTML = `
+      <div style="font-weight:700;">
+        SIGNAL HISTORY
+      </div>
+      <div style="opacity:.7;">
+        No signals yet.
+      </div>
+    `;
+
+    return;
+  }
+
+  const rows =
+    signals
+      .slice(
+        0,
+        HISTORY_LIMIT
+      )
+      .map(
+        signal => {
+          const result =
+            signal.result ||
+            'PENDING';
+
+          return `
+            <div style="
+              padding:8px 0;
+              border-bottom:1px solid rgba(255,255,255,.08);
+              font-size:12px;
+            ">
+              <div style="
+                display:flex;
+                justify-content:space-between;
+                gap:8px;
+              ">
+                <strong>
+                  ${escapeHtml(
+                    signal.pair
+                  )}
+                  ·
+                  ${escapeHtml(
+                    signal.timeframe
+                  )}m
+                </strong>
+
+                <strong>
+                  ${escapeHtml(
+                    signal.signal
+                  )}
+                </strong>
+              </div>
+
+              <div style="opacity:.75;">
+                Entry:
+                ${escapeHtml(
+                  formatTime(
+                    signal.entryTime
+                  )
+                )}
+                ·
+                Expiry:
+                ${escapeHtml(
+                  formatTime(
+                    signal.expiryTime
+                  )
+                )}
+              </div>
+
+              <div style="margin-top:3px;">
+                Result:
+                <strong>
+                  ${escapeHtml(
+                    result
+                  )}
+                </strong>
+
+                ${
+                  signal.entryPrice !== null
+                    ? `
+                      · Entry:
+                      ${escapeHtml(
+                        formatNumber(
+                          signal.entryPrice
+                        )
+                      )}
+                    `
+                    : ''
+                }
+
+                ${
+                  signal.exitPrice !== null
+                    ? `
+                      · Exit:
+                      ${escapeHtml(
+                        formatNumber(
+                          signal.exitPrice
+                        )
+                      )}
+                    `
+                    : ''
+                }
+              </div>
+            </div>
+          `;
+        }
+      )
+      .join('');
+
+  box.innerHTML = `
+    <div style="
+      font-weight:700;
+      margin-bottom:8px;
+    ">
+      SIGNAL HISTORY
+    </div>
+
+    ${rows}
+  `;
+}
+
+/* =========================================================
+   ANALYZE MARKET
 ========================================================= */
 
 async function analyzeMarket() {
-    if (analyzing) {
-        return;
+  if (analyzing) {
+    return;
+  }
+
+  analyzing = true;
+
+  setStatus(
+    'Scanning live market...',
+    'loading'
+  );
+
+  try {
+    const data =
+      await apiGet(
+        '/api/best'
+      );
+
+    if (
+      !data.ok ||
+      !data.selectedMarket
+    ) {
+      throw new Error(
+        data.error ||
+        'Backend returned no selected market.'
+      );
     }
 
-    clearError();
-
-    clearCountdown();
-
-    currentResult =
-        null;
-
-    setLoading(true);
-
-    renderLoading();
-
-    try {
-
-        /*
-          Smart scanner:
-          backend chooses pair + timeframe.
-        */
-        const data =
-            await fetchJson(
-                BEST_URL
-            );
-
-        if (
-            !data ||
-            data.ok !== true
-        ) {
-            throw new Error(
-                data?.error ||
-                data?.message ||
-                'Smart scanner returned an invalid response.'
-            );
-        }
-
-        const selected =
-            data.selectedMarket ||
-            data.selected ||
-            data.best ||
-            null;
-
-        if (!selected) {
-            throw new Error(
-                'Smart scanner did not return a selected market.'
-            );
-        }
-
-        const signal =
-            normalizeSignal(
-                selected.signal
-            );
-
-        if (
-            !selected.pair ||
-            !selected.timeframe ||
-            !selected.entryTime ||
-            !selected.expiryTime
-        ) {
-            throw new Error(
-                'Selected market response is incomplete.'
-            );
-        }
-
-        currentResult =
-            selected;
-
-        renderSignal(
-            selected
-        );
-
-        if (el.scanInfo) {
-            const scanned =
-                Number(
-                    data.scannedResults
-                );
-
-            const scanText =
-                Number.isFinite(scanned)
-                    ? ` Compared ${scanned} available result(s).`
-                    : '';
-
-            el.scanInfo.textContent =
-                `AI selected ${selected.pair} • ${formatTimeframe(
-                    selected.timeframe
-                )} • ${signal}.${scanText}`;
-        }
-
-        if (
-            selected.dataWarning &&
-            el.scanInfo
-        ) {
-            el.scanInfo.textContent +=
-                ` ${selected.dataWarning}`;
-        }
-
-        await refreshScanner();
-
-    } catch (error) {
-
-        console.error(
-            '[PO AI PREDICTOR] Analyze error:',
-            error
-        );
-
-        const message =
-            error?.message ||
-            'Unable to load live market data.';
-
-        showError(
-            message
-        );
-
-        renderErrorState(
-            message
-        );
-
-        if (el.scanInfo) {
-            el.scanInfo.textContent =
-                'Smart scanner could not select a valid market.';
-        }
-
-    } finally {
-        setLoading(false);
-    }
-}
-
-
-/* =========================================================
-   AUTO STATUS REFRESH
-========================================================= */
-
-function startStatusRefresh() {
-    if (healthTimer) {
-        clearInterval(
-            healthTimer
-        );
-    }
-
-    if (scannerTimer) {
-        clearInterval(
-            scannerTimer
-        );
-    }
-
-    /*
-      Health only.
-      Does not trigger scanning.
-    */
-    healthTimer =
-        setInterval(
-            () => {
-                checkHealth();
-            },
-            30000
-        );
-
-    /*
-      Scanner status only.
-      Does not trigger provider requests.
-    */
-    scannerTimer =
-        setInterval(
-            () => {
-                refreshScanner();
-            },
-            15000
-        );
-}
-
-
-/* =========================================================
-   VISIBILITY
-========================================================= */
-
-document.addEventListener(
-    'visibilitychange',
-    () => {
-        if (!document.hidden) {
-
-            checkHealth();
-
-            refreshScanner();
-
-            if (currentResult) {
-                renderDataAge(
-                    currentResult
-                );
-
-                updateCountdown();
-            }
-        }
-    }
-);
-
-
-/* =========================================================
-   BUTTON
-========================================================= */
-
-function bindEvents() {
-    if (el.analyzeBtn) {
-        el.analyzeBtn.addEventListener(
-            'click',
-            analyzeMarket
-        );
-    }
-}
-
-
-/* =========================================================
-   INIT
-========================================================= */
-
-async function init() {
-    clearError();
-
-    clearCountdown();
-
-    setBackendStatus(
-        'CONNECTING...',
-        false
+    renderSelectedMarket(
+      data.selectedMarket
     );
 
-    bindEvents();
-
-    await checkHealth();
-
-    await refreshScanner();
-
-    startStatusRefresh();
+    window.__v861Performance =
+      data.performance ||
+      null;
 
     /*
-      No automatic signal generation on page load.
+    Since renderSelectedMarket may have
+    rebuilt the status container,
+    explicitly render performance/history
+    again after storing the data.
     */
+    renderPerformance(
+      data.performance ||
+        null
+    );
+
+    setStatus(
+      'LIVE DATA CONNECTED',
+      'success'
+    );
+
+    await refreshPerformanceAndHistory(
+      false
+    );
+  } catch (error) {
+    console.error(
+      '[PO AI V8.6.1]',
+      error
+    );
+
+    setStatus(
+      `Unable to load live market data: ${error.message}`,
+      'error'
+    );
+
+    if (!selectedMarket) {
+      setSignal(
+        'NO TRADE'
+      );
+
+      setConfidence(
+        null
+      );
+    }
+  } finally {
+    analyzing = false;
+  }
 }
 
+/* =========================================================
+   PERFORMANCE + HISTORY REFRESH
+========================================================= */
+
+async function refreshPerformanceAndHistory(
+  updateMain = false
+) {
+  try {
+    const [
+      performanceData,
+      historyData
+    ] = await Promise.all([
+      apiGet(
+        '/api/performance'
+      ),
+      apiGet(
+        `/api/history?limit=${HISTORY_LIMIT}`
+      )
+    ]);
+
+    const performance =
+      performanceData.performance ||
+      null;
+
+    const signals =
+      historyData.signals ||
+      [];
+
+    window.__v861Performance =
+      performance;
+
+    window.__v861History =
+      signals;
+
+    renderPerformance(
+      performance
+    );
+
+    renderHistory(
+      signals
+    );
+
+    /*
+    If the currently displayed signal
+    has just been settled, update its
+    result fields without choosing a
+    completely different market.
+    */
+    if (
+      selectedMarket &&
+      selectedMarket.signalId
+    ) {
+      const matching =
+        signals.find(
+          item =>
+            item.signalId ===
+            selectedMarket.signalId
+        );
+
+      if (matching) {
+        selectedMarket.resultStatus =
+          matching.result;
+
+        selectedMarket.entryPrice =
+          matching.entryPrice;
+
+        selectedMarket.exitPrice =
+          matching.exitPrice;
+
+        selectedMarket.settledAt =
+          matching.settledAt;
+
+        if (
+          matching.result !==
+          'PENDING'
+        ) {
+          setResultStatus(
+            matching.result
+          );
+        }
+      }
+    }
+
+    if (
+      updateMain
+    ) {
+      renderSelectedMarket(
+        selectedMarket
+      );
+    }
+  } catch (error) {
+    console.warn(
+      '[PERFORMANCE]',
+      error.message
+    );
+  }
+}
+
+/* =========================================================
+   AUTO REFRESH
+========================================================= */
+
+async function refreshCycle() {
+  /*
+  Don't continuously replace the
+  selected market every second.
+
+  The selected market is refreshed
+  every 10 seconds.
+  */
+  if (!analyzing) {
+    await analyzeMarket();
+  }
+}
+
+function startAutoRefresh() {
+  if (refreshTimer) {
+    clearInterval(
+      refreshTimer
+    );
+  }
+
+  refreshTimer =
+    setInterval(
+      () => {
+        refreshCycle();
+      },
+      REFRESH_INTERVAL
+    );
+}
+
+function startCountdown() {
+  if (countdownTimer) {
+    clearInterval(
+      countdownTimer
+    );
+  }
+
+  countdownTimer =
+    setInterval(
+      () => {
+        updateCountdown();
+        updateDynamicCountdown();
+      },
+      COUNTDOWN_INTERVAL
+    );
+}
+
+/* =========================================================
+   BUTTON BINDING
+========================================================= */
+
+function bindAnalyzeButton() {
+  const button =
+    findElement(
+      [
+        'analyzeButton',
+        'analyzeBtn',
+        'analyzeMarket',
+        'analyze'
+      ],
+      [
+        '#analyze-market',
+        '.analyze-button',
+        '.analyze-btn',
+        'button[data-action="analyze"]'
+      ]
+    );
+
+  if (!button) {
+    console.warn(
+      '[PO AI] Analyze button not found.'
+    );
+
+    return;
+  }
+
+  if (
+    button.dataset.v861Bound ===
+    'true'
+  ) {
+    return;
+  }
+
+  button.dataset.v861Bound =
+    'true';
+
+  button.addEventListener(
+    'click',
+    () => {
+      analyzeMarket();
+    }
+  );
+}
+
+/* =========================================================
+   GLOBAL CSS FOR SIGNAL COLORS
+========================================================= */
+
+function injectV861Styles() {
+  if (
+    document.getElementById(
+      'po-v861-styles'
+    )
+  ) {
+    return;
+  }
+
+  const style =
+    document.createElement(
+      'style'
+    );
+
+  style.id =
+    'po-v861-styles';
+
+  style.textContent = `
+    .call {
+      color: #19d66b !important;
+      font-weight: 800;
+    }
+
+    .put {
+      color: #ff4d5d !important;
+      font-weight: 800;
+    }
+
+    .no-trade {
+      color: #f0b84b !important;
+      font-weight: 800;
+    }
+
+    .win {
+      color: #19d66b !important;
+      font-weight: 800;
+    }
+
+    .loss {
+      color: #ff4d5d !important;
+      font-weight: 800;
+    }
+
+    .draw {
+      color: #f0b84b !important;
+      font-weight: 800;
+    }
+
+    .pending {
+      opacity: .8;
+      font-weight: 700;
+    }
+
+    #po-v861-status small {
+      opacity: .65;
+      font-size: 10px;
+    }
+
+    #po-v861-status strong {
+      font-size: 13px;
+    }
+
+    @media (max-width: 520px) {
+      #po-v861-performance
+        > div:nth-child(2) {
+        grid-template-columns:
+          repeat(2,minmax(0,1fr)) !important;
+      }
+    }
+  `;
+
+  document.head.appendChild(
+    style
+  );
+}
+
+/* =========================================================
+   INITIALIZATION
+========================================================= */
+
+async function initPOAI() {
+  console.log(
+    `PO AI Predictor ${API_URL} V8.6.1 frontend starting...`
+  );
+
+  injectV861Styles();
+
+  ensureV861UI();
+
+  bindAnalyzeButton();
+
+  startCountdown();
+
+  setStatus(
+    'Connecting to LIVE DATA...',
+    'loading'
+  );
+
+  /*
+  First analysis immediately.
+  */
+  await analyzeMarket();
+
+  /*
+  Automatic market refresh.
+  */
+  startAutoRefresh();
+
+  /*
+  Performance/history refresh
+  independent of market selection.
+  */
+  setInterval(
+    () => {
+      refreshPerformanceAndHistory(
+        false
+      );
+    },
+    10000
+  );
+}
 
 /* =========================================================
    DOM READY
 ========================================================= */
 
 if (
-    document.readyState ===
-    'loading'
+  document.readyState ===
+  'loading'
 ) {
-    document.addEventListener(
-        'DOMContentLoaded',
-        init
-    );
+  document.addEventListener(
+    'DOMContentLoaded',
+    initPOAI
+  );
 } else {
-    init();
+  initPOAI();
 }
