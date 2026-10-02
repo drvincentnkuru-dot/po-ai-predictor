@@ -1,607 +1,715 @@
-'use strict';
+// ============================================================
+// PO AI PREDICTOR
+// Backend V8.6.3
+// LIVE ONLY - Twelve Data
+//
+// V8.6.3 changes:
+// - MACD REMOVED
+// - CCI20 REMOVED
+// - Keeps EMA9/EMA21, RSI14, ADX14, Stochastic,
+//   Support/Resistance, Candlestick Patterns,
+//   Market Psychology
+// - Quota-safe: max 7 provider requests/minute
+// - Daily safety reserve
+// - Automatic signal registration
+// - Automatic WIN / LOSS / DRAW settlement
+// - Settlement loop independent from scanner
+// ============================================================
 
-/*
-===========================================================
- PO AI PREDICTOR
- V8.6.2 • QUOTA-SAFE SMART LIVE SCANNER
-
- SOURCE:
- Twelve Data LIVE ONLY
-
- FEATURES:
- • 24 LIVE forex pairs
- • 1m / 2m / 3m
- • EMA9 / EMA21
- • RSI14
- • MACD
- • Stochastic 14/3/3
- • CCI20
- • ATR14
- • ADX14
- • Support / Resistance
- • Candlestick patterns
- • Price-action market psychology
- • Smart CALL / PUT / NO TRADE
- • Automatic WIN / LOSS / DRAW settlement
- • Persistent in-memory best-market fallback
- • Quota-safe max 7 requests/minute
- • Automatic settlement every 10 seconds
-===========================================================
-*/
-
-const express = require('express');
-const cors = require('cors');
+const express = require("express");
 
 const app = express();
 
-app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-const VERSION = 'V8.6.2';
+const VERSION = "V8.6.3";
+const SOURCE = "Twelve Data LIVE";
+const TIMEZONE = "UTC";
 
-const TWELVE_DATA_API_KEY =
-  process.env.TWELVE_DATA_API_KEY || '';
+// ------------------------------------------------------------
+// ENV
+// ------------------------------------------------------------
 
-const TWELVE_DATA_URL =
-  'https://api.twelvedata.com/time_series';
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || "";
 
-/* =========================================================
-   CONFIG
-========================================================= */
+if (!TWELVE_DATA_API_KEY) {
+  console.warn("[WARNING] TWELVE_DATA_API_KEY is not configured.");
+}
+
+// ------------------------------------------------------------
+// PAIRS
+// ------------------------------------------------------------
 
 const PAIRS = [
-  'EUR/USD',
-  'GBP/USD',
-  'USD/JPY',
-  'USD/CHF',
-  'AUD/USD',
-  'USD/CAD',
-  'NZD/USD',
-  'EUR/GBP',
-  'EUR/JPY',
-  'GBP/JPY',
-  'AUD/JPY',
-  'CAD/JPY',
-  'CHF/JPY',
-  'EUR/AUD',
-  'EUR/CAD',
-  'EUR/CHF',
-  'GBP/AUD',
-  'GBP/CAD',
-  'GBP/CHF',
-  'NZD/JPY',
-  'NZD/CAD',
-  'AUD/CAD',
-  'AUD/CHF',
-  'CAD/CHF'
+  "EUR/USD",
+  "GBP/USD",
+  "USD/JPY",
+  "USD/CHF",
+  "AUD/USD",
+  "USD/CAD",
+  "NZD/USD",
+  "EUR/GBP",
+  "EUR/JPY",
+  "GBP/JPY",
+  "AUD/JPY",
+  "CAD/JPY",
+  "CHF/JPY",
+  "EUR/AUD",
+  "EUR/CAD",
+  "EUR/CHF",
+  "GBP/AUD",
+  "GBP/CAD",
+  "GBP/CHF",
+  "NZD/JPY",
+  "NZD/CAD",
+  "AUD/CAD",
+  "AUD/CHF",
+  "CAD/CHF"
 ];
 
 const TIMEFRAMES = [1, 2, 3];
 
-const MAX_CANDLES = 180;
-const MIN_CANDLES = 60;
+// ------------------------------------------------------------
+// SYSTEM SETTINGS
+// ------------------------------------------------------------
 
-/*
-IMPORTANT:
-
-Twelve Data account observed limit:
-8 credits/minute.
-
-We intentionally stay at:
-7 requests/minute.
-
-This leaves one request of safety margin.
-*/
+// Twelve Data provider limit observed by this project:
+// 8 credits/minute.
+//
+// We intentionally stay at 7 to keep a safety margin.
 const REQUEST_LIMIT_PER_MINUTE = 7;
 
-/*
-7 pairs per scan batch.
-
-24 pairs therefore rotate across approximately
-4 scan cycles.
-*/
+// Scanner requests one batch at a time.
 const SCAN_BATCH_SIZE = 7;
 
-/*
-V8.6.2:
-Instead of waiting 15 minutes between batches,
-we rotate one batch every minute.
-
-This gives:
-
-Minute 1 -> pairs 1-7
-Minute 2 -> pairs 8-14
-Minute 3 -> pairs 15-21
-Minute 4 -> pairs 22-24
-
-The result cache remains valid for 15 minutes.
-*/
+// One scan batch every minute.
 const SCAN_EVERY_MS = 60 * 1000;
 
-const SETTLEMENT_INTERVAL_MS =
-  10 * 1000;
+// Settlement checks every 10 seconds.
+const SETTLEMENT_INTERVAL_MS = 10 * 1000;
 
-const ENTRY_BUFFER_SECONDS = 30;
+// Keep market candle data for 15 minutes.
+const CACHE_TTL_MS = 15 * 60 * 1000;
 
-const SETTLEMENT_GRACE_SECONDS = 10;
-
-/*
-This is only the "freshness" marker.
-
-IMPORTANT:
-A result becoming older than 30 seconds
-does NOT delete the last valid selected market.
-
-That is the main V8.6.2 fix.
-*/
+// Keep selected result even after the "fresh" window.
 const RESULT_FRESH_MS = 30 * 1000;
 
-/*
-Cached pair candle data may be retained for 15 minutes.
-*/
-const CACHE_TTL_MS =
-  15 * 60 * 1000;
+// Signal must be visible at least 30 seconds before entry.
+const ENTRY_BUFFER_SECONDS = 30;
 
-/*
-Daily safety budget.
-*/
+// Settlement grace period.
+const SETTLEMENT_GRACE_SECONDS = 10;
+
+// Number of 1-minute candles requested.
+const MAX_CANDLES = 180;
+
+// Minimum candles required before analysis.
+const MIN_CANDLES = 60;
+
+// Daily budget.
+// We deliberately reserve credits.
 const DAILY_LIMIT = 768;
-const SAFETY_RESERVE = 32;
+const DAILY_SAFETY_RESERVE = 32;
 const MAX_DAILY_REQUESTS =
-  DAILY_LIMIT - SAFETY_RESERVE;
+  DAILY_LIMIT - DAILY_SAFETY_RESERVE;
 
-const HISTORY_SIZE = 5;
+// Signal history.
+const MAX_SIGNAL_HISTORY = 5;
 
-/* =========================================================
-   MEMORY
-========================================================= */
+// Maximum cache size.
+const MAX_CACHE_ENTRIES = 100;
 
-const pairCache = new Map();
+// ------------------------------------------------------------
+// STATE
+// ------------------------------------------------------------
 
-const resultCache = new Map();
+const candleCache = new Map();
 
-const signalHistory = [];
-
-const requestTimes = [];
-
-/*
-Current scanner position.
-*/
 let scanCursor = 0;
-
 let scanRunning = false;
 
 let lastScanAt = null;
-
 let lastScanError = null;
-
 let totalScanned = 0;
-
 let totalFailed = 0;
-
-/*
-Daily request counter.
-*/
-let dailyRequests = 0;
-
-let dailyDate = utcDateKey();
-
-/*
-Provider quota information.
-*/
-let lastProviderQuotaMessage = null;
-
-let lastProviderQuotaResetAt = null;
-
-/*
-===========================================================
-CRITICAL V8.6.2 FALLBACK
-
-This object is deliberately NOT deleted when it becomes
-older than RESULT_FRESH_MS.
-
-That prevents:
-
-"No fresh selected market is currently available."
-
-from appearing simply because 30 seconds elapsed.
-===========================================================
-*/
+let totalApiRequests = 0;
 
 let lastSelected = null;
-
 let lastSelectedAt = null;
 
-/* =========================================================
-   BASIC HELPERS
-========================================================= */
+let minuteRequestTimestamps = [];
 
-function utcDateKey() {
-  return new Date()
-    .toISOString()
-    .slice(0, 10);
+let dailyRequestDate = getUtcDateKey(new Date());
+let dailyRequests = 0;
+
+let quotaBlocked = false;
+let quotaBlockedUntil = null;
+let providerQuotaMessage = null;
+let providerQuotaResetAt = null;
+
+let minuteBlocked = false;
+let minuteResetAt = null;
+
+// Signal history.
+// Newest signal is stored first.
+const signalHistory = [];
+
+// ------------------------------------------------------------
+// HELPERS
+// ------------------------------------------------------------
+
+function getUtcDateKey(date) {
+  return date.toISOString().slice(0, 10);
 }
 
-function resetDailyIfNeeded() {
-  const today = utcDateKey();
-
-  if (today !== dailyDate) {
-    dailyDate = today;
-    dailyRequests = 0;
-  }
+function nowMs() {
+  return Date.now();
 }
 
 function sleep(ms) {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
-  );
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function clamp(value, min, max) {
-  return Math.max(
-    min,
-    Math.min(max, value)
-  );
+  return Math.max(min, Math.min(max, value));
 }
 
-function num(value) {
-  const n = Number(value);
+function roundNumber(value, decimals = 5) {
+  if (!Number.isFinite(value)) return null;
 
-  return Number.isFinite(n)
-    ? n
-    : null;
+  const factor = Math.pow(10, decimals);
+
+  return Math.round(value * factor) / factor;
 }
 
-function avg(values) {
-  if (!values.length) {
-    return null;
-  }
+function normalizePair(pair) {
+  if (!pair) return "";
 
-  return values.reduce(
-    (a, b) => a + b,
-    0
-  ) / values.length;
+  return String(pair)
+    .trim()
+    .toUpperCase()
+    .replace("-", "/");
 }
 
-function fmt(value, decimals = 5) {
-  if (value == null) {
-    return null;
-  }
-
-  return Number(
-    Number(value).toFixed(decimals)
-  );
+function pairToTwelveDataSymbol(pair) {
+  return normalizePair(pair).replace("/", "");
 }
 
-/* =========================================================
-   QUOTA
-========================================================= */
+function isSupportedPair(pair) {
+  return PAIRS.includes(normalizePair(pair));
+}
 
-function quotaState() {
-  resetDailyIfNeeded();
+function isSupportedTimeframe(tf) {
+  return TIMEFRAMES.includes(Number(tf));
+}
 
-  const now = Date.now();
+function getPriceDecimals(pair) {
+  const p = normalizePair(pair);
 
-  while (
-    requestTimes.length &&
-    requestTimes[0] <= now - 60000
+  if (
+    p.includes("JPY")
   ) {
-    requestTimes.shift();
+    return 3;
   }
 
-  const used = requestTimes.length;
+  return 5;
+}
+
+// ------------------------------------------------------------
+// DAILY REQUEST RESET
+// ------------------------------------------------------------
+
+function resetDailyBudgetIfNeeded() {
+  const today = getUtcDateKey(new Date());
+
+  if (today !== dailyRequestDate) {
+    dailyRequestDate = today;
+    dailyRequests = 0;
+
+    quotaBlocked = false;
+    quotaBlockedUntil = null;
+    providerQuotaMessage = null;
+    providerQuotaResetAt = null;
+  }
+}
+
+// ------------------------------------------------------------
+// MINUTE REQUEST TRACKER
+// ------------------------------------------------------------
+
+function cleanupMinuteRequests() {
+  const cutoff = nowMs() - 60 * 1000;
+
+  minuteRequestTimestamps =
+    minuteRequestTimestamps.filter(
+      (timestamp) => timestamp > cutoff
+    );
+}
+
+function getMinuteRequestCount() {
+  cleanupMinuteRequests();
+
+  return minuteRequestTimestamps.length;
+}
+
+function getSecondsUntilMinuteReset() {
+  cleanupMinuteRequests();
+
+  if (minuteRequestTimestamps.length === 0) {
+    return 0;
+  }
+
+  const oldest = minuteRequestTimestamps[0];
+
+  return Math.max(
+    0,
+    Math.ceil(
+      (oldest + 60 * 1000 - nowMs()) / 1000
+    )
+  );
+}
+
+function acquireRequestSlot() {
+  resetDailyBudgetIfNeeded();
+  cleanupMinuteRequests();
+
+  if (quotaBlocked) {
+    return {
+      allowed: false,
+      reason: "provider_quota_blocked",
+      retryAfterSeconds:
+        quotaBlockedUntil
+          ? Math.max(
+              0,
+              Math.ceil(
+                (quotaBlockedUntil - nowMs()) / 1000
+              )
+            )
+          : null
+    };
+  }
+
+  if (
+    dailyRequests >= MAX_DAILY_REQUESTS
+  ) {
+    return {
+      allowed: false,
+      reason: "daily_safety_budget_reached",
+      retryAfterSeconds: null
+    };
+  }
+
+  const usedThisMinute =
+    minuteRequestTimestamps.length;
+
+  if (
+    usedThisMinute >=
+    REQUEST_LIMIT_PER_MINUTE
+  ) {
+    const retry =
+      getSecondsUntilMinuteReset();
+
+    minuteBlocked = true;
+
+    minuteResetAt =
+      new Date(
+        nowMs() + retry * 1000
+      ).toISOString();
+
+    return {
+      allowed: false,
+      reason: "local_minute_budget_reached",
+      retryAfterSeconds: retry
+    };
+  }
+
+  minuteBlocked = false;
+  minuteResetAt = null;
+
+  minuteRequestTimestamps.push(nowMs());
+
+  dailyRequests += 1;
+  totalApiRequests += 1;
 
   return {
-    usedLastMinute: used,
-
-    remaining: Math.max(
-      0,
-      REQUEST_LIMIT_PER_MINUTE - used
-    ),
-
-    minuteBlocked:
-      used >= REQUEST_LIMIT_PER_MINUTE,
-
-    dailyRequests,
-
-    dailyRemaining:
-      Math.max(
-        0,
-        MAX_DAILY_REQUESTS - dailyRequests
-      )
+    allowed: true
   };
 }
 
-async function acquireRequestSlot() {
-  resetDailyIfNeeded();
+// ------------------------------------------------------------
+// TWELVE DATA FETCH
+// ------------------------------------------------------------
 
-  if (
-    dailyRequests >=
-    MAX_DAILY_REQUESTS
-  ) {
+async function fetchTwelveDataCandles(pair) {
+  const normalized = normalizePair(pair);
+
+  if (!isSupportedPair(normalized)) {
     throw new Error(
-      'Daily safety budget reached.'
+      `${normalized}: unsupported pair`
     );
   }
 
-  while (true) {
-    const now = Date.now();
+  const slot = acquireRequestSlot();
 
-    while (
-      requestTimes.length &&
-      requestTimes[0] <= now - 60000
-    ) {
-      requestTimes.shift();
-    }
-
-    if (
-      requestTimes.length <
-      REQUEST_LIMIT_PER_MINUTE
-    ) {
-      requestTimes.push(Date.now());
-
-      dailyRequests++;
-
-      return;
-    }
-
-    const wait =
-      Math.max(
-        250,
-        requestTimes[0] +
-          60000 -
-          now +
-          50
-      );
-
-    await sleep(
-      Math.min(wait, 5000)
+  if (!slot.allowed) {
+    const error = new Error(
+      `Request blocked: ${slot.reason}`
     );
-  }
-}
 
-/* =========================================================
-   TWELVE DATA
-========================================================= */
+    error.code = slot.reason;
+    error.retryAfterSeconds =
+      slot.retryAfterSeconds;
 
-async function fetchCandles(
-  pair,
-  outputsize = MAX_CANDLES
-) {
-  if (!TWELVE_DATA_API_KEY) {
-    throw new Error(
-      'TWELVE_DATA_API_KEY is not configured.'
-    );
+    throw error;
   }
 
-  await acquireRequestSlot();
+  const symbol =
+    pairToTwelveDataSymbol(normalized);
 
   const url =
-    `${TWELVE_DATA_URL}` +
-    `?symbol=${encodeURIComponent(pair)}` +
-    `&interval=1min` +
-    `&outputsize=${outputsize}` +
-    `&order=ASC` +
+    "https://api.twelvedata.com/time_series" +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    "&interval=1min" +
+    `&outputsize=${MAX_CANDLES}` +
+    "&order=ASC" +
     `&apikey=${encodeURIComponent(
       TWELVE_DATA_API_KEY
     )}`;
 
-  const response =
-    await fetch(url);
+  const response = await fetch(url);
 
   let data;
 
   try {
     data = await response.json();
   } catch {
-    throw new Error(
-      `Twelve Data HTTP ${response.status}: invalid JSON`
-    );
+    data = null;
   }
 
   if (!response.ok) {
     throw new Error(
-      `Twelve Data HTTP ${response.status}`
+      `${normalized}: Twelve Data HTTP ${response.status}`
     );
   }
 
-  if (
-    data.status === 'error' ||
-    data.code
-  ) {
+  if (!data) {
+    throw new Error(
+      `${normalized}: empty Twelve Data response`
+    );
+  }
+
+  if (data.status === "error") {
     const message =
       data.message ||
-      'Twelve Data error';
+      "Twelve Data returned an error";
+
+    const lower =
+      message.toLowerCase();
 
     if (
-      /credit|quota|limit|rate/i
-        .test(message)
+      lower.includes("run out") ||
+      lower.includes("credits") ||
+      lower.includes("rate limit") ||
+      lower.includes("too many")
     ) {
-      lastProviderQuotaMessage =
-        message;
+      quotaBlocked = true;
 
-      lastProviderQuotaResetAt =
+      providerQuotaMessage = message;
+
+      const retrySeconds = 60;
+
+      quotaBlockedUntil =
+        nowMs() + retrySeconds * 1000;
+
+      providerQuotaResetAt =
         new Date(
-          Date.now() + 60000
+          quotaBlockedUntil
         ).toISOString();
     }
 
-    throw new Error(message);
-  }
-
-  if (!Array.isArray(data.values)) {
     throw new Error(
-      'Twelve Data returned no candle values.'
+      `${normalized}: ${message}`
     );
   }
 
-  return data.values
-    .map(value => {
-      const rawTime =
-        String(value.datetime);
-
-      const normalized =
-        rawTime.endsWith('Z')
-          ? rawTime
-          : rawTime.replace(
-              ' ',
-              'T'
-            ) + 'Z';
-
-      return {
-        time:
-          new Date(
-            normalized
-          ).getTime(),
-
-        open:
-          num(value.open),
-
-        high:
-          num(value.high),
-
-        low:
-          num(value.low),
-
-        close:
-          num(value.close)
-      };
-    })
-    .filter(candle =>
-      candle.time &&
-      candle.open != null &&
-      candle.high != null &&
-      candle.low != null &&
-      candle.close != null
-    )
-    .sort(
-      (a, b) =>
-        a.time - b.time
+  if (
+    !Array.isArray(data.values)
+  ) {
+    throw new Error(
+      `${normalized}: Twelve Data returned no candle values`
     );
+  }
+
+  const candles =
+    data.values
+      .map((row) => ({
+        time: new Date(
+          row.datetime
+        ).getTime(),
+
+        open: Number(row.open),
+        high: Number(row.high),
+        low: Number(row.low),
+        close: Number(row.close)
+      }))
+      .filter(
+        (candle) =>
+          Number.isFinite(candle.time) &&
+          Number.isFinite(candle.open) &&
+          Number.isFinite(candle.high) &&
+          Number.isFinite(candle.low) &&
+          Number.isFinite(candle.close)
+      )
+      .sort(
+        (a, b) =>
+          a.time - b.time
+      );
+
+  if (
+    candles.length < MIN_CANDLES
+  ) {
+    throw new Error(
+      `${normalized}: insufficient candles (${candles.length}/${MIN_CANDLES})`
+    );
+  }
+
+  return candles;
 }
 
-/* =========================================================
-   TIMEFRAME AGGREGATION
-========================================================= */
+// ------------------------------------------------------------
+// CACHE
+// ------------------------------------------------------------
+
+function setCache(pair, candles) {
+  const normalized =
+    normalizePair(pair);
+
+  candleCache.set(
+    normalized,
+    {
+      candles,
+      fetchedAt: nowMs()
+    }
+  );
+
+  cleanupCache();
+}
+
+function getCache(pair) {
+  const normalized =
+    normalizePair(pair);
+
+  const item =
+    candleCache.get(normalized);
+
+  if (!item) {
+    return null;
+  }
+
+  if (
+    nowMs() - item.fetchedAt >
+    CACHE_TTL_MS
+  ) {
+    candleCache.delete(normalized);
+    return null;
+  }
+
+  return item;
+}
+
+function cleanupCache() {
+  if (
+    candleCache.size <=
+    MAX_CACHE_ENTRIES
+  ) {
+    return;
+  }
+
+  const entries =
+    Array.from(
+      candleCache.entries()
+    ).sort(
+      (a, b) =>
+        a[1].fetchedAt -
+        b[1].fetchedAt
+    );
+
+  while (
+    candleCache.size >
+    MAX_CACHE_ENTRIES
+  ) {
+    const oldest =
+      entries.shift();
+
+    if (!oldest) break;
+
+    candleCache.delete(
+      oldest[0]
+    );
+  }
+}
+
+async function getCandles(
+  pair,
+  options = {}
+) {
+  const {
+    forceFresh = false
+  } = options;
+
+  if (!forceFresh) {
+    const cached =
+      getCache(pair);
+
+    if (cached) {
+      return cached.candles;
+    }
+  }
+
+  const candles =
+    await fetchTwelveDataCandles(
+      pair
+    );
+
+  setCache(pair, candles);
+
+  return candles;
+}
+
+// ------------------------------------------------------------
+// TIMEFRAME AGGREGATION
+// ------------------------------------------------------------
 
 function aggregateCandles(
-  oneMinuteCandles,
+  candles,
   timeframe
 ) {
-  if (timeframe === 1) {
-    return oneMinuteCandles.slice();
+  const tf =
+    Number(timeframe);
+
+  if (tf === 1) {
+    return candles.slice();
   }
 
-  const buckets = new Map();
+  const groups = new Map();
 
-  const bucketMs =
-    timeframe * 60000;
+  for (const candle of candles) {
+    const date =
+      new Date(candle.time);
 
-  for (
-    const candle
-    of oneMinuteCandles
-  ) {
-    const key =
-      Math.floor(
-        candle.time / bucketMs
-      ) * bucketMs;
+    const year =
+      date.getUTCFullYear();
 
-    let bucket =
-      buckets.get(key);
+    const month =
+      date.getUTCMonth();
 
-    if (!bucket) {
-      bucket = {
-        time: key,
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-        count: 0
-      };
+    const day =
+      date.getUTCDate();
 
-      buckets.set(
-        key,
-        bucket
+    const hour =
+      date.getUTCHours();
+
+    const minute =
+      date.getUTCMinutes();
+
+    const bucketMinute =
+      Math.floor(minute / tf) *
+      tf;
+
+    const bucket =
+      Date.UTC(
+        year,
+        month,
+        day,
+        hour,
+        bucketMinute,
+        0,
+        0
       );
+
+    if (!groups.has(bucket)) {
+      groups.set(bucket, []);
     }
 
-    bucket.high =
-      Math.max(
-        bucket.high,
-        candle.high
-      );
-
-    bucket.low =
-      Math.min(
-        bucket.low,
-        candle.low
-      );
-
-    bucket.close =
-      candle.close;
-
-    bucket.count++;
+    groups.get(bucket).push(
+      candle
+    );
   }
 
-  return [
-    ...buckets.values()
-  ]
-    .filter(
-      bucket =>
-        bucket.count === timeframe
-    )
-    .sort(
-      (a, b) =>
-        a.time - b.time
-    );
+  const result = [];
+
+  for (const [
+    bucket,
+    rows
+  ] of groups.entries()) {
+    if (!rows.length) continue;
+
+    result.push({
+      time: bucket,
+      open: rows[0].open,
+      high: Math.max(
+        ...rows.map(
+          (r) => r.high
+        )
+      ),
+      low: Math.min(
+        ...rows.map(
+          (r) => r.low
+        )
+      ),
+      close:
+        rows[rows.length - 1]
+          .close
+    });
+  }
+
+  return result.sort(
+    (a, b) =>
+      a.time - b.time
+  );
 }
 
-/* =========================================================
-   INDICATORS
-========================================================= */
+// ------------------------------------------------------------
+// INDICATORS
+// ------------------------------------------------------------
 
-function ema(
-  values,
-  period
-) {
+function ema(values, period) {
   if (
+    !Array.isArray(values) ||
     values.length < period
   ) {
     return null;
   }
 
-  let current =
-    avg(
-      values.slice(
-        0,
-        period
-      )
-    );
-
   const multiplier =
     2 / (period + 1);
+
+  let result =
+    values
+      .slice(0, period)
+      .reduce(
+        (sum, value) =>
+          sum + value,
+        0
+      ) / period;
 
   for (
     let i = period;
     i < values.length;
     i++
   ) {
-    current =
-      values[i] *
+    result =
+      (values[i] - result) *
         multiplier +
-      current *
-        (1 - multiplier);
+      result;
   }
 
-  return current;
+  return result;
 }
 
-function rsi(
-  values,
-  period = 14
-) {
+function rsi(values, period = 14) {
   if (
     values.length <= period
   ) {
@@ -643,24 +751,22 @@ function rsi(
       values[i - 1];
 
     const gain =
-      Math.max(diff, 0);
+      diff > 0 ? diff : 0;
 
     const loss =
-      Math.max(-diff, 0);
+      diff < 0 ? -diff : 0;
 
     avgGain =
-      (
-        avgGain *
-          (period - 1) +
-        gain
-      ) / period;
+      (avgGain *
+        (period - 1) +
+        gain) /
+      period;
 
     avgLoss =
-      (
-        avgLoss *
-          (period - 1) +
-        loss
-      ) / period;
+      (avgLoss *
+        (period - 1) +
+        loss) /
+      period;
   }
 
   if (avgLoss === 0) {
@@ -676,197 +782,14 @@ function rsi(
   );
 }
 
-function macd(values) {
+function atr(candles, period = 14) {
   if (
-    values.length < 35
+    candles.length <= period
   ) {
     return null;
   }
 
-  const fast =
-    ema(values, 12);
-
-  const slow =
-    ema(values, 26);
-
-  if (
-    fast == null ||
-    slow == null
-  ) {
-    return null;
-  }
-
-  return {
-    line:
-      fast - slow
-  };
-}
-
-function stochastic(
-  candles
-) {
-  if (
-    candles.length < 17
-  ) {
-    return null;
-  }
-
-  const recent =
-    candles.slice(-14);
-
-  const highest =
-    Math.max(
-      ...recent.map(
-        c => c.high
-      )
-    );
-
-  const lowest =
-    Math.min(
-      ...recent.map(
-        c => c.low
-      )
-    );
-
-  const last =
-    candles.at(-1);
-
-  const k =
-    highest === lowest
-      ? 50
-      : (
-          (
-            last.close -
-            lowest
-          ) /
-          (
-            highest -
-            lowest
-          )
-        ) * 100;
-
-  const kValues = [];
-
-  for (
-    let i =
-      Math.max(
-        13,
-        candles.length - 5
-      );
-
-    i < candles.length;
-
-    i++
-  ) {
-    const window =
-      candles.slice(
-        i - 13,
-        i + 1
-      );
-
-    const high =
-      Math.max(
-        ...window.map(
-          c => c.high
-        )
-      );
-
-    const low =
-      Math.min(
-        ...window.map(
-          c => c.low
-        )
-      );
-
-    const value =
-      high === low
-        ? 50
-        : (
-            (
-              candles[i].close -
-              low
-            ) /
-            (high - low)
-          ) * 100;
-
-    kValues.push(value);
-  }
-
-  return {
-    k,
-    d:
-      avg(
-        kValues.slice(-3)
-      )
-  };
-}
-
-function cci(
-  candles,
-  period = 20
-) {
-  if (
-    candles.length < period
-  ) {
-    return null;
-  }
-
-  const typicalPrices =
-    candles.map(
-      candle =>
-        (
-          candle.high +
-          candle.low +
-          candle.close
-        ) / 3
-    );
-
-  const recent =
-    typicalPrices.slice(
-      -period
-    );
-
-  const mean =
-    avg(recent);
-
-  const meanDeviation =
-    avg(
-      recent.map(
-        value =>
-          Math.abs(
-            value - mean
-          )
-      )
-    );
-
-  if (!meanDeviation) {
-    return 0;
-  }
-
-  return (
-    (
-      typicalPrices.at(-1) -
-      mean
-    ) /
-    (
-      0.015 *
-      meanDeviation
-    )
-  );
-}
-
-function atr(
-  candles,
-  period = 14
-) {
-  if (
-    candles.length <
-    period + 1
-  ) {
-    return null;
-  }
-
-  const trueRanges = [];
+  const trs = [];
 
   for (
     let i = 1;
@@ -879,43 +802,61 @@ function atr(
     const previous =
       candles[i - 1];
 
-    trueRanges.push(
+    const tr =
       Math.max(
         current.high -
           current.low,
 
         Math.abs(
           current.high -
-          previous.close
+            previous.close
         ),
 
         Math.abs(
           current.low -
-          previous.close
+            previous.close
         )
-      )
-    );
+      );
+
+    trs.push(tr);
   }
 
-  return avg(
-    trueRanges.slice(
-      -period
-    )
-  );
+  if (trs.length < period) {
+    return null;
+  }
+
+  let value =
+    trs
+      .slice(0, period)
+      .reduce(
+        (a, b) => a + b,
+        0
+      ) / period;
+
+  for (
+    let i = period;
+    i < trs.length;
+    i++
+  ) {
+    value =
+      (value *
+        (period - 1) +
+        trs[i]) /
+      period;
+  }
+
+  return value;
 }
 
-function adx(
-  candles,
-  period = 14
-) {
+function adx(candles, period = 14) {
   if (
     candles.length <
-    period + 2
+    period * 2 + 1
   ) {
     return null;
   }
 
-  const trueRanges = [];
+  const trValues = [];
   const plusDM = [];
   const minusDM = [];
 
@@ -930,23 +871,6 @@ function adx(
     const previous =
       candles[i - 1];
 
-    trueRanges.push(
-      Math.max(
-        current.high -
-          current.low,
-
-        Math.abs(
-          current.high -
-          previous.close
-        ),
-
-        Math.abs(
-          current.low -
-          previous.close
-        )
-      )
-    );
-
     const upMove =
       current.high -
       previous.high;
@@ -955,307 +879,546 @@ function adx(
       previous.low -
       current.low;
 
+    const tr =
+      Math.max(
+        current.high -
+          current.low,
+
+        Math.abs(
+          current.high -
+            previous.close
+        ),
+
+        Math.abs(
+          current.low -
+            previous.close
+        )
+      );
+
+    trValues.push(tr);
+
     plusDM.push(
-      upMove >
-        downMove &&
+      upMove > downMove &&
       upMove > 0
         ? upMove
         : 0
     );
 
     minusDM.push(
-      downMove >
-        upMove &&
+      downMove > upMove &&
       downMove > 0
         ? downMove
         : 0
     );
   }
 
-  const tr =
-    avg(
-      trueRanges.slice(
-        -period
-      )
-    );
-
-  if (!tr) {
-    return 0;
+  if (
+    trValues.length <
+    period * 2
+  ) {
+    return null;
   }
 
-  const plus =
-    100 *
-    avg(
-      plusDM.slice(
-        -period
-      )
-    ) /
-    tr;
+  let trSmooth =
+    trValues
+      .slice(0, period)
+      .reduce(
+        (a, b) => a + b,
+        0
+      );
 
-  const minus =
-    100 *
-    avg(
-      minusDM.slice(
-        -period
-      )
-    ) /
-    tr;
+  let plusSmooth =
+    plusDM
+      .slice(0, period)
+      .reduce(
+        (a, b) => a + b,
+        0
+      );
 
-  return (
-    100 *
-    Math.abs(
-      plus - minus
-    ) /
-    Math.max(
-      0.000001,
-      plus + minus
-    )
-  );
+  let minusSmooth =
+    minusDM
+      .slice(0, period)
+      .reduce(
+        (a, b) => a + b,
+        0
+      );
+
+  const dxValues = [];
+
+  for (
+    let i = period;
+    i < trValues.length;
+    i++
+  ) {
+    if (i > period) {
+      trSmooth =
+        trSmooth -
+        trSmooth / period +
+        trValues[i];
+
+      plusSmooth =
+        plusSmooth -
+        plusSmooth / period +
+        plusDM[i];
+
+      minusSmooth =
+        minusSmooth -
+        minusSmooth / period +
+        minusDM[i];
+    }
+
+    const plusDI =
+      trSmooth === 0
+        ? 0
+        : (100 *
+            plusSmooth) /
+          trSmooth;
+
+    const minusDI =
+      trSmooth === 0
+        ? 0
+        : (100 *
+            minusSmooth) /
+          trSmooth;
+
+    const denominator =
+      plusDI + minusDI;
+
+    const dx =
+      denominator === 0
+        ? 0
+        : (100 *
+            Math.abs(
+              plusDI -
+                minusDI
+            )) /
+          denominator;
+
+    dxValues.push(dx);
+  }
+
+  if (
+    dxValues.length < period
+  ) {
+    return null;
+  }
+
+  let adxValue =
+    dxValues
+      .slice(0, period)
+      .reduce(
+        (a, b) => a + b,
+        0
+      ) / period;
+
+  for (
+    let i = period;
+    i < dxValues.length;
+    i++
+  ) {
+    adxValue =
+      (adxValue *
+        (period - 1) +
+        dxValues[i]) /
+      period;
+  }
+
+  return adxValue;
 }
 
-/* =========================================================
-   SUPPORT / RESISTANCE
-========================================================= */
-
-function supportResistance(
-  candles
+function stochastic(
+  candles,
+  period = 14,
+  signalPeriod = 3
 ) {
-  const recent =
-    candles.slice(-20);
+  if (
+    candles.length <
+    period + signalPeriod
+  ) {
+    return null;
+  }
+
+  const kValues = [];
+
+  for (
+    let i = period - 1;
+    i < candles.length;
+    i++
+  ) {
+    const window =
+      candles.slice(
+        i - period + 1,
+        i + 1
+      );
+
+    const highest =
+      Math.max(
+        ...window.map(
+          (c) => c.high
+        )
+      );
+
+    const lowest =
+      Math.min(
+        ...window.map(
+          (c) => c.low
+        )
+      );
+
+    const close =
+      candles[i].close;
+
+    const k =
+      highest === lowest
+        ? 50
+        : ((close - lowest) /
+            (highest - lowest)) *
+          100;
+
+    kValues.push(k);
+  }
+
+  if (
+    kValues.length <
+    signalPeriod
+  ) {
+    return null;
+  }
+
+  const k =
+    kValues[
+      kValues.length - 1
+    ];
+
+  const recentK =
+    kValues.slice(
+      -signalPeriod
+    );
+
+  const d =
+    recentK.reduce(
+      (a, b) => a + b,
+      0
+    ) / signalPeriod;
 
   return {
-    support:
-      Math.min(
-        ...recent.map(
-          candle =>
-            candle.low
-        )
-      ),
-
-    resistance:
-      Math.max(
-        ...recent.map(
-          candle =>
-            candle.high
-        )
-      )
+    k,
+    d
   };
 }
 
-/* =========================================================
-   CANDLESTICK PATTERNS
-========================================================= */
+function supportResistance(
+  candles,
+  lookback = 30
+) {
+  const rows =
+    candles.slice(-lookback);
 
-function detectPatterns(
+  if (!rows.length) {
+    return {
+      support: null,
+      resistance: null
+    };
+  }
+
+  const support =
+    Math.min(
+      ...rows.map(
+        (c) => c.low
+      )
+    );
+
+  const resistance =
+    Math.max(
+      ...rows.map(
+        (c) => c.high
+      )
+    );
+
+  return {
+    support,
+    resistance
+  };
+}
+
+// ------------------------------------------------------------
+// CANDLESTICK PATTERNS
+// ------------------------------------------------------------
+
+function detectCandlestickPatterns(
   candles
 ) {
   if (
     candles.length < 3
   ) {
-    return {};
+    return [];
   }
 
-  const previous =
-    candles.at(-2);
+  const a =
+    candles[candles.length - 3];
 
-  const current =
-    candles.at(-1);
+  const b =
+    candles[candles.length - 2];
 
-  const body =
+  const c =
+    candles[candles.length - 1];
+
+  const patterns = [];
+
+  const bodyC =
     Math.abs(
-      current.close -
-      current.open
+      c.close - c.open
     );
 
-  const range =
-    current.high -
-    current.low ||
-    1;
-
-  const lowerWick =
-    Math.min(
-      current.open,
-      current.close
-    ) -
-    current.low;
-
-  const upperWick =
-    current.high -
+  const rangeC =
     Math.max(
-      current.open,
-      current.close
+      c.high - c.low,
+      0.00000001
     );
 
-  const bullishEngulfing =
-    previous.close <
-      previous.open &&
-    current.close >
-      current.open &&
-    current.open <=
-      previous.close &&
-    current.close >=
-      previous.open;
+  const upperC =
+    c.high -
+    Math.max(
+      c.open,
+      c.close
+    );
 
-  const bearishEngulfing =
-    previous.close >
-      previous.open &&
-    current.close <
-      current.open &&
-    current.open >=
-      previous.close &&
-    current.close <=
-      previous.open;
+  const lowerC =
+    Math.min(
+      c.open,
+      c.close
+    ) - c.low;
 
-  const hammer =
-    lowerWick >
-      body * 2 &&
-    upperWick <
-      body * 0.8;
+  // Bullish engulfing
+  if (
+    b.close < b.open &&
+    c.close > c.open &&
+    c.open <= b.close &&
+    c.close >= b.open
+  ) {
+    patterns.push(
+      "bullish engulfing"
+    );
+  }
 
-  const shootingStar =
-    upperWick >
-      body * 2 &&
-    lowerWick <
-      body * 0.8;
+  // Bearish engulfing
+  if (
+    b.close > b.open &&
+    c.close < c.open &&
+    c.open >= b.close &&
+    c.close <= b.open
+  ) {
+    patterns.push(
+      "bearish engulfing"
+    );
+  }
 
-  const strongBullish =
-    current.close >
-      current.open &&
-    body / range >
-      0.6;
+  // Hammer
+  if (
+    lowerC >
+      bodyC * 2 &&
+    upperC <
+      bodyC &&
+    c.close >= c.open
+  ) {
+    patterns.push(
+      "hammer"
+    );
+  }
 
-  const strongBearish =
-    current.close <
-      current.open &&
-    body / range >
-      0.6;
+  // Shooting star
+  if (
+    upperC >
+      bodyC * 2 &&
+    lowerC <
+      bodyC &&
+    c.close <= c.open
+  ) {
+    patterns.push(
+      "shooting star"
+    );
+  }
 
-  return {
-    bullishEngulfing,
-    bearishEngulfing,
-    hammer,
-    shootingStar,
-    strongBullish,
-    strongBearish
-  };
+  // Strong bullish candle
+  if (
+    c.close > c.open &&
+    bodyC / rangeC >= 0.65
+  ) {
+    patterns.push(
+      "strong bullish candle"
+    );
+  }
+
+  // Strong bearish candle
+  if (
+    c.close < c.open &&
+    bodyC / rangeC >= 0.65
+  ) {
+    patterns.push(
+      "strong bearish candle"
+    );
+  }
+
+  // Three-candle momentum
+  if (
+    a.close > a.open &&
+    b.close > b.open &&
+    c.close > c.open
+  ) {
+    patterns.push(
+      "three bullish candles"
+    );
+  }
+
+  if (
+    a.close < a.open &&
+    b.close < b.open &&
+    c.close < c.open
+  ) {
+    patterns.push(
+      "three bearish candles"
+    );
+  }
+
+  return patterns;
 }
 
-/* =========================================================
-   MARKET PSYCHOLOGY
-========================================================= */
+// ------------------------------------------------------------
+// MARKET PSYCHOLOGY
+// ------------------------------------------------------------
 
 function marketPsychology(
   candles,
-  indicators
+  ema9,
+  ema21,
+  rsiValue,
+  adxValue
 ) {
+  if (
+    candles.length < 6
+  ) {
+    return {
+      direction: "neutral",
+      label: "neutral pressure"
+    };
+  }
+
   const recent =
     candles.slice(-5);
 
-  const bullish =
+  const bullishCount =
     recent.filter(
-      candle =>
-        candle.close >
-        candle.open
+      (c) => c.close > c.open
     ).length;
 
-  const bearish =
+  const bearishCount =
     recent.filter(
-      candle =>
-        candle.close <
-        candle.open
+      (c) => c.close < c.open
     ).length;
 
-  const current =
-    candles.at(-1);
+  const last =
+    candles[candles.length - 1];
 
-  const body =
-    Math.abs(
-      current.close -
-      current.open
-    );
+  const previous =
+    candles[candles.length - 2];
 
-  const range =
-    current.high -
-      current.low ||
-    1;
+  const priceMomentum =
+    last.close -
+    previous.close;
 
-  let pressure =
-    'BALANCED';
-
-  if (bullish > bearish) {
-    pressure =
-      'BUYER_PRESSURE';
-  }
-
-  if (bearish > bullish) {
-    pressure =
-      'SELLER_PRESSURE';
+  if (
+    ema9 != null &&
+    ema21 != null &&
+    ema9 > ema21 &&
+    bullishCount >= 3 &&
+    priceMomentum > 0
+  ) {
+    return {
+      direction: "bullish",
+      label: "buyer pressure"
+    };
   }
 
   if (
-    indicators.stochastic &&
-    indicators.rsi != null &&
-    indicators.stochastic.k > 80 &&
-    indicators.rsi > 60
+    ema9 != null &&
+    ema21 != null &&
+    ema9 < ema21 &&
+    bearishCount >= 3 &&
+    priceMomentum < 0
   ) {
-    pressure =
-      'BUYERS_EXTENDED';
+    return {
+      direction: "bearish",
+      label: "seller pressure"
+    };
   }
 
   if (
-    indicators.stochastic &&
-    indicators.rsi != null &&
-    indicators.stochastic.k < 20 &&
-    indicators.rsi < 40
+    adxValue != null &&
+    adxValue < 18
   ) {
-    pressure =
-      'SELLERS_EXTENDED';
+    return {
+      direction: "neutral",
+      label: "weak trend / ranging"
+    };
+  }
+
+  if (
+    rsiValue != null &&
+    rsiValue > 60
+  ) {
+    return {
+      direction: "bullish",
+      label: "positive momentum"
+    };
+  }
+
+  if (
+    rsiValue != null &&
+    rsiValue < 40
+  ) {
+    return {
+      direction: "bearish",
+      label: "negative momentum"
+    };
   }
 
   return {
-    pressure,
-
-    bullishCandles:
-      bullish,
-
-    bearishCandles:
-      bearish,
-
-    rejectionRatio:
-      fmt(
-        (
-          range - body
-        ) / range,
-        3
-      )
+    direction: "neutral",
+    label: "mixed pressure"
   };
 }
 
-/* =========================================================
-   ANALYSIS
-========================================================= */
+// ------------------------------------------------------------
+// ANALYSIS
+// ------------------------------------------------------------
 
 function analyzeCandles(
   candles,
+  pair,
   timeframe
 ) {
+  const tf =
+    Number(timeframe);
+
+  const aggregated =
+    aggregateCandles(
+      candles,
+      tf
+    );
+
   if (
-    candles.length <
+    aggregated.length <
     MIN_CANDLES
   ) {
     throw new Error(
-      `${timeframe}m: insufficient aggregated candles (${candles.length}/${MIN_CANDLES}).`
+      `${pair} ${tf}m: insufficient aggregated candles (${aggregated.length}/${MIN_CANDLES})`
     );
   }
 
   const closes =
-    candles.map(
-      candle =>
-        candle.close
+    aggregated.map(
+      (c) => c.close
     );
-
-  const currentPrice =
-    closes.at(-1);
 
   const ema9 =
     ema(closes, 9);
@@ -1263,524 +1426,646 @@ function analyzeCandles(
   const ema21 =
     ema(closes, 21);
 
-  const rsi14 =
+  const rsiValue =
     rsi(closes, 14);
 
-  const macdData =
-    macd(closes);
+  const atrValue =
+    atr(aggregated, 14);
 
-  const stochasticData =
-    stochastic(candles);
+  const adxValue =
+    adx(aggregated, 14);
 
-  const cci20 =
-    cci(candles, 20);
-
-  const atr14 =
-    atr(candles, 14);
-
-  const adx14 =
-    adx(candles, 14);
+  const stoch =
+    stochastic(
+      aggregated,
+      14,
+      3
+    );
 
   const sr =
     supportResistance(
-      candles
+      aggregated,
+      30
     );
 
   const patterns =
-    detectPatterns(
-      candles
+    detectCandlestickPatterns(
+      aggregated
     );
+
+  const currentPrice =
+    closes[closes.length - 1];
+
+  const previousPrice =
+    closes[closes.length - 2];
 
   let callScore = 0;
   let putScore = 0;
 
-  /* EMA */
+  const reasons = [];
+
+  // ----------------------------------------------------------
+  // EMA
+  // ----------------------------------------------------------
 
   if (
     ema9 != null &&
     ema21 != null
   ) {
     if (ema9 > ema21) {
-      callScore += 18;
+      callScore += 22;
+      reasons.push(
+        "EMA bullish"
+      );
     } else if (
       ema9 < ema21
     ) {
-      putScore += 18;
+      putScore += 22;
+      reasons.push(
+        "EMA bearish"
+      );
     }
   }
 
-  /* RSI */
+  // ----------------------------------------------------------
+  // RSI
+  // ----------------------------------------------------------
 
-  if (rsi14 != null) {
-    if (rsi14 >= 55) {
-      callScore += 12;
+  if (rsiValue != null) {
+    if (
+      rsiValue >= 52 &&
+      rsiValue <= 68
+    ) {
+      callScore += 14;
+
+      reasons.push(
+        `RSI ${rsiValue.toFixed(1)}`
+      );
     } else if (
-      rsi14 <= 45
+      rsiValue <= 48 &&
+      rsiValue >= 32
+    ) {
+      putScore += 14;
+
+      reasons.push(
+        `RSI ${rsiValue.toFixed(1)}`
+      );
+    } else if (
+      rsiValue > 68
+    ) {
+      putScore += 5;
+
+      reasons.push(
+        `RSI ${rsiValue.toFixed(1)} high`
+      );
+    } else if (
+      rsiValue < 32
+    ) {
+      callScore += 5;
+
+      reasons.push(
+        `RSI ${rsiValue.toFixed(1)} low`
+      );
+    } else {
+      reasons.push(
+        `RSI ${rsiValue.toFixed(1)}`
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // ADX
+  // ----------------------------------------------------------
+
+  if (adxValue != null) {
+    if (adxValue >= 25) {
+      callScore +=
+        ema9 > ema21
+          ? 10
+          : 0;
+
+      putScore +=
+        ema9 < ema21
+          ? 10
+          : 0;
+
+      reasons.push(
+        `ADX ${adxValue.toFixed(1)}`
+      );
+    } else {
+      reasons.push(
+        `ADX ${adxValue.toFixed(1)} weak`
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // STOCHASTIC
+  // ----------------------------------------------------------
+
+  if (stoch) {
+    if (
+      stoch.k >
+        stoch.d &&
+      stoch.k < 85
+    ) {
+      callScore += 12;
+
+      reasons.push(
+        `Stoch K ${stoch.k.toFixed(
+          1
+        )} / D ${stoch.d.toFixed(1)}`
+      );
+    } else if (
+      stoch.k <
+        stoch.d &&
+      stoch.k > 15
     ) {
       putScore += 12;
+
+      reasons.push(
+        `Stoch K ${stoch.k.toFixed(
+          1
+        )} / D ${stoch.d.toFixed(1)}`
+      );
+    } else {
+      reasons.push(
+        `Stoch K ${stoch.k.toFixed(
+          1
+        )} / D ${stoch.d.toFixed(1)}`
+      );
     }
   }
 
-  /* MACD */
-
-  if (macdData) {
-    if (
-      macdData.line > 0
-    ) {
-      callScore += 10;
-    } else if (
-      macdData.line < 0
-    ) {
-      putScore += 10;
-    }
-  }
-
-  /* STOCHASTIC */
-
-  if (stochasticData) {
-    if (
-      stochasticData.k >
-        stochasticData.d &&
-      stochasticData.k < 80
-    ) {
-      callScore += 10;
-    } else if (
-      stochasticData.k <
-        stochasticData.d &&
-      stochasticData.k > 20
-    ) {
-      putScore += 10;
-    }
-  }
-
-  /* CCI20 */
-
-  if (cci20 != null) {
-    if (cci20 > 50) {
-      callScore += 10;
-    } else if (
-      cci20 < -50
-    ) {
-      putScore += 10;
-    }
-  }
-
-  /* ADX + trend */
+  // ----------------------------------------------------------
+  // PRICE MOMENTUM
+  // ----------------------------------------------------------
 
   if (
-    adx14 != null &&
-    adx14 >= 18
+    Number.isFinite(
+      previousPrice
+    )
   ) {
     if (
-      ema9 != null &&
-      ema21 != null &&
-      ema9 > ema21
+      currentPrice >
+      previousPrice
     ) {
       callScore += 8;
     } else if (
-      ema9 != null &&
-      ema21 != null &&
-      ema9 < ema21
+      currentPrice <
+      previousPrice
     ) {
       putScore += 8;
     }
   }
 
-  /* Candle patterns */
+  // ----------------------------------------------------------
+  // CANDLESTICK PATTERNS
+  // ----------------------------------------------------------
 
-  if (
-    patterns.bullishEngulfing ||
-    patterns.hammer ||
-    patterns.strongBullish
-  ) {
-    callScore += 10;
+  for (const pattern of patterns) {
+    const bullish =
+      pattern.includes(
+        "bullish"
+      ) ||
+      pattern === "hammer";
+
+    const bearish =
+      pattern.includes(
+        "bearish"
+      ) ||
+      pattern ===
+        "shooting star";
+
+    if (bullish) {
+      callScore += 7;
+    }
+
+    if (bearish) {
+      putScore += 7;
+    }
   }
 
-  if (
-    patterns.bearishEngulfing ||
-    patterns.shootingStar ||
-    patterns.strongBearish
-  ) {
-    putScore += 10;
+  if (patterns.length) {
+    reasons.push(
+      patterns
+        .slice(0, 2)
+        .join(" • ")
+    );
   }
 
-  /* Support / resistance */
+  // ----------------------------------------------------------
+  // MARKET PSYCHOLOGY
+  // ----------------------------------------------------------
+
+  const psychology =
+    marketPsychology(
+      aggregated,
+      ema9,
+      ema21,
+      rsiValue,
+      adxValue
+    );
 
   if (
-    currentPrice >
-    sr.resistance
+    psychology.direction ===
+    "bullish"
   ) {
-    callScore += 5;
+    callScore += 8;
+    reasons.push(
+      psychology.label
+    );
   } else if (
-    currentPrice <
-    sr.support
+    psychology.direction ===
+    "bearish"
   ) {
-    putScore += 5;
+    putScore += 8;
+    reasons.push(
+      psychology.label
+    );
+  } else {
+    reasons.push(
+      psychology.label
+    );
   }
 
-  const strongest =
-    Math.max(
-      callScore,
-      putScore
+  // ----------------------------------------------------------
+  // SUPPORT / RESISTANCE
+  // ----------------------------------------------------------
+
+  if (
+    sr.support != null &&
+    sr.resistance != null
+  ) {
+    const range =
+      sr.resistance -
+      sr.support;
+
+    if (
+      range > 0
+    ) {
+      const position =
+        (currentPrice -
+          sr.support) /
+        range;
+
+      // Avoid CALL too close to resistance.
+      if (
+        position < 0.75 &&
+        psychology.direction ===
+          "bullish"
+      ) {
+        callScore += 3;
+      }
+
+      // Avoid PUT too close to support.
+      if (
+        position > 0.25 &&
+        psychology.direction ===
+          "bearish"
+      ) {
+        putScore += 3;
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // FINAL SCORING
+  // ----------------------------------------------------------
+
+  callScore =
+    Math.round(
+      clamp(
+        callScore,
+        0,
+        95
+      )
+    );
+
+  putScore =
+    Math.round(
+      clamp(
+        putScore,
+        0,
+        95
+      )
     );
 
   const difference =
     Math.abs(
       callScore -
-      putScore
+        putScore
     );
 
-  const total =
-    callScore +
-    putScore;
-
-  let signal =
-    'NO TRADE';
+  let signal = "NO TRADE";
 
   let confidence = 40;
 
-  /*
-  Only issue a directional signal when
-  there is enough score and enough separation.
-  */
-
   if (
-    total >= 55 &&
-    difference >= 15
+    callScore >= 58 &&
+    callScore >
+      putScore &&
+    difference >= 12
   ) {
-    signal =
-      callScore >
-      putScore
-        ? 'CALL'
-        : 'PUT';
+    signal = "CALL";
 
     confidence =
-      clamp(
-        55 +
-          Math.round(
-            (
-              strongest /
-              Math.max(
-                1,
-                total
-              )
-            ) *
-              40
+      Math.round(
+        clamp(
+          callScore +
+            difference * 0.35,
+          70,
+          95
+        )
+      );
+  } else if (
+    putScore >= 58 &&
+    putScore >
+      callScore &&
+    difference >= 12
+  ) {
+    signal = "PUT";
+
+    confidence =
+      Math.round(
+        clamp(
+          putScore +
+            difference * 0.35,
+          70,
+          95
+        )
+      );
+  } else {
+    // NO TRADE should never be presented
+    // as a 70-95% directional confidence.
+    confidence =
+      Math.round(
+        clamp(
+          Math.max(
+            callScore,
+            putScore
           ),
-        55,
-        95
+          0,
+          69
+        )
       );
   }
 
-  const psychology =
-    marketPsychology(
-      candles,
-      {
-        stochastic:
-          stochasticData,
+  // ----------------------------------------------------------
+  // ENTRY / EXPIRY
+  // ----------------------------------------------------------
 
-        rsi:
-          rsi14
-      }
-    );
+  const now =
+    new Date();
 
-  const reasons = [];
+  const currentTime =
+    now.getTime();
 
+  const tfMs =
+    tf * 60 * 1000;
+
+  let entryTime =
+    Math.ceil(
+      currentTime /
+        tfMs
+    ) * tfMs;
+
+  // Make sure signal is visible at least
+  // ENTRY_BUFFER_SECONDS before entry.
   if (
-    ema9 != null &&
-    ema21 != null
+    entryTime -
+      currentTime <
+    ENTRY_BUFFER_SECONDS *
+      1000
   ) {
-    reasons.push(
-      ema9 > ema21
-        ? 'EMA bullish'
-        : 'EMA bearish'
-    );
+    entryTime += tfMs;
   }
 
-  if (
-    rsi14 != null
-  ) {
-    reasons.push(
-      `RSI ${fmt(
-        rsi14,
-        1
-      )}`
-    );
-  }
+  const expiryTime =
+    entryTime + tfMs;
 
-  if (
-    stochasticData
-  ) {
-    reasons.push(
-      `Stoch K ${fmt(
-        stochasticData.k,
-        1
-      )} / D ${fmt(
-        stochasticData.d,
-        1
-      )}`
-    );
-  }
-
-  if (
-    cci20 != null
-  ) {
-    reasons.push(
-      `CCI20 ${fmt(
-        cci20,
-        1
-      )}`
-    );
-  }
-
-  if (macdData) {
-    reasons.push(
-      macdData.line > 0
-        ? 'MACD bullish'
-        : 'MACD bearish'
-    );
-  }
-
-  if (
-    adx14 != null
-  ) {
-    reasons.push(
-      `ADX ${fmt(
-        adx14,
-        1
-      )}`
-    );
-  }
-
-  reasons.push(
-    psychology.pressure
-      .replaceAll(
-        '_',
-        ' '
+  const entryInSeconds =
+    Math.max(
+      0,
+      Math.ceil(
+        (entryTime -
+          currentTime) /
+          1000
       )
-      .toLowerCase()
-  );
+    );
+
+  const decimals =
+    getPriceDecimals(pair);
 
   return {
+    pair,
+    timeframe: tf,
+
     signal,
 
     confidence,
 
+    callScore,
+    putScore,
+
     currentPrice:
-      fmt(
+      roundNumber(
         currentPrice,
-        5
+        decimals
       ),
+
+    predictedPrice:
+      roundNumber(
+        currentPrice,
+        decimals
+      ),
+
+    entryTime:
+      new Date(
+        entryTime
+      ).toISOString(),
+
+    expiryTime:
+      new Date(
+        expiryTime
+      ).toISOString(),
+
+    entryInSeconds,
+
+    marketCondition:
+      psychology.label,
+
+    psychology:
+      psychology.label,
+
+    patterns,
 
     indicators: {
       ema9:
-        fmt(
-          ema9,
-          5
-        ),
+        ema9 == null
+          ? null
+          : roundNumber(
+              ema9,
+              decimals
+            ),
 
       ema21:
-        fmt(
-          ema21,
-          5
-        ),
+        ema21 == null
+          ? null
+          : roundNumber(
+              ema21,
+              decimals
+            ),
 
-      rsi:
-        fmt(
-          rsi14,
-          2
-        ),
+      rsi14:
+        rsiValue == null
+          ? null
+          : roundNumber(
+              rsiValue,
+              2
+            ),
 
-      macd:
-        macdData
-          ? fmt(
-              macdData.line,
-              6
-            )
-          : null,
+      adx14:
+        adxValue == null
+          ? null
+          : roundNumber(
+              adxValue,
+              2
+            ),
 
-      stochastic:
-        stochasticData
-          ? {
-              k:
-                fmt(
-                  stochasticData.k,
-                  2
-                ),
+      stochasticK:
+        stoch == null
+          ? null
+          : roundNumber(
+              stoch.k,
+              2
+            ),
 
-              d:
-                fmt(
-                  stochasticData.d,
-                  2
-                )
-            }
-          : null,
+      stochasticD:
+        stoch == null
+          ? null
+          : roundNumber(
+              stoch.d,
+              2
+            ),
 
-      cci20:
-        fmt(
-          cci20,
-          2
-        ),
-
-      atr:
-        fmt(
-          atr14,
-          6
-        ),
-
-      adx:
-        fmt(
-          adx14,
-          2
-        ),
+      atr14:
+        atrValue == null
+          ? null
+          : roundNumber(
+              atrValue,
+              decimals
+            ),
 
       support:
-        fmt(
-          sr.support,
-          5
-        ),
+        sr.support == null
+          ? null
+          : roundNumber(
+              sr.support,
+              decimals
+            ),
 
       resistance:
-        fmt(
-          sr.resistance,
-          5
-        ),
-
-      candlestickPatterns:
-        patterns,
-
-      marketPsychology:
-        psychology
+        sr.resistance == null
+          ? null
+          : roundNumber(
+              sr.resistance,
+              decimals
+            )
     },
 
-    reasons
+    reasons: reasons.slice(
+      0,
+      8
+    )
   };
 }
 
-/* =========================================================
-   ENTRY / EXPIRY
-========================================================= */
+// ------------------------------------------------------------
+// SIGNAL REGISTRY
+// ------------------------------------------------------------
 
-function nextEntry(
-  timeframe,
-  now = Date.now()
+function createSignalKey(
+  analysis
 ) {
-  const timeframeMs =
-    timeframe * 60000;
-
-  const nextBoundary =
-    (
-      Math.floor(
-        now / timeframeMs
-      ) + 1
-    ) *
-    timeframeMs;
-
-  /*
-  Never create an entry less than 30 seconds away.
-  */
-
-  if (
-    nextBoundary -
-      now <
-    ENTRY_BUFFER_SECONDS *
-      1000
-  ) {
-    return (
-      nextBoundary +
-      timeframeMs
-    );
-  }
-
-  return nextBoundary;
+  return [
+    analysis.pair,
+    analysis.timeframe,
+    new Date(
+      analysis.entryTime
+    ).getTime(),
+    analysis.signal
+  ].join(":");
 }
 
-/* =========================================================
-   SIGNAL TRACKING
-========================================================= */
-
-function signalKey(
-  pair,
-  timeframe,
-  entryTime,
-  signal
-) {
-  return (
-    `${pair}:${timeframe}:${entryTime}:${signal}`
+function findSignalByKey(key) {
+  return signalHistory.find(
+    (signal) =>
+      signal.key === key
   );
 }
 
 function registerSignal(
-  result
+  analysis
 ) {
   if (
-    result.signal ===
-    'NO TRADE'
+    !analysis ||
+    analysis.signal ===
+      "NO TRADE"
   ) {
     return null;
   }
 
-  const entry =
-    nextEntry(
-      result.timeframe
-    );
-
-  const expiry =
-    entry +
-    result.timeframe *
-      60000;
-
   const key =
-    signalKey(
-      result.pair,
-      result.timeframe,
-      entry,
-      result.signal
+    createSignalKey(
+      analysis
     );
 
   const existing =
-    signalHistory.find(
-      item =>
-        item.key === key
-    );
+    findSignalByKey(key);
 
   if (existing) {
     return existing;
   }
 
-  const signal = {
-    signalId:
-      `PO862-${Date.now()}-${signalHistory.length + 1}`,
+  const signalId =
+    `PO863-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 7)}`;
 
+  const record = {
+    signalId,
     key,
 
     pair:
-      result.pair,
+      analysis.pair,
 
     timeframe:
-      result.timeframe,
+      analysis.timeframe,
 
     signal:
-      result.signal,
+      analysis.signal,
 
     confidence:
-      result.confidence,
+      analysis.confidence,
+
+    callScore:
+      analysis.callScore,
+
+    putScore:
+      analysis.putScore,
 
     analysisTime:
       new Date().toISOString(),
 
     entryTime:
-      new Date(
-        entry
-      ).toISOString(),
+      analysis.entryTime,
 
     expiryTime:
-      new Date(
-        expiry
-      ).toISOString(),
+      analysis.expiryTime,
 
     predictedPrice:
-      result.currentPrice,
+      analysis.predictedPrice,
 
     entryPrice:
       null,
@@ -1789,7 +2074,7 @@ function registerSignal(
       null,
 
     result:
-      'PENDING',
+      "PENDING",
 
     settledAt:
       null,
@@ -1799,582 +2084,22 @@ function registerSignal(
   };
 
   signalHistory.unshift(
-    signal
+    record
   );
 
-  /*
-  Keep newest signals only.
-  */
-
-  if (
+  while (
     signalHistory.length >
-    HISTORY_SIZE
+    MAX_SIGNAL_HISTORY
   ) {
-    signalHistory.length =
-      HISTORY_SIZE;
+    signalHistory.pop();
   }
 
-  return signal;
+  return record;
 }
 
-/* =========================================================
-   RESULT OBJECT
-========================================================= */
-
-function makeResult(
-  pair,
-  timeframe,
-  analysis
-) {
-  const entry =
-    nextEntry(
-      timeframe
-    );
-
-  const expiry =
-    entry +
-    timeframe *
-      60000;
-
-  const result = {
-    ...analysis,
-
-    pair,
-
-    timeframe,
-
-    entryTime:
-      new Date(
-        entry
-      ).toISOString(),
-
-    expiryTime:
-      new Date(
-        expiry
-      ).toISOString(),
-
-    resultStatus:
-      'PENDING'
-  };
-
-  const signal =
-    registerSignal(
-      result
-    );
-
-  if (signal) {
-    result.signalId =
-      signal.signalId;
-
-    result.resultStatus =
-      signal.result;
-  }
-
-  return result;
-}
-
-/* =========================================================
-   BEST MARKET SELECTION
-========================================================= */
-
-function chooseBest() {
-  const now =
-    Date.now();
-
-  const candidates =
-    [
-      ...resultCache.values()
-    ].filter(result => {
-      const entry =
-        new Date(
-          result.entryTime
-        ).getTime();
-
-      return (
-        result.signal !==
-          'NO TRADE' &&
-        result.confidence >=
-          55 &&
-        entry > now
-      );
-    });
-
-  if (!candidates.length) {
-    return lastSelected;
-  }
-
-  candidates.sort(
-    (a, b) => {
-      if (
-        b.confidence !==
-        a.confidence
-      ) {
-        return (
-          b.confidence -
-          a.confidence
-        );
-      }
-
-      return (
-        new Date(
-          a.entryTime
-        ).getTime() -
-        new Date(
-          b.entryTime
-        ).getTime()
-      );
-    }
-  );
-
-  const best =
-    candidates[0];
-
-  lastSelected = {
-    ...best,
-
-    selectedAt:
-      new Date().toISOString(),
-
-    fresh:
-      true,
-
-    stale:
-      false
-  };
-
-  lastSelectedAt =
-    Date.now();
-
-  return lastSelected;
-}
-
-/*
-===========================================================
-V8.6.2 FIX
-
-Fresh result:
-    fresh=true
-    stale=false
-
-Older than 30 sec:
-    fresh=false
-    stale=true
-
-BUT:
-    lastSelected remains available.
-
-Therefore /api/best does NOT become empty
-just because RESULT_FRESH_MS expired.
-===========================================================
-*/
-
-function getBest() {
-  const now =
-    Date.now();
-
-  if (
-    lastSelected &&
-    lastSelectedAt
-  ) {
-    const age =
-      now -
-      lastSelectedAt;
-
-    const isFresh =
-      age <=
-      RESULT_FRESH_MS;
-
-    return {
-      ...lastSelected,
-
-      fresh:
-        isFresh,
-
-      stale:
-        !isFresh,
-
-      staleSeconds:
-        Math.floor(
-          age / 1000
-        )
-    };
-  }
-
-  /*
-  Fallback to cached results if
-  lastSelected has not been initialized.
-  */
-
-  const selected =
-    chooseBest();
-
-  if (selected) {
-    return {
-      ...selected,
-
-      fresh: false,
-
-      stale: true
-    };
-  }
-
-  return null;
-}
-
-/* =========================================================
-   SCANNER
-========================================================= */
-
-async function scanBatch() {
-  if (scanRunning) {
-    return;
-  }
-
-  scanRunning = true;
-
-  lastScanError = null;
-
-  const start =
-    scanCursor;
-
-  const batch =
-    Array.from(
-      {
-        length:
-          Math.min(
-            SCAN_BATCH_SIZE,
-            PAIRS.length
-          )
-      },
-      (_, index) =>
-        PAIRS[
-          (start + index) %
-            PAIRS.length
-        ]
-    );
-
-  scanCursor =
-    (
-      start +
-      batch.length
-    ) %
-    PAIRS.length;
-
-  try {
-    for (
-      const pair
-      of batch
-    ) {
-      try {
-        /*
-        One Twelve Data request per pair.
-
-        All 1m / 2m / 3m analyses
-        are built locally from this data.
-        */
-
-        const candles =
-          await fetchCandles(
-            pair,
-            MAX_CANDLES
-          );
-
-        pairCache.set(
-          pair,
-          {
-            candles,
-
-            updatedAt:
-              Date.now()
-          }
-        );
-
-        for (
-          const timeframe
-          of TIMEFRAMES
-        ) {
-          try {
-            const aggregated =
-              aggregateCandles(
-                candles,
-                timeframe
-              );
-
-            const analysis =
-              analyzeCandles(
-                aggregated,
-                timeframe
-              );
-
-            const result =
-              makeResult(
-                pair,
-                timeframe,
-                analysis
-              );
-
-            resultCache.set(
-              `${pair}:${timeframe}`,
-              {
-                ...result,
-
-                cachedAt:
-                  Date.now()
-              }
-            );
-          } catch (error) {
-            /*
-            A single timeframe problem
-            must not crash the whole pair.
-            */
-
-            lastScanError =
-              `${pair}: ${error.message}`;
-          }
-        }
-
-        totalScanned++;
-      } catch (error) {
-        totalFailed++;
-
-        lastScanError =
-          `${pair}: ${error.message}`;
-      }
-    }
-
-    /*
-    Select best after batch.
-    */
-
-    chooseBest();
-  } finally {
-    lastScanAt =
-      new Date().toISOString();
-
-    scanRunning = false;
-  }
-}
-
-/* =========================================================
-   AUTOMATIC SETTLEMENT
-========================================================= */
-
-async function settleDueSignals() {
-  const now =
-    Date.now();
-
-  const due =
-    signalHistory.filter(
-      signal => {
-        if (
-          signal.result !==
-          'PENDING'
-        ) {
-          return false;
-        }
-
-        const expiry =
-          new Date(
-            signal.expiryTime
-          ).getTime();
-
-        return (
-          expiry +
-            SETTLEMENT_GRACE_SECONDS *
-              1000 <=
-          now
-        );
-      }
-    );
-
-  if (!due.length) {
-    return;
-  }
-
-  /*
-  Group signals by pair.
-
-  One fresh Twelve Data request can
-  settle multiple timeframes/signals
-  for the same pair.
-  */
-
-  const byPair =
-    new Map();
-
-  for (
-    const signal
-    of due
-  ) {
-    if (
-      !byPair.has(
-        signal.pair
-      )
-    ) {
-      byPair.set(
-        signal.pair,
-        []
-      );
-    }
-
-    byPair
-      .get(signal.pair)
-      .push(signal);
-  }
-
-  for (
-    const [
-      pair,
-      signals
-    ] of byPair
-  ) {
-    try {
-      /*
-      This request is quota-controlled
-      by acquireRequestSlot().
-      */
-
-      const candles =
-        await fetchCandles(
-          pair,
-          MAX_CANDLES
-        );
-
-      pairCache.set(
-        pair,
-        {
-          candles,
-
-          updatedAt:
-            Date.now()
-        }
-      );
-
-      for (
-        const signal
-        of signals
-      ) {
-        const timeframe =
-          signal.timeframe;
-
-        const aggregated =
-          aggregateCandles(
-            candles,
-            timeframe
-          );
-
-        const entryTime =
-          new Date(
-            signal.entryTime
-          ).getTime();
-
-        const expiryTime =
-          new Date(
-            signal.expiryTime
-          ).getTime();
-
-        /*
-        Entry candle:
-        use its OPEN.
-
-        Expiry candle:
-        use its CLOSE.
-        */
-
-        const entryCandle =
-          aggregated.find(
-            candle =>
-              candle.time ===
-              entryTime
-          );
-
-        let expiryCandle =
-          aggregated.find(
-            candle =>
-              candle.time ===
-              expiryTime
-          );
-
-        /*
-        Safety fallback:
-        if provider candle alignment
-        differs by one timeframe bucket,
-        use previous matching bucket.
-        */
-
-        if (
-          !expiryCandle
-        ) {
-          expiryCandle =
-            aggregated.find(
-              candle =>
-                candle.time ===
-                (
-                  expiryTime -
-                  timeframe *
-                    60000
-                )
-            );
-        }
-
-        if (
-          !entryCandle ||
-          !expiryCandle
-        ) {
-          /*
-          Keep PENDING.
-
-          Next settlement cycle will retry.
-          */
-
-          continue;
-        }
-
-        signal.entryPrice =
-          entryCandle.open;
-
-        signal.exitPrice =
-          expiryCandle.close;
-
-        if (
-          signal.exitPrice ===
-          signal.entryPrice
-        ) {
-          signal.result =
-            'DRAW';
-        } else if (
-          signal.signal ===
-          'CALL'
-        ) {
-          signal.result =
-            signal.exitPrice >
-            signal.entryPrice
-              ? 'WIN'
-              : 'LOSS';
-        } else {
-          signal.result =
-            signal.exitPrice <
-            signal.entryPrice
-              ? 'WIN'
-              : 'LOSS';
-        }
-
-        signal.settledAt =
-          new Date().toISOString();
-
-        signal.settlementSource =
-          'Twelve Data LIVE candle';
-      }
-    } catch (error) {
-      lastScanError =
-        `Settlement ${pair}: ${error.message}`;
-    }
-  }
-}
-
-/* =========================================================
-   PERFORMANCE
-========================================================= */
+// ------------------------------------------------------------
+// PERFORMANCE
+// ------------------------------------------------------------
 
 function getPerformance() {
   const total =
@@ -2382,30 +2107,30 @@ function getPerformance() {
 
   const pending =
     signalHistory.filter(
-      signal =>
-        signal.result ===
-        'PENDING'
+      (s) =>
+        s.result ===
+        "PENDING"
     ).length;
 
   const wins =
     signalHistory.filter(
-      signal =>
-        signal.result ===
-        'WIN'
+      (s) =>
+        s.result ===
+        "WIN"
     ).length;
 
   const losses =
     signalHistory.filter(
-      signal =>
-        signal.result ===
-        'LOSS'
+      (s) =>
+        s.result ===
+        "LOSS"
     ).length;
 
   const draws =
     signalHistory.filter(
-      signal =>
-        signal.result ===
-        'DRAW'
+      (s) =>
+        s.result ===
+        "DRAW"
     ).length;
 
   const settled =
@@ -2419,74 +2144,691 @@ function getPerformance() {
 
   return {
     total,
-
     pending,
-
     wins,
-
     losses,
-
     draws,
-
     settled,
-
     decisive,
 
     winRate:
-      decisive
-        ? (
-            wins /
-            decisive
-          ) * 100
+      decisive > 0
+        ? roundNumber(
+            (wins /
+              decisive) *
+              100,
+            2
+          )
         : null,
 
     winRateIncludingDraws:
-      settled
-        ? (
-            wins /
-            settled
-          ) * 100
+      settled > 0
+        ? roundNumber(
+            (wins /
+              settled) *
+              100,
+            2
+          )
         : null
   };
 }
 
-/* =========================================================
-   HEALTH
-========================================================= */
+// ------------------------------------------------------------
+// SETTLEMENT HELPERS
+// ------------------------------------------------------------
 
-function healthData() {
-  const quota =
-    quotaState();
+function findCandleAtOrAfter(
+  candles,
+  timestamp
+) {
+  return candles.find(
+    (candle) =>
+      candle.time >=
+      timestamp
+  );
+}
+
+function findCandleAtOrBefore(
+  candles,
+  timestamp
+) {
+  let found = null;
+
+  for (const candle of candles) {
+    if (
+      candle.time <=
+      timestamp
+    ) {
+      found = candle;
+    } else {
+      break;
+    }
+  }
+
+  return found;
+}
+
+function determineResult(
+  signal,
+  entryPrice,
+  exitPrice
+) {
+  if (
+    !Number.isFinite(
+      entryPrice
+    ) ||
+    !Number.isFinite(
+      exitPrice
+    )
+  ) {
+    return "DRAW";
+  }
+
+  if (signal === "CALL") {
+    if (
+      exitPrice >
+      entryPrice
+    ) {
+      return "WIN";
+    }
+
+    if (
+      exitPrice <
+      entryPrice
+    ) {
+      return "LOSS";
+    }
+
+    return "DRAW";
+  }
+
+  if (signal === "PUT") {
+    if (
+      exitPrice <
+      entryPrice
+    ) {
+      return "WIN";
+    }
+
+    if (
+      exitPrice >
+      entryPrice
+    ) {
+      return "LOSS";
+    }
+
+    return "DRAW";
+  }
+
+  return "DRAW";
+}
+
+// ------------------------------------------------------------
+// AUTOMATIC SETTLEMENT
+// ------------------------------------------------------------
+
+let settlementRunning = false;
+
+async function settlePendingSignals() {
+  if (settlementRunning) {
+    return;
+  }
+
+  settlementRunning = true;
+
+  try {
+    const now =
+      nowMs();
+
+    const pending =
+      signalHistory.filter(
+        (signal) =>
+          signal.result ===
+            "PENDING" &&
+          new Date(
+            signal.expiryTime
+          ).getTime() +
+            SETTLEMENT_GRACE_SECONDS *
+              1000 <=
+            now
+      );
+
+    if (!pending.length) {
+      return;
+    }
+
+    // Group by pair.
+    // This allows multiple timeframes on the
+    // same pair to share one Twelve Data request.
+    const grouped =
+      new Map();
+
+    for (const signal of pending) {
+      if (
+        !grouped.has(
+          signal.pair
+        )
+      ) {
+        grouped.set(
+          signal.pair,
+          []
+        );
+      }
+
+      grouped
+        .get(signal.pair)
+        .push(signal);
+    }
+
+    for (const [
+      pair,
+      signals
+    ] of grouped.entries()) {
+      let candles;
+
+      try {
+        // Fresh data is needed for settlement.
+        candles =
+          await getCandles(
+            pair,
+            {
+              forceFresh: true
+            }
+          );
+      } catch (error) {
+        console.warn(
+          `[SETTLEMENT] ${pair}: ${error.message}`
+        );
+
+        continue;
+      }
+
+      for (const signal of signals) {
+        try {
+          const tf =
+            signal.timeframe;
+
+          const aggregated =
+            aggregateCandles(
+              candles,
+              tf
+            );
+
+          const entryTimestamp =
+            new Date(
+              signal.entryTime
+            ).getTime();
+
+          const expiryTimestamp =
+            new Date(
+              signal.expiryTime
+            ).getTime();
+
+          // Entry candle must start at the signal entry.
+          const entryCandle =
+            findCandleAtOrAfter(
+              aggregated,
+              entryTimestamp
+            );
+
+          // Expiry candle must start at or after
+          // the expiry timestamp.
+          const expiryCandle =
+            findCandleAtOrAfter(
+              aggregated,
+              expiryTimestamp
+            );
+
+          if (
+            !entryCandle ||
+            !expiryCandle
+          ) {
+            // If exact expiry candle is not yet
+            // available, leave signal pending.
+            continue;
+          }
+
+          const entryPrice =
+            Number(
+              entryCandle.open
+            );
+
+          const exitPrice =
+            Number(
+              expiryCandle.close
+            );
+
+          if (
+            !Number.isFinite(
+              entryPrice
+            ) ||
+            !Number.isFinite(
+              exitPrice
+            )
+          ) {
+            continue;
+          }
+
+          const result =
+            determineResult(
+              signal.signal,
+              entryPrice,
+              exitPrice
+            );
+
+          signal.entryPrice =
+            entryPrice;
+
+          signal.exitPrice =
+            exitPrice;
+
+          signal.result =
+            result;
+
+          signal.settledAt =
+            new Date().toISOString();
+
+          signal.settlementSource =
+            "Twelve Data LIVE candle";
+
+          console.log(
+            `[SETTLEMENT] ${signal.pair} ${signal.timeframe}m ${signal.signal} => ${result} | entry=${entryPrice} exit=${exitPrice}`
+          );
+        } catch (error) {
+          console.warn(
+            `[SETTLEMENT] signal ${signal.signalId}: ${error.message}`
+          );
+        }
+      }
+    }
+  } finally {
+    settlementRunning = false;
+  }
+}
+
+// ------------------------------------------------------------
+// SCANNER
+// ------------------------------------------------------------
+
+async function scanNextBatch() {
+  if (scanRunning) {
+    return;
+  }
+
+  if (!TWELVE_DATA_API_KEY) {
+    lastScanError =
+      "TWELVE_DATA_API_KEY is not configured";
+
+    return;
+  }
+
+  scanRunning = true;
+
+  const batch = [];
+
+  try {
+    for (
+      let i = 0;
+      i < SCAN_BATCH_SIZE;
+      i++
+    ) {
+      const index =
+        (scanCursor + i) %
+        PAIRS.length;
+
+      batch.push(
+        PAIRS[index]
+      );
+    }
+
+    const analyses = [];
+
+    for (const pair of batch) {
+      let candles;
+
+      try {
+        candles =
+          await getCandles(
+            pair,
+            {
+              forceFresh: true
+            }
+          );
+
+        totalScanned += 1;
+
+        for (const timeframe of TIMEFRAMES) {
+          try {
+            const analysis =
+              analyzeCandles(
+                candles,
+                pair,
+                timeframe
+              );
+
+            analyses.push(
+              analysis
+            );
+          } catch (error) {
+            totalFailed += 1;
+
+            console.warn(
+              `[ANALYZE] ${pair} ${timeframe}m: ${error.message}`
+            );
+          }
+        }
+      } catch (error) {
+        totalFailed += 1;
+
+        lastScanError =
+          error.message;
+
+        console.warn(
+          `[SCAN] ${pair}: ${error.message}`
+        );
+
+        // If local quota is exhausted,
+        // stop the batch immediately.
+        if (
+          error.code ===
+            "local_minute_budget_reached" ||
+          error.code ===
+            "daily_safety_budget_reached" ||
+          error.code ===
+            "provider_quota_blocked"
+        ) {
+          break;
+        }
+      }
+    }
+
+    if (analyses.length) {
+      const valid =
+        analyses.filter(
+          (analysis) =>
+            analysis.signal !==
+            "NO TRADE"
+        );
+
+      // Register all directional signals.
+      for (const analysis of valid) {
+        registerSignal(
+          analysis
+        );
+      }
+
+      // Rank directional setups.
+      const ranked =
+        [...valid].sort(
+          (a, b) =>
+            rankAnalysis(b) -
+            rankAnalysis(a)
+        );
+
+      const selected =
+        ranked.length
+          ? ranked[0]
+          : chooseBestNoTrade(
+              analyses
+            );
+
+      if (selected) {
+        lastSelected =
+          selected;
+
+        lastSelectedAt =
+          nowMs();
+      }
+    }
+
+    scanCursor =
+      (scanCursor +
+        SCAN_BATCH_SIZE) %
+      PAIRS.length;
+
+    lastScanAt =
+      new Date().toISOString();
+
+    // Don't overwrite a previous useful error
+    // if this scan had successful results.
+    if (analyses.length) {
+      lastScanError = null;
+    }
+  } catch (error) {
+    lastScanError =
+      error.message;
+
+    console.error(
+      "[SCAN ERROR]",
+      error
+    );
+  } finally {
+    scanRunning = false;
+  }
+}
+
+// ------------------------------------------------------------
+// RANKING
+// ------------------------------------------------------------
+
+function rankAnalysis(
+  analysis
+) {
+  if (!analysis) {
+    return -Infinity;
+  }
+
+  let score =
+    analysis.confidence || 0;
+
+  const difference =
+    Math.abs(
+      (analysis.callScore || 0) -
+        (analysis.putScore || 0)
+    );
+
+  score +=
+    difference * 0.7;
+
+  const adx =
+    analysis.indicators
+      ? analysis.indicators.adx14
+      : null;
+
+  if (
+    Number.isFinite(adx) &&
+    adx >= 25
+  ) {
+    score += 8;
+  }
+
+  const stochK =
+    analysis.indicators
+      ? analysis.indicators
+          .stochasticK
+      : null;
+
+  const stochD =
+    analysis.indicators
+      ? analysis.indicators
+          .stochasticD
+      : null;
+
+  if (
+    Number.isFinite(stochK) &&
+    Number.isFinite(stochD)
+  ) {
+    if (
+      analysis.signal ===
+        "CALL" &&
+      stochK > stochD
+    ) {
+      score += 4;
+    }
+
+    if (
+      analysis.signal ===
+        "PUT" &&
+      stochK < stochD
+    ) {
+      score += 4;
+    }
+  }
+
+  if (
+    analysis.patterns &&
+    analysis.patterns.length
+  ) {
+    score +=
+      Math.min(
+        analysis.patterns.length *
+          2,
+        6
+      );
+  }
+
+  if (
+    analysis.marketCondition ===
+      "buyer pressure" &&
+    analysis.signal ===
+      "CALL"
+  ) {
+    score += 6;
+  }
+
+  if (
+    analysis.marketCondition ===
+      "seller pressure" &&
+    analysis.signal ===
+      "PUT"
+  ) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function chooseBestNoTrade(
+  analyses
+) {
+  if (!analyses.length) {
+    return null;
+  }
+
+  const sorted =
+    [...analyses].sort(
+      (a, b) =>
+        Math.max(
+          b.callScore || 0,
+          b.putScore || 0
+        ) -
+        Math.max(
+          a.callScore || 0,
+          a.putScore || 0
+        )
+    );
+
+  return sorted[0];
+}
+
+// ------------------------------------------------------------
+// RESPONSE FORMAT
+// ------------------------------------------------------------
+
+function enrichSelected(
+  analysis
+) {
+  if (!analysis) {
+    return null;
+  }
+
+  const signalRecord =
+    findSignalByKey(
+      createSignalKey(
+        analysis
+      )
+    );
 
   return {
-    ok: true,
+    ...analysis,
 
-    version:
-      VERSION,
+    signalId:
+      signalRecord
+        ? signalRecord.signalId
+        : null,
 
-    source:
-      'Twelve Data LIVE',
+    result:
+      signalRecord
+        ? signalRecord.result
+        : null,
 
-    timezone:
-      'UTC',
+    entryPrice:
+      signalRecord
+        ? signalRecord.entryPrice
+        : null,
 
-    pairs:
-      PAIRS.length,
+    exitPrice:
+      signalRecord
+        ? signalRecord.exitPrice
+        : null,
 
-    supportedTimeframes:
-      TIMEFRAMES,
+    settlement:
+      signalRecord
+        ? {
+            result:
+              signalRecord.result,
 
-    cachedPairs:
-      pairCache.size,
+            settledAt:
+              signalRecord.settledAt,
 
-    cachedResults:
-      resultCache.size,
+            settlementSource:
+              signalRecord.settlementSource
+          }
+        : null
+  };
+}
 
-    scanRunning,
+// ------------------------------------------------------------
+// HEALTH DATA
+// ------------------------------------------------------------
 
-    scanCursor,
+function getApiBudget() {
+  resetDailyBudgetIfNeeded();
 
-    scanBatchSize:
+  return {
+    dailyLimit:
+      DAILY_LIMIT,
+
+    safetyReserve:
+      DAILY_SAFETY_RESERVE,
+
+    maxDailyRequests:
+      MAX_DAILY_REQUESTS,
+
+    used:
+      dailyRequests,
+
+    remaining:
+      Math.max(
+        0,
+        MAX_DAILY_REQUESTS -
+          dailyRequests
+      )
+  };
+}
+
+function getScannerData() {
+  const minuteUsed =
+    getMinuteRequestCount();
+
+  return {
+    running:
+      scanRunning,
+
+    cursor:
+      scanCursor,
+
+    batchSize:
       SCAN_BATCH_SIZE,
 
     lastScanAt,
@@ -2497,242 +2839,230 @@ function healthData() {
 
     totalFailed,
 
-    quotaBlocked:
-      false,
+    totalApiRequests,
 
-    providerQuotaMessage:
-      lastProviderQuotaMessage,
+    quotaBlocked,
 
-    providerQuotaResetAt:
-      lastProviderQuotaResetAt,
+    providerQuotaMessage,
 
-    minuteBlocked:
-      quota.minuteBlocked,
+    providerQuotaResetAt,
+
+    minuteBlocked,
+
+    minuteResetAt,
 
     minuteRetryInSeconds:
-      0,
+      getSecondsUntilMinuteReset(),
 
     dailyRequests,
 
     dailyCreditsUsed:
       dailyRequests,
 
-    apiBudget: {
-      dailyLimit:
-        DAILY_LIMIT,
-
-      safetyReserve:
-        SAFETY_RESERVE,
-
-      maxDailyRequests:
-        MAX_DAILY_REQUESTS,
-
-      used:
-        dailyRequests,
-
-      remaining:
-        quota.dailyRemaining
-    },
+    apiBudget:
+      getApiBudget(),
 
     providerMinuteBudget: {
       configuredLimit:
         REQUEST_LIMIT_PER_MINUTE,
 
       usedLastMinute:
-        quota.usedLastMinute,
+        minuteUsed,
 
       remaining:
-        quota.remaining
-    },
-
-    cacheTTLMinutes:
-      CACHE_TTL_MS / 60000,
-
-    resultTTLSeconds:
-      RESULT_FRESH_MS / 1000,
-
-    /*
-    V8.6.2 scanner rotates
-    every minute.
-    */
-
-    scanEveryMinutes:
-      SCAN_EVERY_MS / 60000,
-
-    settlementIntervalSeconds:
-      SETTLEMENT_INTERVAL_MS /
-      1000,
-
-    settlementGraceSeconds:
-      SETTLEMENT_GRACE_SECONDS,
-
-    indicators: {
-      macd: true,
-
-      stochastic: true,
-
-      cci20: true,
-
-      candlestickPatterns:
-        true,
-
-      marketPsychology:
-        true
-    },
-
-    signalTracking: {
-      historySize:
-        HISTORY_SIZE,
-
-      performance:
-        getPerformance()
-    },
-
-    time:
-      new Date().toISOString()
+        Math.max(
+          0,
+          REQUEST_LIMIT_PER_MINUTE -
+            minuteUsed
+        )
+    }
   };
 }
 
-/* =========================================================
-   ROUTES
-========================================================= */
+// ------------------------------------------------------------
+// ROUTES
+// ------------------------------------------------------------
 
 app.get(
-  '/',
+  "/",
   (req, res) => {
     res.json({
       ok: true,
+      service:
+        "PO AI Predictor API",
+      version: VERSION,
+      source: SOURCE,
+      message:
+        "Backend is running."
+    });
+  }
+);
 
-      name:
-        'PO AI PREDICTOR',
+// ------------------------------------------------------------
+// HEALTH
+// ------------------------------------------------------------
+
+app.get(
+  "/api/health",
+  (req, res) => {
+    const performance =
+      getPerformance();
+
+    const cacheEntries =
+      Array.from(
+        candleCache.values()
+      );
+
+    const cachedPairs =
+      cacheEntries.length;
+
+    res.json({
+      ok: true,
 
       version:
         VERSION,
 
       source:
-        'Twelve Data LIVE'
-    });
-  }
-);
+        SOURCE,
 
-/* HEALTH */
+      timezone:
+        TIMEZONE,
 
-app.get(
-  '/api/health',
-  (req, res) => {
-    res.json(
-      healthData()
-    );
-  }
-);
+      pairs:
+        PAIRS.length,
 
-/* SCANNER STATUS */
+      supportedTimeframes:
+        TIMEFRAMES,
 
-app.get(
-  '/api/scanner',
-  (req, res) => {
-    res.json({
-      ok: true,
-
-      version:
-        VERSION,
-
-      running:
-        scanRunning,
-
-      cursor:
-        scanCursor,
-
-      lastScanAt,
-
-      lastScanError,
-
-      cachedPairs:
-        pairCache.size,
+      cachedPairs,
 
       cachedResults:
-        resultCache.size,
+        lastSelected
+          ? 1
+          : 0,
 
-      time:
-        new Date().toISOString()
-    });
-  }
-);
+      scanRunning:
+        scanRunning,
 
-/* =========================================================
-   BEST MARKET
-========================================================= */
+      scanCursor:
+        scanCursor,
 
-app.get(
-  '/api/best',
-  (req, res) => {
-    const selected =
-      getBest();
+      scanBatchSize:
+        SCAN_BATCH_SIZE,
 
-    /*
-    IMPORTANT:
-    Do not return the old "No fresh..."
-    error simply because the result is stale.
-    */
-
-    if (!selected) {
-      return res.json({
-        ok: false,
-
-        error:
-          'No selected market is currently available.',
-
-        performance:
-          getPerformance(),
-
-        scan: {
-          running:
-            scanRunning,
-
-          cursor:
-            scanCursor,
-
-          lastScanAt,
-
-          lastScanError
-        },
-
-        time:
-          new Date().toISOString()
-      });
-    }
-
-    return res.json({
-      ok: true,
-
-      version:
-        VERSION,
-
-      selectedMarket:
-        selected,
-
-      /*
-      Compatibility:
-      some previous frontend versions
-      expected "best".
-      */
-
-      best:
-        selected,
-
-      performance:
-        getPerformance(),
-
-      scan: {
-        running:
-          scanRunning,
-
-        cursor:
-          scanCursor,
-
+      lastScanAt:
         lastScanAt,
 
-        lastScanError
+      lastScanError:
+        lastScanError,
+
+      totalScanned:
+        totalScanned,
+
+      totalFailed:
+        totalFailed,
+
+      totalApiRequests:
+        totalApiRequests,
+
+      quotaBlocked:
+        quotaBlocked,
+
+      providerQuotaMessage:
+        providerQuotaMessage,
+
+      providerQuotaResetAt:
+        providerQuotaResetAt,
+
+      minuteBlocked:
+        minuteBlocked,
+
+      minuteResetAt:
+        minuteResetAt,
+
+      minuteRetryInSeconds:
+        getSecondsUntilMinuteReset(),
+
+      dailyRequests:
+        dailyRequests,
+
+      dailyCreditsUsed:
+        dailyRequests,
+
+      apiBudget:
+        getApiBudget(),
+
+      providerMinuteBudget: {
+        configuredLimit:
+          REQUEST_LIMIT_PER_MINUTE,
+
+        usedLastMinute:
+          getMinuteRequestCount(),
+
+        remaining:
+          Math.max(
+            0,
+            REQUEST_LIMIT_PER_MINUTE -
+              getMinuteRequestCount()
+          )
+      },
+
+      cacheTTLMinutes:
+        CACHE_TTL_MS /
+        60000,
+
+      resultTTLSeconds:
+        RESULT_FRESH_MS /
+        1000,
+
+      scanEveryMinutes:
+        SCAN_EVERY_MS /
+        60000,
+
+      settlementIntervalSeconds:
+        SETTLEMENT_INTERVAL_MS /
+        1000,
+
+      settlementGraceSeconds:
+        SETTLEMENT_GRACE_SECONDS,
+
+      indicators: {
+        ema9ema21:
+          true,
+
+        rsi14:
+          true,
+
+        adx14:
+          true,
+
+        stochastic:
+          true,
+
+        atr14:
+          true,
+
+        supportResistance:
+          true,
+
+        candlestickPatterns:
+          true,
+
+        marketPsychology:
+          true,
+
+        macd:
+          false,
+
+        cci20:
+          false
+      },
+
+      signalTracking: {
+        historySize:
+          MAX_SIGNAL_HISTORY,
+
+        performance
       },
 
       time:
@@ -2741,42 +3071,158 @@ app.get(
   }
 );
 
-/* =========================================================
-   SELECTED MARKET
-========================================================= */
+// ------------------------------------------------------------
+// BEST
+// ------------------------------------------------------------
 
 app.get(
-  '/api/selected',
+  "/api/best",
   (req, res) => {
     const selected =
-      getBest();
+      enrichSelected(
+        lastSelected
+      );
 
-    if (!selected) {
-      return res.json({
-        ok: false,
+    const selectedAge =
+      lastSelectedAt
+        ? nowMs() -
+          lastSelectedAt
+        : null;
 
-        selectedMarket:
-          null,
-
-        error:
-          'No selected market is currently available.',
-
-        performance:
-          getPerformance(),
-
-        time:
-          new Date().toISOString()
-      });
-    }
+    const fresh =
+      selectedAge != null &&
+      selectedAge <=
+        RESULT_FRESH_MS;
 
     res.json({
-      ok: true,
+      ok:
+        !!selected,
+
+      version:
+        VERSION,
+
+      source:
+        SOURCE,
+
+      fresh,
+
+      stale:
+        selected
+          ? !fresh
+          : false,
 
       selectedMarket:
         selected,
 
       best:
         selected,
+
+      selected:
+        selected,
+
+      market:
+        selected,
+
+      selectedAt:
+        lastSelectedAt
+          ? new Date(
+              lastSelectedAt
+            ).toISOString()
+          : null,
+
+      selectedAgeSeconds:
+        selectedAge == null
+          ? null
+          : Math.floor(
+              selectedAge / 1000
+            ),
+
+      performance:
+        getPerformance(),
+
+      scan:
+        getScannerData(),
+
+      time:
+        new Date().toISOString()
+    });
+  }
+);
+
+// ------------------------------------------------------------
+// SELECTED
+// ------------------------------------------------------------
+
+app.get(
+  "/api/selected",
+  (req, res) => {
+    const selected =
+      enrichSelected(
+        lastSelected
+      );
+
+    const selectedAge =
+      lastSelectedAt
+        ? nowMs() -
+          lastSelectedAt
+        : null;
+
+    res.json({
+      ok:
+        !!selected,
+
+      version:
+        VERSION,
+
+      source:
+        SOURCE,
+
+      fresh:
+        selectedAge != null &&
+        selectedAge <=
+          RESULT_FRESH_MS,
+
+      stale:
+        selectedAge != null &&
+        selectedAge >
+          RESULT_FRESH_MS,
+
+      selectedMarket:
+        selected,
+
+      best:
+        selected,
+
+      selected:
+        selected,
+
+      market:
+        selected,
+
+      performance:
+        getPerformance(),
+
+      scan:
+        getScannerData(),
+
+      time:
+        new Date().toISOString()
+    });
+  }
+);
+
+// ------------------------------------------------------------
+// PERFORMANCE
+// ------------------------------------------------------------
+
+app.get(
+  "/api/performance",
+  (req, res) => {
+    res.json({
+      ok: true,
+
+      version:
+        VERSION,
 
       performance:
         getPerformance(),
@@ -2787,12 +3233,12 @@ app.get(
   }
 );
 
-/* =========================================================
-   HISTORY
-========================================================= */
+// ------------------------------------------------------------
+// HISTORY
+// ------------------------------------------------------------
 
 app.get(
-  '/api/history',
+  "/api/history",
   (req, res) => {
     res.json({
       ok: true,
@@ -2815,12 +3261,12 @@ app.get(
   }
 );
 
-/* =========================================================
-   PERFORMANCE
-========================================================= */
+// ------------------------------------------------------------
+// SCANNER
+// ------------------------------------------------------------
 
 app.get(
-  '/api/performance',
+  "/api/scanner",
   (req, res) => {
     res.json({
       ok: true,
@@ -2828,8 +3274,12 @@ app.get(
       version:
         VERSION,
 
-      performance:
-        getPerformance(),
+      ...getScannerData(),
+
+      selectedMarket:
+        enrichSelected(
+          lastSelected
+        ),
 
       time:
         new Date().toISOString()
@@ -2837,116 +3287,105 @@ app.get(
   }
 );
 
-/* =========================================================
-   MANUAL ANALYZE
-========================================================= */
+// ------------------------------------------------------------
+// ANALYZE
+// ------------------------------------------------------------
 
 app.get(
-  '/api/analyze',
+  "/api/analyze",
   async (req, res) => {
     const pair =
-      req.query.pair;
+      normalizePair(
+        req.query.pair
+      );
+
+    const timeframe =
+      Number(
+        req.query.timeframe ||
+          1
+      );
 
     if (
-      !pair ||
-      !PAIRS.includes(pair)
+      !isSupportedPair(pair)
     ) {
       return res.status(400).json({
         ok: false,
-
         error:
-          'Unsupported or missing pair.'
+          "Unsupported pair",
+        pair,
+        supportedPairs:
+          PAIRS
+      });
+    }
+
+    if (
+      !isSupportedTimeframe(
+        timeframe
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Unsupported timeframe",
+        timeframe,
+        supportedTimeframes:
+          TIMEFRAMES
       });
     }
 
     try {
-      /*
-      Manual analysis uses one Twelve Data request
-      and locally builds all three timeframes.
-      */
-
       const candles =
-        await fetchCandles(
+        await getCandles(
           pair,
-          MAX_CANDLES
-        );
-
-      pairCache.set(
-        pair,
-        {
-          candles,
-
-          updatedAt:
-            Date.now()
-        }
-      );
-
-      const results =
-        TIMEFRAMES.map(
-          timeframe => {
-            const aggregated =
-              aggregateCandles(
-                candles,
-                timeframe
-              );
-
-            const analysis =
-              analyzeCandles(
-                aggregated,
-                timeframe
-              );
-
-            const result =
-              makeResult(
-                pair,
-                timeframe,
-                analysis
-              );
-
-            resultCache.set(
-              `${pair}:${timeframe}`,
-              {
-                ...result,
-
-                cachedAt:
-                  Date.now()
-              }
-            );
-
-            return result;
+          {
+            forceFresh: true
           }
         );
 
-      chooseBest();
+      const analysis =
+        analyzeCandles(
+          candles,
+          pair,
+          timeframe
+        );
 
-      res.json({
+      const signalRecord =
+        registerSignal(
+          analysis
+        );
+
+      return res.json({
         ok: true,
 
-        mode:
-          'LIVE',
+        version:
+          VERSION,
 
-        pair,
+        source:
+          SOURCE,
 
-        results,
+        analysis:
+          enrichSelected(
+            analysis
+          ),
 
-        selected:
-          getBest(),
-
-        performance:
-          getPerformance(),
+        signal:
+          signalRecord,
 
         time:
           new Date().toISOString()
       });
     } catch (error) {
-      res.status(500).json({
+      return res.status(503).json({
         ok: false,
+
+        version:
+          VERSION,
 
         error:
           error.message,
 
-        performance:
-          getPerformance(),
+        quota:
+          getScannerData(),
 
         time:
           new Date().toISOString()
@@ -2955,88 +3394,200 @@ app.get(
   }
 );
 
-/* =========================================================
-   AUTOMATIC LOOPS
-========================================================= */
+// ------------------------------------------------------------
+// 404
+// ------------------------------------------------------------
 
-/*
-Scanner:
-one 7-pair batch every minute.
-*/
-
-setInterval(
-  () => {
-    scanBatch()
-      .catch(error => {
-        lastScanError =
-          error.message;
-
-        scanRunning =
-          false;
-      });
-  },
-  SCAN_EVERY_MS
+app.use(
+  (req, res) => {
+    res.status(404).json({
+      ok: false,
+      error:
+        "Endpoint not found",
+      path:
+        req.path,
+      version:
+        VERSION
+    });
+  }
 );
 
-/*
-Settlement:
-every 10 seconds.
-
-It does NOT wait for scanner.
-*/
-
-setInterval(
-  () => {
-    settleDueSignals()
-      .catch(error => {
-        lastScanError =
-          error.message;
-      });
-  },
-  SETTLEMENT_INTERVAL_MS
-);
-
-/* =========================================================
-   START
-========================================================= */
+// ------------------------------------------------------------
+// SERVER START
+// ------------------------------------------------------------
 
 app.listen(
   PORT,
   () => {
     console.log(
-      `[${VERSION}] listening on ${PORT}`
+      "=================================================="
     );
 
     console.log(
-      `[${VERSION}] Twelve Data configured: ${Boolean(
-        TWELVE_DATA_API_KEY
+      `PO AI PREDICTOR ${VERSION}`
+    );
+
+    console.log(
+      `Source: ${SOURCE}`
+    );
+
+    console.log(
+      `Port: ${PORT}`
+    );
+
+    console.log(
+      `Pairs: ${PAIRS.length}`
+    );
+
+    console.log(
+      `Timeframes: ${TIMEFRAMES.join(
+        ", "
       )}`
     );
 
     console.log(
-      `[${VERSION}] request limit: ${REQUEST_LIMIT_PER_MINUTE}/minute`
+      "MACD: DISABLED"
     );
 
     console.log(
-      `[${VERSION}] scan batch: ${SCAN_BATCH_SIZE}`
+      "CCI20: DISABLED"
     );
 
     console.log(
-      `[${VERSION}] scan interval: ${SCAN_EVERY_MS / 60000} minute`
+      `Provider request limit: ${REQUEST_LIMIT_PER_MINUTE}/minute`
     );
 
     console.log(
-      `[${VERSION}] settlement interval: ${SETTLEMENT_INTERVAL_MS / 1000}s`
+      `Scanner batch: ${SCAN_BATCH_SIZE}`
     );
 
-    /*
-    Initial scan immediately after startup.
-    */
+    console.log(
+      `Scanner interval: ${
+        SCAN_EVERY_MS / 1000
+      } seconds`
+    );
 
-    scanBatch()
-      .catch(error => {
-        lastScanError =
-          error.message;
-      });
+    console.log(
+      `Settlement interval: ${
+        SETTLEMENT_INTERVAL_MS /
+        1000
+      } seconds`
+    );
+
+    console.log(
+      `Daily max requests: ${MAX_DAILY_REQUESTS}`
+    );
+
+    console.log(
+      "=================================================="
+    );
+
+    // Initial scan shortly after startup.
+    setTimeout(
+      () => {
+        scanNextBatch().catch(
+          (error) => {
+            console.error(
+              "[INITIAL SCAN]",
+              error
+            );
+          }
+        );
+      },
+      3000
+    );
+  }
+);
+
+// ------------------------------------------------------------
+// SCANNER TIMER
+// ------------------------------------------------------------
+
+setInterval(
+  () => {
+    scanNextBatch().catch(
+      (error) => {
+        console.error(
+          "[SCAN TIMER]",
+          error
+        );
+      }
+    );
+  },
+  SCAN_EVERY_MS
+);
+
+// ------------------------------------------------------------
+// SETTLEMENT TIMER
+// ------------------------------------------------------------
+
+setInterval(
+  () => {
+    settlePendingSignals().catch(
+      (error) => {
+        console.error(
+          "[SETTLEMENT TIMER]",
+          error
+        );
+      }
+    );
+  },
+  SETTLEMENT_INTERVAL_MS
+);
+
+// ------------------------------------------------------------
+// MINUTE BUDGET RESET STATE
+// ------------------------------------------------------------
+
+setInterval(
+  () => {
+    cleanupMinuteRequests();
+
+    if (
+      getMinuteRequestCount() <
+      REQUEST_LIMIT_PER_MINUTE
+    ) {
+      minuteBlocked = false;
+      minuteResetAt = null;
+    }
+
+    if (
+      quotaBlocked &&
+      quotaBlockedUntil &&
+      nowMs() >=
+        quotaBlockedUntil
+    ) {
+      quotaBlocked = false;
+      quotaBlockedUntil = null;
+      providerQuotaMessage = null;
+      providerQuotaResetAt = null;
+    }
+
+    resetDailyBudgetIfNeeded();
+  },
+  5000
+);
+
+// ------------------------------------------------------------
+// PROCESS SAFETY
+// ------------------------------------------------------------
+
+process.on(
+  "unhandledRejection",
+  (error) => {
+    console.error(
+      "[UNHANDLED REJECTION]",
+      error
+    );
+  }
+);
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "[UNCAUGHT EXCEPTION]",
+      error
+    );
   }
 );
