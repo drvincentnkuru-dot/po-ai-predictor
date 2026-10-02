@@ -3,39 +3,33 @@
 /*
 ===========================================================
  PO AI PREDICTOR
- V8.4.1 • SMART LIVE SCANNER FRONTEND
-===========================================================
+ V8.5 • SMART LIVE SCANNER FRONTEND
 
-Backend:
-https://po-ai-predictor-api.onrender.com
+ NEW:
+ - Candlestick pattern display
+ - Market psychology display
+ - Buyer / seller pressure
+ - Trend conviction
+ - Rejection / indecision
+ - Pattern confirmation
+ - Psychology confirmation
 
-Main flow:
-
-ANALYZE MARKET
-      ↓
-GET /api/best
-      ↓
-Backend scans / reads live results
-      ↓
-Smart ranking
-      ↓
-SELECTED MARKET
-      ↓
-CALL / PUT / NO TRADE
-      ↓
-TIMEFRAME + CONFIDENCE
-      ↓
-ENTRY + EXPIRY
-      ↓
-REASONS
+ Backend:
+ https://po-ai-predictor-api.onrender.com
 ===========================================================
 */
 
-const API_URL = 'https://po-ai-predictor-api.onrender.com';
+const API_URL =
+    'https://po-ai-predictor-api.onrender.com';
 
-const BEST_URL = `${API_URL}/api/best`;
-const HEALTH_URL = `${API_URL}/api/health`;
-const SCAN_STATUS_URL = `${API_URL}/api/scan/status`;
+const BEST_URL =
+    `${API_URL}/api/best`;
+
+const HEALTH_URL =
+    `${API_URL}/api/health`;
+
+const SCAN_STATUS_URL =
+    `${API_URL}/api/scan/status`;
 
 
 /* =========================================================
@@ -43,44 +37,80 @@ const SCAN_STATUS_URL = `${API_URL}/api/scan/status`;
 ========================================================= */
 
 const el = {
-    backendStatus: document.getElementById('backendStatus'),
+    backendStatus:
+        document.getElementById('backendStatus'),
 
-    analyzeBtn: document.getElementById('analyzeBtn'),
+    analyzeBtn:
+        document.getElementById('analyzeBtn'),
 
-    errorBox: document.getElementById('errorBox'),
+    errorBox:
+        document.getElementById('errorBox'),
 
-    signalCard: document.getElementById('signalCard'),
+    signalCard:
+        document.getElementById('signalCard'),
 
-    selectedPair: document.getElementById('selectedPair'),
-    trendBadge: document.getElementById('trendBadge'),
-    signalBadge: document.getElementById('signalBadge'),
+    selectedPair:
+        document.getElementById('selectedPair'),
 
-    confidence: document.getElementById('confidence'),
-    timeframe: document.getElementById('timeframe'),
+    trendBadge:
+        document.getElementById('trendBadge'),
 
-    countdown: document.getElementById('countdown'),
+    signalBadge:
+        document.getElementById('signalBadge'),
 
-    entryTime: document.getElementById('entryTime'),
-    expiryTime: document.getElementById('expiryTime'),
-    entryPrice: document.getElementById('entryPrice'),
+    confidence:
+        document.getElementById('confidence'),
 
-    callScore: document.getElementById('callScore'),
-    putScore: document.getElementById('putScore'),
+    timeframe:
+        document.getElementById('timeframe'),
 
-    support: document.getElementById('support'),
-    resistance: document.getElementById('resistance'),
+    countdown:
+        document.getElementById('countdown'),
 
-    dataAge: document.getElementById('dataAge'),
+    entryTime:
+        document.getElementById('entryTime'),
 
-    ema9: document.getElementById('ema9'),
-    ema21: document.getElementById('ema21'),
-    rsi: document.getElementById('rsi'),
-    adx: document.getElementById('adx'),
+    expiryTime:
+        document.getElementById('expiryTime'),
 
-    reasons: document.getElementById('reasons'),
+    entryPrice:
+        document.getElementById('entryPrice'),
 
-    scanInfo: document.getElementById('scanInfo'),
-    scanner: document.getElementById('scanner')
+    callScore:
+        document.getElementById('callScore'),
+
+    putScore:
+        document.getElementById('putScore'),
+
+    support:
+        document.getElementById('support'),
+
+    resistance:
+        document.getElementById('resistance'),
+
+    dataAge:
+        document.getElementById('dataAge'),
+
+    ema9:
+        document.getElementById('ema9'),
+
+    ema21:
+        document.getElementById('ema21'),
+
+    rsi:
+        document.getElementById('rsi'),
+
+    adx:
+        document.getElementById('adx'),
+
+    reasons:
+        document.getElementById('reasons'),
+
+    scanInfo:
+        document.getElementById('scanInfo'),
+
+    scanner:
+        document.getElementById('scanner')
 };
 
 
@@ -89,11 +119,14 @@ const el = {
 ========================================================= */
 
 let currentResult = null;
+
 let countdownTimer = null;
 let healthTimer = null;
 let scannerTimer = null;
 
 let analyzing = false;
+
+let insightBox = null;
 
 
 /* =========================================================
@@ -139,13 +172,14 @@ function formatPrice(value, pair = '') {
         return '—';
     }
 
-    const normalizedPair = String(pair || '').toUpperCase();
+    const normalizedPair =
+        String(pair || '')
+            .toUpperCase();
 
-    /*
-      JPY pairs normally need 3 decimals.
-      Other FX pairs normally use 5 decimals.
-    */
-    const decimals = normalizedPair.includes('JPY') ? 3 : 5;
+    const decimals =
+        normalizedPair.includes('JPY')
+            ? 3
+            : 5;
 
     return n.toFixed(decimals);
 }
@@ -173,16 +207,19 @@ function formatUTC(value) {
         return String(value);
     }
 
-    return d.toLocaleString('en-GB', {
-        timeZone: 'UTC',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false
-    }) + ' UTC';
+    return d.toLocaleString(
+        'en-GB',
+        {
+            timeZone: 'UTC',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+        }
+    ) + ' UTC';
 }
 
 
@@ -197,13 +234,16 @@ function shortUTC(value) {
         return String(value);
     }
 
-    return d.toLocaleTimeString('en-GB', {
-        timeZone: 'UTC',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false
-    }) + ' UTC';
+    return d.toLocaleTimeString(
+        'en-GB',
+        {
+            timeZone: 'UTC',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+        }
+    ) + ' UTC';
 }
 
 
@@ -212,13 +252,19 @@ function secondsUntil(value) {
         return null;
     }
 
-    const target = new Date(value).getTime();
+    const target =
+        new Date(value).getTime();
 
     if (!Number.isFinite(target)) {
         return null;
     }
 
-    return Math.floor((target - Date.now()) / 1000);
+    return Math.floor(
+        (
+            target -
+            Date.now()
+        ) / 1000
+    );
 }
 
 
@@ -231,8 +277,11 @@ function formatCountdown(seconds) {
         return 'ENTER NOW';
     }
 
-    const min = Math.floor(seconds / 60);
-    const sec = seconds % 60;
+    const min =
+        Math.floor(seconds / 60);
+
+    const sec =
+        seconds % 60;
 
     if (min > 0) {
         return `${min}m ${String(sec).padStart(2, '0')}s`;
@@ -244,7 +293,10 @@ function formatCountdown(seconds) {
 
 function clearCountdown() {
     if (countdownTimer) {
-        clearInterval(countdownTimer);
+        clearInterval(
+            countdownTimer
+        );
+
         countdownTimer = null;
     }
 }
@@ -265,20 +317,34 @@ function showError(message) {
         return;
     }
 
-    el.errorBox.textContent = message;
-    el.errorBox.style.display = 'block';
+    el.errorBox.textContent =
+        message;
+
+    el.errorBox.style.display =
+        'block';
 }
 
 
-function setBackendStatus(text, online = false) {
+function setBackendStatus(
+    text,
+    online = false
+) {
     if (!el.backendStatus) {
         return;
     }
 
-    el.backendStatus.textContent = text;
+    el.backendStatus.textContent =
+        text;
 
-    el.backendStatus.classList.toggle('online', online);
-    el.backendStatus.classList.toggle('offline', !online);
+    el.backendStatus.classList.toggle(
+        'online',
+        online
+    );
+
+    el.backendStatus.classList.toggle(
+        'offline',
+        !online
+    );
 }
 
 
@@ -289,38 +355,53 @@ function setLoading(loading) {
         return;
     }
 
-    el.analyzeBtn.disabled = loading;
+    el.analyzeBtn.disabled =
+        loading;
 
     if (loading) {
         el.analyzeBtn.dataset.originalText =
-            el.analyzeBtn.textContent || 'ANALYZE MARKET';
+            el.analyzeBtn.textContent ||
+            'ANALYZE MARKET';
 
-        el.analyzeBtn.textContent = 'SCANNING LIVE MARKET...';
-        el.analyzeBtn.classList.add('loading');
+        el.analyzeBtn.textContent =
+            'SCANNING LIVE MARKET...';
+
+        el.analyzeBtn.classList.add(
+            'loading'
+        );
     } else {
         el.analyzeBtn.textContent =
-            el.analyzeBtn.dataset.originalText || 'ANALYZE MARKET';
+            el.analyzeBtn.dataset.originalText ||
+            'ANALYZE MARKET';
 
-        el.analyzeBtn.classList.remove('loading');
+        el.analyzeBtn.classList.remove(
+            'loading'
+        );
     }
 }
 
 
-function showSignalCard(show = true) {
+function showSignalCard(
+    show = true
+) {
     if (!el.signalCard) {
         return;
     }
 
-    el.signalCard.style.display = show ? '' : 'none';
+    el.signalCard.style.display =
+        show ? '' : 'none';
 }
 
 
 /* =========================================================
-   SIGNAL / TREND
+   SIGNAL
 ========================================================= */
 
 function normalizeSignal(signal) {
-    const value = String(signal || '').trim().toUpperCase();
+    const value =
+        String(signal || '')
+            .trim()
+            .toUpperCase();
 
     if (value === 'CALL') {
         return 'CALL';
@@ -335,7 +416,10 @@ function normalizeSignal(signal) {
 
 
 function normalizeTrend(condition) {
-    const value = String(condition || '').trim().toUpperCase();
+    const value =
+        String(condition || '')
+            .trim()
+            .toUpperCase();
 
     switch (value) {
         case 'UPTREND':
@@ -351,7 +435,10 @@ function normalizeTrend(condition) {
             return 'RANGING';
 
         default:
-            return value || 'MARKET CONDITION —';
+            return (
+                value ||
+                'MARKET CONDITION —'
+            );
     }
 }
 
@@ -361,9 +448,11 @@ function applySignalBadge(signal) {
         return;
     }
 
-    const normalized = normalizeSignal(signal);
+    const normalized =
+        normalizeSignal(signal);
 
-    el.signalBadge.textContent = normalized;
+    el.signalBadge.textContent =
+        normalized;
 
     el.signalBadge.classList.remove(
         'call',
@@ -375,12 +464,434 @@ function applySignalBadge(signal) {
     );
 
     if (normalized === 'CALL') {
-        el.signalBadge.classList.add('call');
-    } else if (normalized === 'PUT') {
-        el.signalBadge.classList.add('put');
+        el.signalBadge.classList.add(
+            'call'
+        );
+    } else if (
+        normalized === 'PUT'
+    ) {
+        el.signalBadge.classList.add(
+            'put'
+        );
     } else {
-        el.signalBadge.classList.add('no-trade');
+        el.signalBadge.classList.add(
+            'no-trade'
+        );
     }
+}
+
+
+/* =========================================================
+   DYNAMIC INSIGHT PANEL
+========================================================= */
+
+function ensureInsightBox() {
+    if (insightBox) {
+        return insightBox;
+    }
+
+    /*
+      If #reasons exists, put the new panel directly
+      after it. Otherwise attach it to signalCard.
+    */
+    const parent =
+        el.reasons?.parentElement ||
+        el.signalCard ||
+        document.body;
+
+    insightBox =
+        document.createElement('div');
+
+    insightBox.id =
+        'v85MarketInsights';
+
+    insightBox.style.marginTop =
+        '14px';
+
+    insightBox.style.display =
+        'block';
+
+    parent.appendChild(
+        insightBox
+    );
+
+    return insightBox;
+}
+
+
+function insightClass(direction) {
+    const value =
+        String(direction || '')
+            .toUpperCase();
+
+    if (
+        value.includes('BULLISH') ||
+        value.includes('BUYER')
+    ) {
+        return 'bullish';
+    }
+
+    if (
+        value.includes('BEARISH') ||
+        value.includes('SELLER')
+    ) {
+        return 'bearish';
+    }
+
+    return 'neutral';
+}
+
+
+function renderMarketInsights(result) {
+    const box =
+        ensureInsightBox();
+
+    if (!box) {
+        return;
+    }
+
+    const patterns =
+        Array.isArray(
+            result?.candlestickPatterns
+        )
+            ? result.candlestickPatterns
+            : [];
+
+    const summary =
+        result?.patternSummary ||
+        {};
+
+    const psychology =
+        result?.marketPsychology ||
+        {};
+
+    const confirmation =
+        result?.confirmation ||
+        {};
+
+    const patternNames =
+        Array.isArray(summary.names)
+            ? summary.names
+            : [];
+
+    const patternDirection =
+        summary.direction ||
+        'NEUTRAL';
+
+    const psychologySentiment =
+        psychology.sentiment ||
+        'BALANCED';
+
+    const patternText =
+        patternNames.length
+            ? patternNames
+                .map(name =>
+                    escapeHtml(name)
+                )
+                .join(' • ')
+            : 'No strong named pattern';
+
+    const psychologyDescription =
+        psychology.description ||
+        'No psychology summary returned.';
+
+    const rejection =
+        psychology.rejection ||
+        'NONE';
+
+    const conviction =
+        Number.isFinite(
+            Number(
+                psychology.conviction
+            )
+        )
+            ? Math.round(
+                Number(
+                    psychology.conviction
+                )
+            )
+            : null;
+
+    const buyerPressure =
+        Number.isFinite(
+            Number(
+                psychology.buyerPressure
+            )
+        )
+            ? Math.round(
+                Number(
+                    psychology.buyerPressure
+                )
+            )
+            : null;
+
+    const sellerPressure =
+        Number.isFinite(
+            Number(
+                psychology.sellerPressure
+            )
+        )
+            ? Math.round(
+                Number(
+                    psychology.sellerPressure
+                )
+            )
+            : null;
+
+    const indecision =
+        Number.isFinite(
+            Number(
+                psychology.indecision
+            )
+        )
+            ? Math.round(
+                Number(
+                    psychology.indecision
+                )
+            )
+            : null;
+
+    const patternScore =
+        Number.isFinite(
+            Number(
+                result?.patternScore
+            )
+        )
+            ? Math.round(
+                Number(
+                    result.patternScore
+                )
+            )
+            : 0;
+
+    const psychologyScore =
+        Number.isFinite(
+            Number(
+                result?.psychologyScore
+            )
+        )
+            ? Math.round(
+                Number(
+                    result.psychologyScore
+                )
+            )
+            : 0;
+
+    box.innerHTML = `
+        <div class="v85-insights"
+             style="
+                border:1px solid rgba(128,128,128,.25);
+                border-radius:14px;
+                padding:14px;
+                margin-top:12px;
+             ">
+
+            <div style="
+                font-weight:700;
+                margin-bottom:12px;
+            ">
+                MARKET PRICE-ACTION INSIGHTS
+            </div>
+
+            <div style="
+                display:grid;
+                grid-template-columns:
+                    repeat(auto-fit,minmax(210px,1fr));
+                gap:10px;
+            ">
+
+                <div class="v85-insight-card"
+                     style="
+                        padding:12px;
+                        border-radius:10px;
+                        border:1px solid rgba(128,128,128,.18);
+                     ">
+
+                    <div style="
+                        font-weight:700;
+                        margin-bottom:7px;
+                    ">
+                        CANDLESTICK PATTERN
+                    </div>
+
+                    <div class="${insightClass(patternDirection)}"
+                         style="
+                            font-weight:700;
+                            margin-bottom:5px;
+                         ">
+                        ${escapeHtml(patternDirection)}
+                    </div>
+
+                    <div style="
+                        font-size:.9rem;
+                        margin-bottom:6px;
+                    ">
+                        ${patternText}
+                    </div>
+
+                    <div style="
+                        font-size:.82rem;
+                        opacity:.75;
+                    ">
+                        Confirmation:
+                        ${escapeHtml(String(patternScore))}
+                    </div>
+                </div>
+
+
+                <div class="v85-insight-card"
+                     style="
+                        padding:12px;
+                        border-radius:10px;
+                        border:1px solid rgba(128,128,128,.18);
+                     ">
+
+                    <div style="
+                        font-weight:700;
+                        margin-bottom:7px;
+                    ">
+                        MARKET PSYCHOLOGY
+                    </div>
+
+                    <div class="${insightClass(psychologySentiment)}"
+                         style="
+                            font-weight:700;
+                            margin-bottom:5px;
+                         ">
+                        ${escapeHtml(psychologySentiment)}
+                    </div>
+
+                    <div style="
+                        font-size:.88rem;
+                        line-height:1.4;
+                        margin-bottom:7px;
+                    ">
+                        ${escapeHtml(psychologyDescription)}
+                    </div>
+
+                    <div style="
+                        font-size:.82rem;
+                        opacity:.82;
+                    ">
+                        Buyers:
+                        <strong>
+                            ${buyerPressure !== null
+                                ? `${buyerPressure}%`
+                                : '—'}
+                        </strong>
+                        &nbsp;|&nbsp;
+                        Sellers:
+                        <strong>
+                            ${sellerPressure !== null
+                                ? `${sellerPressure}%`
+                                : '—'}
+                        </strong>
+                    </div>
+                </div>
+
+
+                <div class="v85-insight-card"
+                     style="
+                        padding:12px;
+                        border-radius:10px;
+                        border:1px solid rgba(128,128,128,.18);
+                     ">
+
+                    <div style="
+                        font-weight:700;
+                        margin-bottom:7px;
+                    ">
+                        MARKET BEHAVIOR
+                    </div>
+
+                    <div style="
+                        font-size:.88rem;
+                        line-height:1.7;
+                    ">
+                        <div>
+                            Conviction:
+                            <strong>
+                                ${conviction !== null
+                                    ? `${conviction}%`
+                                    : '—'}
+                            </strong>
+                        </div>
+
+                        <div>
+                            Rejection:
+                            <strong>
+                                ${escapeHtml(rejection)}
+                            </strong>
+                        </div>
+
+                        <div>
+                            Indecision:
+                            <strong>
+                                ${indecision !== null
+                                    ? `${indecision}%`
+                                    : '—'}
+                            </strong>
+                        </div>
+
+                        <div>
+                            Pattern confirmation:
+                            <strong>
+                                ${patternScore}
+                            </strong>
+                        </div>
+
+                        <div>
+                            Psychology confirmation:
+                            <strong>
+                                ${psychologyScore}
+                            </strong>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            ${
+                patterns.length
+                    ? `
+                        <div style="
+                            margin-top:12px;
+                            font-size:.85rem;
+                            opacity:.82;
+                        ">
+                            Detected:
+                            ${patterns
+                                .slice(0, 5)
+                                .map(pattern => `
+                                    <span style="
+                                        display:inline-block;
+                                        margin:3px 4px 3px 0;
+                                        padding:4px 7px;
+                                        border-radius:7px;
+                                        border:1px solid rgba(128,128,128,.2);
+                                    ">
+                                        ${escapeHtml(
+                                            pattern.name
+                                        )}
+                                    </span>
+                                `)
+                                .join('')}
+                        </div>
+                    `
+                    : ''
+            }
+
+            <div style="
+                margin-top:10px;
+                font-size:.75rem;
+                opacity:.62;
+            ">
+                Price-action psychology is inferred from recent
+                OHLC candles; it is not direct order-book sentiment.
+            </div>
+
+        </div>
+    `;
 }
 
 
@@ -388,38 +899,57 @@ function applySignalBadge(signal) {
    REASON ENGINE
 ========================================================= */
 
-/*
-  Backend V8.4.1 already returns "reasons".
-
-  This function uses backend reasons first.
-
-  If backend reasons are missing, we create a transparent
-  fallback explanation from the actual returned indicators.
-
-  IMPORTANT:
-  We never invent market data.
-*/
-
 function buildFallbackReasons(result) {
     const reasons = [];
 
-    const signal = normalizeSignal(result?.signal);
+    const signal =
+        normalizeSignal(
+            result?.signal
+        );
 
-    const indicators = result?.indicators || {};
+    const indicators =
+        result?.indicators || {};
 
-    const ema9 = Number(indicators.ema9);
-    const ema21 = Number(indicators.ema21);
-    const rsi = Number(indicators.rsi14);
-    const adx = Number(indicators.adx14);
+    const ema9 =
+        Number(indicators.ema9);
 
-    const currentPrice = Number(result?.currentPrice);
-    const support = Number(indicators.support);
-    const resistance = Number(indicators.resistance);
+    const ema21 =
+        Number(indicators.ema21);
 
-    const callScore = Number(result?.callScore);
-    const putScore = Number(result?.putScore);
+    const rsi =
+        Number(indicators.rsi14);
 
-    if (signal === 'CALL') {
+    const adx =
+        Number(indicators.adx14);
+
+    const currentPrice =
+        Number(
+            result?.currentPrice
+        );
+
+    const support =
+        Number(
+            indicators.support
+        );
+
+    const resistance =
+        Number(
+            indicators.resistance
+        );
+
+    const callScore =
+        Number(
+            result?.callScore
+        );
+
+    const putScore =
+        Number(
+            result?.putScore
+        );
+
+    if (
+        signal === 'CALL'
+    ) {
         if (
             Number.isFinite(ema9) &&
             Number.isFinite(ema21) &&
@@ -430,41 +960,37 @@ function buildFallbackReasons(result) {
             );
         }
 
-        if (Number.isFinite(rsi)) {
-            if (rsi >= 50 && rsi < 70) {
-                reasons.push(
-                    `RSI14 is ${rsi.toFixed(1)}, supporting bullish momentum without being deeply overbought.`
-                );
-            } else if (rsi >= 70) {
-                reasons.push(
-                    `RSI14 is ${rsi.toFixed(1)}, showing strong momentum but also elevated overbought risk.`
-                );
-            } else {
-                reasons.push(
-                    `RSI14 is ${rsi.toFixed(1)} and is not strongly bearish.`
-                );
-            }
-        }
-
-        if (Number.isFinite(adx)) {
-            if (adx >= 25) {
-                reasons.push(
-                    `ADX14 is ${adx.toFixed(1)}, indicating a meaningful trend strength.`
-                );
-            } else {
-                reasons.push(
-                    `ADX14 is ${adx.toFixed(1)}, so trend strength is moderate.`
-                );
-            }
+        if (
+            Number.isFinite(rsi)
+        ) {
+            reasons.push(
+                `RSI14 is ${rsi.toFixed(1)}.`
+            );
         }
 
         if (
-            Number.isFinite(currentPrice) &&
-            Number.isFinite(resistance) &&
-            resistance > currentPrice
+            Number.isFinite(adx)
         ) {
             reasons.push(
-                `Price is below resistance at ${formatPrice(resistance, result.pair)}, leaving a defined resistance level above.`
+                `ADX14 is ${adx.toFixed(1)}.`
+            );
+        }
+
+        if (
+            Number.isFinite(
+                currentPrice
+            ) &&
+            Number.isFinite(
+                resistance
+            ) &&
+            resistance >
+                currentPrice
+        ) {
+            reasons.push(
+                `Price is below resistance at ${formatPrice(
+                    resistance,
+                    result.pair
+                )}.`
             );
         }
 
@@ -478,7 +1004,9 @@ function buildFallbackReasons(result) {
         }
     }
 
-    if (signal === 'PUT') {
+    if (
+        signal === 'PUT'
+    ) {
         if (
             Number.isFinite(ema9) &&
             Number.isFinite(ema21) &&
@@ -489,41 +1017,37 @@ function buildFallbackReasons(result) {
             );
         }
 
-        if (Number.isFinite(rsi)) {
-            if (rsi <= 50 && rsi > 30) {
-                reasons.push(
-                    `RSI14 is ${rsi.toFixed(1)}, supporting bearish momentum without being deeply oversold.`
-                );
-            } else if (rsi <= 30) {
-                reasons.push(
-                    `RSI14 is ${rsi.toFixed(1)}, showing strong bearish momentum but also elevated oversold risk.`
-                );
-            } else {
-                reasons.push(
-                    `RSI14 is ${rsi.toFixed(1)} and is not strongly bullish.`
-                );
-            }
-        }
-
-        if (Number.isFinite(adx)) {
-            if (adx >= 25) {
-                reasons.push(
-                    `ADX14 is ${adx.toFixed(1)}, indicating a meaningful trend strength.`
-                );
-            } else {
-                reasons.push(
-                    `ADX14 is ${adx.toFixed(1)}, so trend strength is moderate.`
-                );
-            }
+        if (
+            Number.isFinite(rsi)
+        ) {
+            reasons.push(
+                `RSI14 is ${rsi.toFixed(1)}.`
+            );
         }
 
         if (
-            Number.isFinite(currentPrice) &&
-            Number.isFinite(support) &&
-            currentPrice > support
+            Number.isFinite(adx)
         ) {
             reasons.push(
-                `Price is above support at ${formatPrice(support, result.pair)}, leaving a defined support level below.`
+                `ADX14 is ${adx.toFixed(1)}.`
+            );
+        }
+
+        if (
+            Number.isFinite(
+                currentPrice
+            ) &&
+            Number.isFinite(
+                support
+            ) &&
+            currentPrice >
+                support
+        ) {
+            reasons.push(
+                `Price is above support at ${formatPrice(
+                    support,
+                    result.pair
+                )}.`
             );
         }
 
@@ -537,9 +1061,11 @@ function buildFallbackReasons(result) {
         }
     }
 
-    if (signal === 'NO TRADE') {
+    if (
+        signal === 'NO TRADE'
+    ) {
         reasons.push(
-            'The available indicators are not sufficiently aligned for a high-confidence CALL or PUT.'
+            'Available indicators are not sufficiently aligned for a high-confidence CALL or PUT.'
         );
 
         if (
@@ -550,12 +1076,6 @@ function buildFallbackReasons(result) {
                 `CALL score ${Math.round(callScore)}% vs PUT score ${Math.round(putScore)}%.`
             );
         }
-
-        if (Number.isFinite(adx)) {
-            reasons.push(
-                `ADX14 is ${adx.toFixed(1)}, which is considered when evaluating trend strength.`
-            );
-        }
     }
 
     return reasons;
@@ -563,34 +1083,53 @@ function buildFallbackReasons(result) {
 
 
 function getReasons(result) {
-    const backendReasons = result?.reasons;
+    const backendReasons =
+        result?.reasons;
 
-    if (Array.isArray(backendReasons)) {
-        const clean = backendReasons
-            .map(item => {
-                if (typeof item === 'string') {
-                    return item.trim();
-                }
+    if (
+        Array.isArray(
+            backendReasons
+        )
+    ) {
+        const clean =
+            backendReasons
+                .map(item => {
+                    if (
+                        typeof item ===
+                        'string'
+                    ) {
+                        return item.trim();
+                    }
 
-                if (item && typeof item === 'object') {
-                    return (
-                        item.reason ||
-                        item.message ||
-                        item.text ||
-                        ''
-                    ).toString().trim();
-                }
+                    if (
+                        item &&
+                        typeof item ===
+                        'object'
+                    ) {
+                        return (
+                            item.reason ||
+                            item.message ||
+                            item.text ||
+                            ''
+                        )
+                            .toString()
+                            .trim();
+                    }
 
-                return '';
-            })
-            .filter(Boolean);
+                    return '';
+                })
+                .filter(Boolean);
 
-        if (clean.length > 0) {
+        if (
+            clean.length > 0
+        ) {
             return clean;
         }
     }
 
-    return buildFallbackReasons(result);
+    return buildFallbackReasons(
+        result
+    );
 }
 
 
@@ -599,7 +1138,8 @@ function renderReasons(result) {
         return;
     }
 
-    const reasons = getReasons(result);
+    const reasons =
+        getReasons(result);
 
     if (!reasons.length) {
         el.reasons.innerHTML =
@@ -608,14 +1148,15 @@ function renderReasons(result) {
         return;
     }
 
-    el.reasons.innerHTML = reasons
-        .map(reason => `
-            <div class="reason-item">
-                <span class="reason-dot">•</span>
-                <span>${escapeHtml(reason)}</span>
-            </div>
-        `)
-        .join('');
+    el.reasons.innerHTML =
+        reasons
+            .map(reason => `
+                <div class="reason-item">
+                    <span class="reason-dot">•</span>
+                    <span>${escapeHtml(reason)}</span>
+                </div>
+            `)
+            .join('');
 }
 
 
@@ -628,36 +1169,46 @@ function renderDataAge(result) {
         return;
     }
 
-    /*
-      V8.4.1 currently exposes analysisTime rather than
-      lastCandle. We therefore do NOT falsely label analysis
-      time as "last candle".
-
-      If a future backend response provides lastCandle,
-      we use it.
-    */
-
     const timestamp =
         result?.lastCandle ||
         result?.analysisTime ||
         null;
 
     if (!timestamp) {
-        el.dataAge.textContent = '—';
+        el.dataAge.textContent =
+            '—';
+
         return;
     }
 
-    const d = new Date(timestamp);
+    const d =
+        new Date(timestamp);
 
-    if (Number.isNaN(d.getTime())) {
-        el.dataAge.textContent = '—';
+    if (
+        Number.isNaN(
+            d.getTime()
+        )
+    ) {
+        el.dataAge.textContent =
+            '—';
+
         return;
     }
 
     const ageSeconds =
-        Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+        Math.max(
+            0,
+            Math.floor(
+                (
+                    Date.now() -
+                    d.getTime()
+                ) / 1000
+            )
+        );
 
-    if (result?.lastCandle) {
+    if (
+        result?.lastCandle
+    ) {
         el.dataAge.textContent =
             `${ageSeconds}s old`;
     } else {
@@ -676,125 +1227,163 @@ function renderSignal(result) {
         return;
     }
 
-    currentResult = result;
+    currentResult =
+        result;
 
-    const pair = result.pair || '—';
-    const signal = normalizeSignal(result.signal);
-    const trend = normalizeTrend(result.marketCondition);
+    const pair =
+        result.pair || '—';
 
-    const indicators = result.indicators || {};
+    const signal =
+        normalizeSignal(
+            result.signal
+        );
+
+    const trend =
+        normalizeTrend(
+            result.marketCondition
+        );
+
+    const indicators =
+        result.indicators || {};
 
     showSignalCard(true);
 
-    /* Pair */
     if (el.selectedPair) {
-        el.selectedPair.textContent = pair;
+        el.selectedPair.textContent =
+            pair;
     }
 
-    /* Trend / market condition */
     if (el.trendBadge) {
-        el.trendBadge.textContent = trend;
+        el.trendBadge.textContent =
+            trend;
     }
 
-    /* Signal */
-    applySignalBadge(signal);
+    applySignalBadge(
+        signal
+    );
 
-    /* Confidence */
     if (el.confidence) {
-        el.confidence.textContent = percent(result.confidence);
+        el.confidence.textContent =
+            percent(
+                result.confidence
+            );
     }
 
-    /* Timeframe */
     if (el.timeframe) {
         el.timeframe.textContent =
-            formatTimeframe(result.timeframe);
+            formatTimeframe(
+                result.timeframe
+            );
     }
 
-    /* Entry time */
     if (el.entryTime) {
         el.entryTime.textContent =
-            formatUTC(result.entryTime);
+            formatUTC(
+                result.entryTime
+            );
     }
 
-    /* Expiry time */
     if (el.expiryTime) {
         el.expiryTime.textContent =
-            formatUTC(result.expiryTime);
+            formatUTC(
+                result.expiryTime
+            );
     }
 
-    /*
-      Backend V8.4.1 returns currentPrice.
-
-      The UI's existing field is called entryPrice.
-      We display the current market price here as the
-      reference price at analysis time.
-
-      It is NOT a fabricated future quote.
-    */
     if (el.entryPrice) {
         el.entryPrice.textContent =
-            formatPrice(result.currentPrice, pair);
+            formatPrice(
+                result.currentPrice,
+                pair
+            );
     }
 
-    /* Scores */
     if (el.callScore) {
         el.callScore.textContent =
-            percent(result.callScore);
+            percent(
+                result.callScore
+            );
     }
 
     if (el.putScore) {
         el.putScore.textContent =
-            percent(result.putScore);
+            percent(
+                result.putScore
+            );
     }
 
-    /* Support / resistance */
     if (el.support) {
         el.support.textContent =
-            formatPrice(indicators.support, pair);
+            formatPrice(
+                indicators.support,
+                pair
+            );
     }
 
     if (el.resistance) {
         el.resistance.textContent =
-            formatPrice(indicators.resistance, pair);
+            formatPrice(
+                indicators.resistance,
+                pair
+            );
     }
 
-    /* Technical indicators */
     if (el.ema9) {
         el.ema9.textContent =
-            formatPrice(indicators.ema9, pair);
+            formatPrice(
+                indicators.ema9,
+                pair
+            );
     }
 
     if (el.ema21) {
         el.ema21.textContent =
-            formatPrice(indicators.ema21, pair);
+            formatPrice(
+                indicators.ema21,
+                pair
+            );
     }
 
     if (el.rsi) {
         el.rsi.textContent =
-            safeNumber(indicators.rsi14, 1);
+            safeNumber(
+                indicators.rsi14,
+                1
+            );
     }
 
     if (el.adx) {
         el.adx.textContent =
-            safeNumber(indicators.adx14, 1);
+            safeNumber(
+                indicators.adx14,
+                1
+            );
     }
 
-    /* Reasons */
-    renderReasons(result);
+    renderReasons(
+        result
+    );
 
-    /* Data age */
-    renderDataAge(result);
+    renderDataAge(
+        result
+    );
 
-    /* Scanner information */
+    /*
+      NEW V8.5
+    */
+    renderMarketInsights(
+        result
+    );
+
     if (el.scanInfo) {
         const source =
-            result.source || 'Twelve Data LIVE';
+            result.source ||
+            'Twelve Data LIVE';
 
         el.scanInfo.textContent =
             `${pair} selected from ${source}`;
     }
 
-    /* Start countdown */
     startCountdown();
 }
 
@@ -808,9 +1397,13 @@ function startCountdown() {
 
     updateCountdown();
 
-    countdownTimer = setInterval(() => {
-        updateCountdown();
-    }, 1000);
+    countdownTimer =
+        setInterval(
+            () => {
+                updateCountdown();
+            },
+            1000
+        );
 }
 
 
@@ -820,23 +1413,35 @@ function updateCountdown() {
     }
 
     if (!currentResult) {
-        el.countdown.textContent = '—';
+        el.countdown.textContent =
+            '—';
+
         return;
     }
 
-    const seconds = secondsUntil(
-        currentResult.entryTime
-    );
+    const seconds =
+        secondsUntil(
+            currentResult.entryTime
+        );
 
-    if (seconds === null) {
-        el.countdown.textContent = '—';
+    if (
+        seconds === null
+    ) {
+        el.countdown.textContent =
+            '—';
+
         return;
     }
 
-    if (seconds <= 0) {
-        el.countdown.textContent = 'ENTER NOW';
+    if (
+        seconds <= 0
+    ) {
+        el.countdown.textContent =
+            'ENTER NOW';
 
-        if (seconds < -5) {
+        if (
+            seconds < -5
+        ) {
             clearCountdown();
         }
 
@@ -844,12 +1449,14 @@ function updateCountdown() {
     }
 
     el.countdown.textContent =
-        formatCountdown(seconds);
+        formatCountdown(
+            seconds
+        );
 }
 
 
 /* =========================================================
-   LOADING STATE
+   LOADING
 ========================================================= */
 
 function renderLoading() {
@@ -876,57 +1483,30 @@ function renderLoading() {
         );
     }
 
-    if (el.confidence) {
-        el.confidence.textContent = '—';
-    }
+    const fields = [
+        el.confidence,
+        el.timeframe,
+        el.entryTime,
+        el.expiryTime,
+        el.entryPrice,
+        el.callScore,
+        el.putScore,
+        el.support,
+        el.resistance,
+        el.ema9,
+        el.ema21,
+        el.rsi,
+        el.adx
+    ];
 
-    if (el.timeframe) {
-        el.timeframe.textContent = '—';
-    }
-
-    if (el.entryTime) {
-        el.entryTime.textContent = '—';
-    }
-
-    if (el.expiryTime) {
-        el.expiryTime.textContent = '—';
-    }
-
-    if (el.entryPrice) {
-        el.entryPrice.textContent = '—';
-    }
-
-    if (el.callScore) {
-        el.callScore.textContent = '—';
-    }
-
-    if (el.putScore) {
-        el.putScore.textContent = '—';
-    }
-
-    if (el.support) {
-        el.support.textContent = '—';
-    }
-
-    if (el.resistance) {
-        el.resistance.textContent = '—';
-    }
-
-    if (el.ema9) {
-        el.ema9.textContent = '—';
-    }
-
-    if (el.ema21) {
-        el.ema21.textContent = '—';
-    }
-
-    if (el.rsi) {
-        el.rsi.textContent = '—';
-    }
-
-    if (el.adx) {
-        el.adx.textContent = '—';
-    }
+    fields.forEach(
+        field => {
+            if (field) {
+                field.textContent =
+                    '—';
+            }
+        }
+    );
 
     if (el.countdown) {
         el.countdown.textContent =
@@ -948,20 +1528,28 @@ function renderLoading() {
         el.scanInfo.textContent =
             'Smart scanner is selecting the strongest available setup...';
     }
+
+    if (insightBox) {
+        insightBox.innerHTML = '';
+    }
 }
 
 
 /* =========================================================
-   ERROR STATE
+   ERROR
 ========================================================= */
 
-function renderErrorState(message) {
+function renderErrorState(
+    message
+) {
     clearCountdown();
 
-    currentResult = null;
+    currentResult =
+        null;
 
     if (el.signalBadge) {
-        el.signalBadge.textContent = 'ERROR';
+        el.signalBadge.textContent =
+            'ERROR';
 
         el.signalBadge.classList.remove(
             'call',
@@ -971,7 +1559,8 @@ function renderErrorState(message) {
     }
 
     if (el.countdown) {
-        el.countdown.textContent = '—';
+        el.countdown.textContent =
+            '—';
     }
 
     if (el.reasons) {
@@ -982,23 +1571,36 @@ function renderErrorState(message) {
             </div>
         `;
     }
+
+    if (insightBox) {
+        insightBox.innerHTML =
+            '';
+    }
 }
 
 
 /* =========================================================
-   FETCH JSON
+   FETCH
 ========================================================= */
 
-async function fetchJson(url, options = {}) {
-    const response = await fetch(url, {
-        cache: 'no-store',
-        ...options
-    });
+async function fetchJson(
+    url,
+    options = {}
+) {
+    const response =
+        await fetch(
+            url,
+            {
+                cache: 'no-store',
+                ...options
+            }
+        );
 
     let data = null;
 
     try {
-        data = await response.json();
+        data =
+            await response.json();
     } catch (error) {
         throw new Error(
             `Backend returned invalid JSON (${response.status}).`
@@ -1011,7 +1613,9 @@ async function fetchJson(url, options = {}) {
             data?.message ||
             `Backend request failed with HTTP ${response.status}.`;
 
-        throw new Error(message);
+        throw new Error(
+            message
+        );
     }
 
     return data;
@@ -1024,7 +1628,10 @@ async function fetchJson(url, options = {}) {
 
 async function checkHealth() {
     try {
-        const data = await fetchJson(HEALTH_URL);
+        const data =
+            await fetchJson(
+                HEALTH_URL
+            );
 
         if (data?.ok) {
             const version =
@@ -1040,8 +1647,12 @@ async function checkHealth() {
             return data;
         }
 
-        throw new Error('Backend health check failed.');
+        throw new Error(
+            'Backend health check failed.'
+        );
+
     } catch (error) {
+
         setBackendStatus(
             'BACKEND OFFLINE',
             false
@@ -1053,7 +1664,7 @@ async function checkHealth() {
 
 
 /* =========================================================
-   SCANNER STATUS
+   SCANNER
 ========================================================= */
 
 function renderScanner(data) {
@@ -1064,6 +1675,7 @@ function renderScanner(data) {
     if (!data) {
         el.scanner.textContent =
             'Scanner status unavailable.';
+
         return;
     }
 
@@ -1071,59 +1683,95 @@ function renderScanner(data) {
         data.scanRunning === true;
 
     const cachedPairs =
-        Number.isFinite(Number(data.cachedPairs))
-            ? Number(data.cachedPairs)
+        Number.isFinite(
+            Number(
+                data.cachedPairs
+            )
+        )
+            ? Number(
+                data.cachedPairs
+            )
             : 0;
 
     const cachedResults =
-        Number.isFinite(Number(data.cachedResults))
-            ? Number(data.cachedResults)
+        Number.isFinite(
+            Number(
+                data.cachedResults
+            )
+        )
+            ? Number(
+                data.cachedResults
+            )
             : 0;
 
     const cursor =
-        Number.isFinite(Number(data.scanCursor))
-            ? Number(data.scanCursor)
+        Number.isFinite(
+            Number(
+                data.scanCursor
+            )
+        )
+            ? Number(
+                data.scanCursor
+            )
             : null;
 
     const batchSize =
-        Number.isFinite(Number(data.scanBatchSize))
-            ? Number(data.scanBatchSize)
+        Number.isFinite(
+            Number(
+                data.scanBatchSize
+            )
+        )
+            ? Number(
+                data.scanBatchSize
+            )
             : null;
 
     const quotaBlocked =
         data.quotaBlocked === true;
 
-    let status = running
-        ? 'SCANNING'
-        : 'READY';
+    let status =
+        running
+            ? 'SCANNING'
+            : 'READY';
 
     if (quotaBlocked) {
-        status = 'QUOTA BLOCKED';
+        status =
+            'QUOTA BLOCKED';
     }
 
     el.scanner.innerHTML = `
         <div class="scanner-status">
-            <strong>${escapeHtml(status)}</strong>
+            <strong>
+                ${escapeHtml(status)}
+            </strong>
         </div>
 
         <div class="scanner-line">
             Cached pairs:
-            <strong>${cachedPairs}</strong>
+            <strong>
+                ${cachedPairs}
+            </strong>
         </div>
 
         <div class="scanner-line">
             Cached results:
-            <strong>${cachedResults}</strong>
+            <strong>
+                ${cachedResults}
+            </strong>
         </div>
 
         <div class="scanner-line">
             Batch size:
-            <strong>${batchSize ?? '—'}</strong>
+            <strong>
+                ${batchSize ?? '—'}
+            </strong>
         </div>
 
         <div class="scanner-line">
             Scan cursor:
-            <strong>${cursor ?? '—'}</strong>
+            <strong>
+                ${cursor ?? '—'}
+            </strong>
         </div>
     `;
 }
@@ -1132,12 +1780,18 @@ function renderScanner(data) {
 async function refreshScanner() {
     try {
         const data =
-            await fetchJson(SCAN_STATUS_URL);
+            await fetchJson(
+                SCAN_STATUS_URL
+            );
 
-        renderScanner(data);
+        renderScanner(
+            data
+        );
 
         return data;
+
     } catch (error) {
+
         if (el.scanner) {
             el.scanner.textContent =
                 'Scanner status unavailable.';
@@ -1149,7 +1803,7 @@ async function refreshScanner() {
 
 
 /* =========================================================
-   MAIN ANALYZE FUNCTION
+   MAIN ANALYZE
 ========================================================= */
 
 async function analyzeMarket() {
@@ -1158,36 +1812,31 @@ async function analyzeMarket() {
     }
 
     clearError();
+
     clearCountdown();
 
-    currentResult = null;
+    currentResult =
+        null;
 
     setLoading(true);
+
     renderLoading();
 
     try {
+
         /*
-        =====================================================
-        IMPORTANT
-
-        DO NOT use /api/analyze here.
-
-        /api/analyze requires a pair.
-
-        V8 Smart Scanner must let the backend choose
-        the market automatically.
-
-        Therefore:
-
-            /api/best
-
-        =====================================================
+          Smart scanner:
+          backend chooses pair + timeframe.
         */
-
         const data =
-            await fetchJson(BEST_URL);
+            await fetchJson(
+                BEST_URL
+            );
 
-        if (!data || data.ok !== true) {
+        if (
+            !data ||
+            data.ok !== true
+        ) {
             throw new Error(
                 data?.error ||
                 data?.message ||
@@ -1207,11 +1856,10 @@ async function analyzeMarket() {
             );
         }
 
-        /*
-          Make sure we have an actual signal object.
-        */
         const signal =
-            normalizeSignal(selected.signal);
+            normalizeSignal(
+                selected.signal
+            );
 
         if (
             !selected.pair ||
@@ -1224,22 +1872,18 @@ async function analyzeMarket() {
             );
         }
 
-        /*
-          Store selected result.
-        */
-        currentResult = selected;
+        currentResult =
+            selected;
 
-        /*
-          Render selected market.
-        */
-        renderSignal(selected);
+        renderSignal(
+            selected
+        );
 
-        /*
-          Explain selection.
-        */
         if (el.scanInfo) {
             const scanned =
-                Number(data.scannedResults);
+                Number(
+                    data.scannedResults
+                );
 
             const scanText =
                 Number.isFinite(scanned)
@@ -1247,13 +1891,11 @@ async function analyzeMarket() {
                     : '';
 
             el.scanInfo.textContent =
-                `AI selected ${selected.pair} • ${formatTimeframe(selected.timeframe)} • ${signal}.${scanText}`;
+                `AI selected ${selected.pair} • ${formatTimeframe(
+                    selected.timeframe
+                )} • ${signal}.${scanText}`;
         }
 
-        /*
-          If backend reports stale-cache warning, show it
-          without pretending it is a live fresh quote.
-        */
         if (
             selected.dataWarning &&
             el.scanInfo
@@ -1262,12 +1904,10 @@ async function analyzeMarket() {
                 ` ${selected.dataWarning}`;
         }
 
-        /*
-          Refresh scanner information after selection.
-        */
         await refreshScanner();
 
     } catch (error) {
+
         console.error(
             '[PO AI PREDICTOR] Analyze error:',
             error
@@ -1277,8 +1917,13 @@ async function analyzeMarket() {
             error?.message ||
             'Unable to load live market data.';
 
-        showError(message);
-        renderErrorState(message);
+        showError(
+            message
+        );
+
+        renderErrorState(
+            message
+        );
 
         if (el.scanInfo) {
             el.scanInfo.textContent =
@@ -1292,48 +1937,66 @@ async function analyzeMarket() {
 
 
 /* =========================================================
-   AUTO REFRESH STATUS
+   AUTO STATUS REFRESH
 ========================================================= */
 
 function startStatusRefresh() {
     if (healthTimer) {
-        clearInterval(healthTimer);
+        clearInterval(
+            healthTimer
+        );
     }
 
     if (scannerTimer) {
-        clearInterval(scannerTimer);
+        clearInterval(
+            scannerTimer
+        );
     }
 
     /*
-      Health every 30 seconds.
+      Health only.
+      Does not trigger scanning.
     */
-    healthTimer = setInterval(() => {
-        checkHealth();
-    }, 30000);
+    healthTimer =
+        setInterval(
+            () => {
+                checkHealth();
+            },
+            30000
+        );
 
     /*
-      Scanner status every 15 seconds.
-      This does NOT trigger a new scan.
+      Scanner status only.
+      Does not trigger provider requests.
     */
-    scannerTimer = setInterval(() => {
-        refreshScanner();
-    }, 15000);
+    scannerTimer =
+        setInterval(
+            () => {
+                refreshScanner();
+            },
+            15000
+        );
 }
 
 
 /* =========================================================
-   VISIBILITY CHANGE
+   VISIBILITY
 ========================================================= */
 
 document.addEventListener(
     'visibilitychange',
     () => {
         if (!document.hidden) {
+
             checkHealth();
+
             refreshScanner();
 
             if (currentResult) {
-                renderDataAge(currentResult);
+                renderDataAge(
+                    currentResult
+                );
+
                 updateCountdown();
             }
         }
@@ -1361,6 +2024,7 @@ function bindEvents() {
 
 async function init() {
     clearError();
+
     clearCountdown();
 
     setBackendStatus(
@@ -1377,21 +2041,19 @@ async function init() {
     startStatusRefresh();
 
     /*
-      Do NOT automatically place or generate a trade signal
-      on page load.
-
-      The user explicitly chooses when to analyze by pressing:
-
-          ANALYZE MARKET
+      No automatic signal generation on page load.
     */
 }
 
 
 /* =========================================================
-   SAFE DOM READY
+   DOM READY
 ========================================================= */
 
-if (document.readyState === 'loading') {
+if (
+    document.readyState ===
+    'loading'
+) {
     document.addEventListener(
         'DOMContentLoaded',
         init
