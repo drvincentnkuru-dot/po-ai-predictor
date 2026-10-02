@@ -1,16 +1,23 @@
 // ============================================================
 // PO AI PREDICTOR
-// Backend V8.6.3
+// Backend V8.6.4
 // LIVE ONLY - Twelve Data
 //
-// V8.6.3 changes:
+// V8.6.4 - ULTRA QUOTA-SAFE
+//
+// Changes from V8.6.3:
+// - Provider request budget reduced to 5/minute
+// - HTTP 429 is treated as a provider quota/rate-limit event
+// - Scanner stops immediately when 429 is detected
+// - Provider cooldown prevents repeated 429 retries
+// - Retry-After header is respected when available
+// - Cache remains the first protection against unnecessary calls
+// - Settlement also respects the same quota gate
 // - MACD REMOVED
 // - CCI20 REMOVED
 // - Keeps EMA9/EMA21, RSI14, ADX14, Stochastic,
-//   Support/Resistance, Candlestick Patterns,
+//   ATR14, Support/Resistance, Candlestick Patterns,
 //   Market Psychology
-// - Quota-safe: max 7 provider requests/minute
-// - Daily safety reserve
 // - Automatic signal registration
 // - Automatic WIN / LOSS / DRAW settlement
 // - Settlement loop independent from scanner
@@ -24,7 +31,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-const VERSION = "V8.6.3";
+const VERSION = "V8.6.4";
 const SOURCE = "Twelve Data LIVE";
 const TIMEZONE = "UTC";
 
@@ -32,10 +39,13 @@ const TIMEZONE = "UTC";
 // ENV
 // ------------------------------------------------------------
 
-const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || "";
+const TWELVE_DATA_API_KEY =
+  process.env.TWELVE_DATA_API_KEY || "";
 
 if (!TWELVE_DATA_API_KEY) {
-  console.warn("[WARNING] TWELVE_DATA_API_KEY is not configured.");
+  console.warn(
+    "[WARNING] TWELVE_DATA_API_KEY is not configured."
+  );
 }
 
 // ------------------------------------------------------------
@@ -72,19 +82,30 @@ const PAIRS = [
 const TIMEFRAMES = [1, 2, 3];
 
 // ------------------------------------------------------------
-// SYSTEM SETTINGS
+// QUOTA-SAFE SYSTEM SETTINGS
 // ------------------------------------------------------------
-
-// Twelve Data provider limit observed by this project:
-// 8 credits/minute.
 //
-// We intentionally stay at 7 to keep a safety margin.
-const REQUEST_LIMIT_PER_MINUTE = 7;
+// Important:
+//
+// Twelve Data has previously returned HTTP 429 even when the
+// local application was configured for 7 requests/minute.
+//
+// To protect the account, V8.6.4 deliberately uses only
+// 5 provider requests/minute.
+//
+// This leaves a larger safety margin for provider-side counting,
+// other requests, clock differences and settlement requests.
+//
+// IMPORTANT:
+// The application never intentionally exceeds this local limit.
+//
 
-// Scanner requests one batch at a time.
-const SCAN_BATCH_SIZE = 7;
+const REQUEST_LIMIT_PER_MINUTE = 5;
 
-// One scan batch every minute.
+// Scanner requests only 5 pairs per scan cycle.
+const SCAN_BATCH_SIZE = 5;
+
+// One scanner batch every minute.
 const SCAN_EVERY_MS = 60 * 1000;
 
 // Settlement checks every 10 seconds.
@@ -93,7 +114,7 @@ const SETTLEMENT_INTERVAL_MS = 10 * 1000;
 // Keep market candle data for 15 minutes.
 const CACHE_TTL_MS = 15 * 60 * 1000;
 
-// Keep selected result even after the "fresh" window.
+// Keep selected result considered fresh for 30 seconds.
 const RESULT_FRESH_MS = 30 * 1000;
 
 // Signal must be visible at least 30 seconds before entry.
@@ -108,12 +129,33 @@ const MAX_CANDLES = 180;
 // Minimum candles required before analysis.
 const MIN_CANDLES = 60;
 
+// ------------------------------------------------------------
+// PROVIDER 429 COOLDOWN
+// ------------------------------------------------------------
+//
+// When Twelve Data returns HTTP 429, do NOT immediately retry.
+//
+// The provider may count requests independently from our local
+// counter. A cooldown prevents a chain of repeated 429 requests.
+//
+// Default cooldown: 90 seconds.
+//
+// If Twelve Data sends Retry-After, the larger useful value is used.
+//
+
+const DEFAULT_PROVIDER_COOLDOWN_SECONDS = 90;
+
+const MAX_PROVIDER_COOLDOWN_SECONDS = 15 * 60;
+
 // Daily budget.
 // We deliberately reserve credits.
 const DAILY_LIMIT = 768;
+
 const DAILY_SAFETY_RESERVE = 32;
+
 const MAX_DAILY_REQUESTS =
-  DAILY_LIMIT - DAILY_SAFETY_RESERVE;
+  DAILY_LIMIT -
+  DAILY_SAFETY_RESERVE;
 
 // Signal history.
 const MAX_SIGNAL_HISTORY = 5;
@@ -128,29 +170,53 @@ const MAX_CACHE_ENTRIES = 100;
 const candleCache = new Map();
 
 let scanCursor = 0;
+
 let scanRunning = false;
 
 let lastScanAt = null;
+
 let lastScanError = null;
+
 let totalScanned = 0;
+
 let totalFailed = 0;
+
 let totalApiRequests = 0;
 
 let lastSelected = null;
+
 let lastSelectedAt = null;
 
+// Local provider request timestamps.
 let minuteRequestTimestamps = [];
 
-let dailyRequestDate = getUtcDateKey(new Date());
+let dailyRequestDate =
+  getUtcDateKey(new Date());
+
 let dailyRequests = 0;
 
+// Provider quota state.
 let quotaBlocked = false;
+
 let quotaBlockedUntil = null;
+
 let providerQuotaMessage = null;
+
 let providerQuotaResetAt = null;
 
+// Local minute budget state.
 let minuteBlocked = false;
+
 let minuteResetAt = null;
+
+// Number of HTTP 429 responses.
+let provider429Count = 0;
+
+// Last provider HTTP status.
+let lastProviderHttpStatus = null;
+
+// Last provider error time.
+let lastProviderErrorAt = null;
 
 // Signal history.
 // Newest signal is stored first.
@@ -161,7 +227,9 @@ const signalHistory = [];
 // ------------------------------------------------------------
 
 function getUtcDateKey(date) {
-  return date.toISOString().slice(0, 10);
+  return date
+    .toISOString()
+    .slice(0, 10);
 }
 
 function nowMs() {
@@ -169,23 +237,39 @@ function nowMs() {
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
 }
 
-function roundNumber(value, decimals = 5) {
-  if (!Number.isFinite(value)) return null;
+function roundNumber(
+  value,
+  decimals = 5
+) {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
 
-  const factor = Math.pow(10, decimals);
+  const factor =
+    Math.pow(10, decimals);
 
-  return Math.round(value * factor) / factor;
+  return (
+    Math.round(value * factor) /
+    factor
+  );
 }
 
 function normalizePair(pair) {
-  if (!pair) return "";
+  if (!pair) {
+    return "";
+  }
 
   return String(pair)
     .trim()
@@ -193,24 +277,30 @@ function normalizePair(pair) {
     .replace("-", "/");
 }
 
-function pairToTwelveDataSymbol(pair) {
-  return normalizePair(pair).replace("/", "");
+function pairToTwelveDataSymbol(
+  pair
+) {
+  return normalizePair(pair)
+    .replace("/", "");
 }
 
 function isSupportedPair(pair) {
-  return PAIRS.includes(normalizePair(pair));
+  return PAIRS.includes(
+    normalizePair(pair)
+  );
 }
 
 function isSupportedTimeframe(tf) {
-  return TIMEFRAMES.includes(Number(tf));
+  return TIMEFRAMES.includes(
+    Number(tf)
+  );
 }
 
 function getPriceDecimals(pair) {
-  const p = normalizePair(pair);
+  const p =
+    normalizePair(pair);
 
-  if (
-    p.includes("JPY")
-  ) {
+  if (p.includes("JPY")) {
     return 3;
   }
 
@@ -222,17 +312,129 @@ function getPriceDecimals(pair) {
 // ------------------------------------------------------------
 
 function resetDailyBudgetIfNeeded() {
-  const today = getUtcDateKey(new Date());
+  const today =
+    getUtcDateKey(new Date());
 
-  if (today !== dailyRequestDate) {
+  if (
+    today !==
+    dailyRequestDate
+  ) {
     dailyRequestDate = today;
+
     dailyRequests = 0;
 
     quotaBlocked = false;
+
     quotaBlockedUntil = null;
+
     providerQuotaMessage = null;
+
     providerQuotaResetAt = null;
+
+    lastProviderHttpStatus = null;
+
+    lastProviderErrorAt = null;
+
+    console.log(
+      "[QUOTA] UTC daily budget reset."
+    );
   }
+}
+
+// ------------------------------------------------------------
+// PROVIDER COOLDOWN
+// ------------------------------------------------------------
+
+function clearProviderCooldownIfExpired() {
+  if (
+    !quotaBlocked ||
+    !quotaBlockedUntil
+  ) {
+    return;
+  }
+
+  if (
+    nowMs() >=
+    quotaBlockedUntil
+  ) {
+    quotaBlocked = false;
+
+    quotaBlockedUntil = null;
+
+    providerQuotaMessage = null;
+
+    providerQuotaResetAt = null;
+
+    console.log(
+      "[QUOTA] Provider cooldown expired."
+    );
+  }
+}
+
+function getProviderCooldownSeconds() {
+  clearProviderCooldownIfExpired();
+
+  if (
+    !quotaBlocked ||
+    !quotaBlockedUntil
+  ) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    Math.ceil(
+      (quotaBlockedUntil -
+        nowMs()) /
+        1000
+    )
+  );
+}
+
+function blockProviderQuota(
+  message,
+  retryAfterSeconds = null
+) {
+  let seconds =
+    Number(
+      retryAfterSeconds
+    );
+
+  if (
+    !Number.isFinite(seconds) ||
+    seconds <= 0
+  ) {
+    seconds =
+      DEFAULT_PROVIDER_COOLDOWN_SECONDS;
+  }
+
+  seconds =
+    Math.min(
+      Math.max(
+        1,
+        Math.ceil(seconds)
+      ),
+      MAX_PROVIDER_COOLDOWN_SECONDS
+    );
+
+  quotaBlocked = true;
+
+  quotaBlockedUntil =
+    nowMs() +
+    seconds * 1000;
+
+  providerQuotaMessage =
+    message ||
+    "Twelve Data provider quota/rate limit reached.";
+
+  providerQuotaResetAt =
+    new Date(
+      quotaBlockedUntil
+    ).toISOString();
+
+  console.warn(
+    `[QUOTA] Provider cooldown enabled for ${seconds}s.`
+  );
 }
 
 // ------------------------------------------------------------
@@ -240,11 +442,14 @@ function resetDailyBudgetIfNeeded() {
 // ------------------------------------------------------------
 
 function cleanupMinuteRequests() {
-  const cutoff = nowMs() - 60 * 1000;
+  const cutoff =
+    nowMs() -
+    60 * 1000;
 
   minuteRequestTimestamps =
     minuteRequestTimestamps.filter(
-      (timestamp) => timestamp > cutoff
+      (timestamp) =>
+        timestamp > cutoff
     );
 }
 
@@ -257,46 +462,61 @@ function getMinuteRequestCount() {
 function getSecondsUntilMinuteReset() {
   cleanupMinuteRequests();
 
-  if (minuteRequestTimestamps.length === 0) {
+  if (
+    minuteRequestTimestamps.length ===
+    0
+  ) {
     return 0;
   }
 
-  const oldest = minuteRequestTimestamps[0];
+  const oldest =
+    minuteRequestTimestamps[0];
 
   return Math.max(
     0,
     Math.ceil(
-      (oldest + 60 * 1000 - nowMs()) / 1000
+      (
+        oldest +
+        60 * 1000 -
+        nowMs()
+      ) / 1000
     )
   );
 }
 
+// ------------------------------------------------------------
+// REQUEST SLOT
+// ------------------------------------------------------------
+
 function acquireRequestSlot() {
   resetDailyBudgetIfNeeded();
+
+  clearProviderCooldownIfExpired();
+
   cleanupMinuteRequests();
 
   if (quotaBlocked) {
     return {
       allowed: false,
-      reason: "provider_quota_blocked",
+
+      reason:
+        "provider_quota_blocked",
+
       retryAfterSeconds:
-        quotaBlockedUntil
-          ? Math.max(
-              0,
-              Math.ceil(
-                (quotaBlockedUntil - nowMs()) / 1000
-              )
-            )
-          : null
+        getProviderCooldownSeconds()
     };
   }
 
   if (
-    dailyRequests >= MAX_DAILY_REQUESTS
+    dailyRequests >=
+    MAX_DAILY_REQUESTS
   ) {
     return {
       allowed: false,
-      reason: "daily_safety_budget_reached",
+
+      reason:
+        "daily_safety_budget_reached",
+
       retryAfterSeconds: null
     };
   }
@@ -315,22 +535,31 @@ function acquireRequestSlot() {
 
     minuteResetAt =
       new Date(
-        nowMs() + retry * 1000
+        nowMs() +
+          retry * 1000
       ).toISOString();
 
     return {
       allowed: false,
-      reason: "local_minute_budget_reached",
-      retryAfterSeconds: retry
+
+      reason:
+        "local_minute_budget_reached",
+
+      retryAfterSeconds:
+        retry
     };
   }
 
   minuteBlocked = false;
+
   minuteResetAt = null;
 
-  minuteRequestTimestamps.push(nowMs());
+  minuteRequestTimestamps.push(
+    nowMs()
+  );
 
   dailyRequests += 1;
+
   totalApiRequests += 1;
 
   return {
@@ -339,26 +568,87 @@ function acquireRequestSlot() {
 }
 
 // ------------------------------------------------------------
+// RETRY-AFTER PARSER
+// ------------------------------------------------------------
+
+function parseRetryAfter(
+  response
+) {
+  if (!response) {
+    return null;
+  }
+
+  try {
+    const header =
+      response.headers.get(
+        "retry-after"
+      );
+
+    if (!header) {
+      return null;
+    }
+
+    const numeric =
+      Number(header);
+
+    if (
+      Number.isFinite(numeric) &&
+      numeric >= 0
+    ) {
+      return numeric;
+    }
+
+    const date =
+      Date.parse(header);
+
+    if (
+      Number.isFinite(date)
+    ) {
+      return Math.max(
+        0,
+        Math.ceil(
+          (date - nowMs()) /
+            1000
+        )
+      );
+    }
+  } catch {
+    // Ignore header parsing errors.
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
 // TWELVE DATA FETCH
 // ------------------------------------------------------------
 
-async function fetchTwelveDataCandles(pair) {
-  const normalized = normalizePair(pair);
+async function fetchTwelveDataCandles(
+  pair
+) {
+  const normalized =
+    normalizePair(pair);
 
-  if (!isSupportedPair(normalized)) {
+  if (
+    !isSupportedPair(normalized)
+  ) {
     throw new Error(
       `${normalized}: unsupported pair`
     );
   }
 
-  const slot = acquireRequestSlot();
+  const slot =
+    acquireRequestSlot();
 
   if (!slot.allowed) {
-    const error = new Error(
-      `Request blocked: ${slot.reason}`
-    );
+    const error =
+      new Error(
+        `Request blocked: ${slot.reason}`
+      );
 
-    error.code = slot.reason;
+    error.code =
+      slot.reason;
+
     error.retryAfterSeconds =
       slot.retryAfterSeconds;
 
@@ -366,11 +656,15 @@ async function fetchTwelveDataCandles(pair) {
   }
 
   const symbol =
-    pairToTwelveDataSymbol(normalized);
+    pairToTwelveDataSymbol(
+      normalized
+    );
 
   const url =
     "https://api.twelvedata.com/time_series" +
-    `?symbol=${encodeURIComponent(symbol)}` +
+    `?symbol=${encodeURIComponent(
+      symbol
+    )}` +
     "&interval=1min" +
     `&outputsize=${MAX_CANDLES}` +
     "&order=ASC" +
@@ -378,15 +672,111 @@ async function fetchTwelveDataCandles(pair) {
       TWELVE_DATA_API_KEY
     )}`;
 
-  const response = await fetch(url);
-
-  let data;
+  let response;
 
   try {
-    data = await response.json();
+    response =
+      await fetch(url);
+  } catch (error) {
+    lastProviderErrorAt =
+      new Date().toISOString();
+
+    throw new Error(
+      `${normalized}: Twelve Data network error: ${error.message}`
+    );
+  }
+
+  lastProviderHttpStatus =
+    response.status;
+
+  lastProviderErrorAt =
+    response.ok
+      ? lastProviderErrorAt
+      : new Date().toISOString();
+
+  // ----------------------------------------------------------
+  // HTTP 429
+  // ----------------------------------------------------------
+  //
+  // This is the most important V8.6.4 protection.
+  //
+  // Do NOT continue scanning the rest of the batch.
+  //
+
+  if (
+    response.status === 429
+  ) {
+    provider429Count += 1;
+
+    let bodyText = "";
+
+    try {
+      bodyText =
+        await response.text();
+    } catch {
+      bodyText = "";
+    }
+
+    let message =
+      "Twelve Data HTTP 429 - provider rate limit/quota reached.";
+
+    if (bodyText) {
+      try {
+        const parsed =
+          JSON.parse(bodyText);
+
+        if (
+          parsed &&
+          parsed.message
+        ) {
+          message =
+            String(
+              parsed.message
+            );
+        }
+      } catch {
+        // Keep default message.
+      }
+    }
+
+    const retryAfter =
+      parseRetryAfter(
+        response
+      );
+
+    blockProviderQuota(
+      message,
+      retryAfter
+    );
+
+    const error =
+      new Error(
+        `${normalized}: ${message}`
+      );
+
+    error.code =
+      "provider_http_429";
+
+    error.httpStatus = 429;
+
+    error.retryAfterSeconds =
+      getProviderCooldownSeconds();
+
+    throw error;
+  }
+
+  let data = null;
+
+  try {
+    data =
+      await response.json();
   } catch {
     data = null;
   }
+
+  // ----------------------------------------------------------
+  // OTHER HTTP ERRORS
+  // ----------------------------------------------------------
 
   if (!response.ok) {
     throw new Error(
@@ -400,7 +790,13 @@ async function fetchTwelveDataCandles(pair) {
     );
   }
 
-  if (data.status === "error") {
+  // ----------------------------------------------------------
+  // API-LEVEL ERROR
+  // ----------------------------------------------------------
+
+  if (
+    data.status === "error"
+  ) {
     const message =
       data.message ||
       "Twelve Data returned an error";
@@ -412,30 +808,38 @@ async function fetchTwelveDataCandles(pair) {
       lower.includes("run out") ||
       lower.includes("credits") ||
       lower.includes("rate limit") ||
-      lower.includes("too many")
+      lower.includes("too many") ||
+      lower.includes("quota") ||
+      lower.includes("429")
     ) {
-      quotaBlocked = true;
+      provider429Count += 1;
 
-      providerQuotaMessage = message;
-
-      const retrySeconds = 60;
-
-      quotaBlockedUntil =
-        nowMs() + retrySeconds * 1000;
-
-      providerQuotaResetAt =
-        new Date(
-          quotaBlockedUntil
-        ).toISOString();
+      blockProviderQuota(
+        message,
+        null
+      );
     }
 
-    throw new Error(
-      `${normalized}: ${message}`
-    );
+    const error =
+      new Error(
+        `${normalized}: ${message}`
+      );
+
+    if (quotaBlocked) {
+      error.code =
+        "provider_quota_blocked";
+
+      error.retryAfterSeconds =
+        getProviderCooldownSeconds();
+    }
+
+    throw error;
   }
 
   if (
-    !Array.isArray(data.values)
+    !Array.isArray(
+      data.values
+    )
   ) {
     throw new Error(
       `${normalized}: Twelve Data returned no candle values`
@@ -449,18 +853,39 @@ async function fetchTwelveDataCandles(pair) {
           row.datetime
         ).getTime(),
 
-        open: Number(row.open),
-        high: Number(row.high),
-        low: Number(row.low),
-        close: Number(row.close)
+        open: Number(
+          row.open
+        ),
+
+        high: Number(
+          row.high
+        ),
+
+        low: Number(
+          row.low
+        ),
+
+        close: Number(
+          row.close
+        )
       }))
       .filter(
         (candle) =>
-          Number.isFinite(candle.time) &&
-          Number.isFinite(candle.open) &&
-          Number.isFinite(candle.high) &&
-          Number.isFinite(candle.low) &&
-          Number.isFinite(candle.close)
+          Number.isFinite(
+            candle.time
+          ) &&
+          Number.isFinite(
+            candle.open
+          ) &&
+          Number.isFinite(
+            candle.high
+          ) &&
+          Number.isFinite(
+            candle.low
+          ) &&
+          Number.isFinite(
+            candle.close
+          )
       )
       .sort(
         (a, b) =>
@@ -468,7 +893,8 @@ async function fetchTwelveDataCandles(pair) {
       );
 
   if (
-    candles.length < MIN_CANDLES
+    candles.length <
+    MIN_CANDLES
   ) {
     throw new Error(
       `${normalized}: insufficient candles (${candles.length}/${MIN_CANDLES})`
@@ -482,7 +908,10 @@ async function fetchTwelveDataCandles(pair) {
 // CACHE
 // ------------------------------------------------------------
 
-function setCache(pair, candles) {
+function setCache(
+  pair,
+  candles
+) {
   const normalized =
     normalizePair(pair);
 
@@ -502,17 +931,23 @@ function getCache(pair) {
     normalizePair(pair);
 
   const item =
-    candleCache.get(normalized);
+    candleCache.get(
+      normalized
+    );
 
   if (!item) {
     return null;
   }
 
   if (
-    nowMs() - item.fetchedAt >
+    nowMs() -
+      item.fetchedAt >
     CACHE_TTL_MS
   ) {
-    candleCache.delete(normalized);
+    candleCache.delete(
+      normalized
+    );
+
     return null;
   }
 
@@ -543,7 +978,9 @@ function cleanupCache() {
     const oldest =
       entries.shift();
 
-    if (!oldest) break;
+    if (!oldest) {
+      break;
+    }
 
     candleCache.delete(
       oldest[0]
@@ -573,7 +1010,10 @@ async function getCandles(
       pair
     );
 
-  setCache(pair, candles);
+  setCache(
+    pair,
+    candles
+  );
 
   return candles;
 }
@@ -593,11 +1033,16 @@ function aggregateCandles(
     return candles.slice();
   }
 
-  const groups = new Map();
+  const groups =
+    new Map();
 
-  for (const candle of candles) {
+  for (
+    const candle of candles
+  ) {
     const date =
-      new Date(candle.time);
+      new Date(
+        candle.time
+      );
 
     const year =
       date.getUTCFullYear();
@@ -615,8 +1060,9 @@ function aggregateCandles(
       date.getUTCMinutes();
 
     const bucketMinute =
-      Math.floor(minute / tf) *
-      tf;
+      Math.floor(
+        minute / tf
+      ) * tf;
 
     const bucket =
       Date.UTC(
@@ -629,39 +1075,56 @@ function aggregateCandles(
         0
       );
 
-    if (!groups.has(bucket)) {
-      groups.set(bucket, []);
+    if (
+      !groups.has(bucket)
+    ) {
+      groups.set(
+        bucket,
+        []
+      );
     }
 
-    groups.get(bucket).push(
-      candle
-    );
+    groups
+      .get(bucket)
+      .push(candle);
   }
 
   const result = [];
 
-  for (const [
-    bucket,
-    rows
-  ] of groups.entries()) {
-    if (!rows.length) continue;
+  for (
+    const [
+      bucket,
+      rows
+    ] of groups.entries()
+  ) {
+    if (!rows.length) {
+      continue;
+    }
 
     result.push({
       time: bucket,
-      open: rows[0].open,
-      high: Math.max(
-        ...rows.map(
-          (r) => r.high
-        )
-      ),
-      low: Math.min(
-        ...rows.map(
-          (r) => r.low
-        )
-      ),
+
+      open:
+        rows[0].open,
+
+      high:
+        Math.max(
+          ...rows.map(
+            (r) => r.high
+          )
+        ),
+
+      low:
+        Math.min(
+          ...rows.map(
+            (r) => r.low
+          )
+        ),
+
       close:
-        rows[rows.length - 1]
-          .close
+        rows[
+          rows.length - 1
+        ].close
     });
   }
 
@@ -675,10 +1138,14 @@ function aggregateCandles(
 // INDICATORS
 // ------------------------------------------------------------
 
-function ema(values, period) {
+function ema(
+  values,
+  period
+) {
   if (
     !Array.isArray(values) ||
-    values.length < period
+    values.length <
+      period
   ) {
     return null;
   }
@@ -701,7 +1168,8 @@ function ema(values, period) {
     i++
   ) {
     result =
-      (values[i] - result) *
+      (values[i] -
+        result) *
         multiplier +
       result;
   }
@@ -709,14 +1177,19 @@ function ema(values, period) {
   return result;
 }
 
-function rsi(values, period = 14) {
+function rsi(
+  values,
+  period = 14
+) {
   if (
-    values.length <= period
+    values.length <=
+    period
   ) {
     return null;
   }
 
   let gains = 0;
+
   let losses = 0;
 
   for (
@@ -751,10 +1224,14 @@ function rsi(values, period = 14) {
       values[i - 1];
 
     const gain =
-      diff > 0 ? diff : 0;
+      diff > 0
+        ? diff
+        : 0;
 
     const loss =
-      diff < 0 ? -diff : 0;
+      diff < 0
+        ? -diff
+        : 0;
 
     avgGain =
       (avgGain *
@@ -769,12 +1246,15 @@ function rsi(values, period = 14) {
       period;
   }
 
-  if (avgLoss === 0) {
+  if (
+    avgLoss === 0
+  ) {
     return 100;
   }
 
   const rs =
-    avgGain / avgLoss;
+    avgGain /
+    avgLoss;
 
   return (
     100 -
@@ -782,9 +1262,13 @@ function rsi(values, period = 14) {
   );
 }
 
-function atr(candles, period = 14) {
+function atr(
+  candles,
+  period = 14
+) {
   if (
-    candles.length <= period
+    candles.length <=
+    period
   ) {
     return null;
   }
@@ -821,7 +1305,10 @@ function atr(candles, period = 14) {
     trs.push(tr);
   }
 
-  if (trs.length < period) {
+  if (
+    trs.length <
+    period
+  ) {
     return null;
   }
 
@@ -848,7 +1335,10 @@ function atr(candles, period = 14) {
   return value;
 }
 
-function adx(candles, period = 14) {
+function adx(
+  candles,
+  period = 14
+) {
   if (
     candles.length <
     period * 2 + 1
@@ -857,7 +1347,9 @@ function adx(candles, period = 14) {
   }
 
   const trValues = [];
+
   const plusDM = [];
+
   const minusDM = [];
 
   for (
@@ -898,14 +1390,16 @@ function adx(candles, period = 14) {
     trValues.push(tr);
 
     plusDM.push(
-      upMove > downMove &&
+      upMove >
+        downMove &&
       upMove > 0
         ? upMove
         : 0
     );
 
     minusDM.push(
-      downMove > upMove &&
+      downMove >
+        upMove &&
       downMove > 0
         ? downMove
         : 0
@@ -950,7 +1444,9 @@ function adx(candles, period = 14) {
     i < trValues.length;
     i++
   ) {
-    if (i > period) {
+    if (
+      i > period
+    ) {
       trSmooth =
         trSmooth -
         trSmooth / period +
@@ -982,7 +1478,8 @@ function adx(candles, period = 14) {
           trSmooth;
 
     const denominator =
-      plusDI + minusDI;
+      plusDI +
+      minusDI;
 
     const dx =
       denominator === 0
@@ -998,7 +1495,8 @@ function adx(candles, period = 14) {
   }
 
   if (
-    dxValues.length < period
+    dxValues.length <
+    period
   ) {
     return null;
   }
@@ -1071,9 +1569,12 @@ function stochastic(
     const k =
       highest === lowest
         ? 50
-        : ((close - lowest) /
-            (highest - lowest)) *
-          100;
+        : (
+            (close -
+              lowest) /
+            (highest -
+              lowest)
+          ) * 100;
 
     kValues.push(k);
   }
@@ -1112,7 +1613,9 @@ function supportResistance(
   lookback = 30
 ) {
   const rows =
-    candles.slice(-lookback);
+    candles.slice(
+      -lookback
+    );
 
   if (!rows.length) {
     return {
@@ -1155,24 +1658,32 @@ function detectCandlestickPatterns(
   }
 
   const a =
-    candles[candles.length - 3];
+    candles[
+      candles.length - 3
+    ];
 
   const b =
-    candles[candles.length - 2];
+    candles[
+      candles.length - 2
+    ];
 
   const c =
-    candles[candles.length - 1];
+    candles[
+      candles.length - 1
+    ];
 
   const patterns = [];
 
   const bodyC =
     Math.abs(
-      c.close - c.open
+      c.close -
+        c.open
     );
 
   const rangeC =
     Math.max(
-      c.high - c.low,
+      c.high -
+        c.low,
       0.00000001
     );
 
@@ -1187,83 +1698,96 @@ function detectCandlestickPatterns(
     Math.min(
       c.open,
       c.close
-    ) - c.low;
+    ) -
+    c.low;
 
-  // Bullish engulfing
   if (
-    b.close < b.open &&
-    c.close > c.open &&
-    c.open <= b.close &&
-    c.close >= b.open
+    b.close <
+      b.open &&
+    c.close >
+      c.open &&
+    c.open <=
+      b.close &&
+    c.close >=
+      b.open
   ) {
     patterns.push(
       "bullish engulfing"
     );
   }
 
-  // Bearish engulfing
   if (
-    b.close > b.open &&
-    c.close < c.open &&
-    c.open >= b.close &&
-    c.close <= b.open
+    b.close >
+      b.open &&
+    c.close <
+      c.open &&
+    c.open >=
+      b.close &&
+    c.close <=
+      b.open
   ) {
     patterns.push(
       "bearish engulfing"
     );
   }
 
-  // Hammer
   if (
     lowerC >
       bodyC * 2 &&
     upperC <
       bodyC &&
-    c.close >= c.open
+    c.close >=
+      c.open
   ) {
     patterns.push(
       "hammer"
     );
   }
 
-  // Shooting star
   if (
     upperC >
       bodyC * 2 &&
     lowerC <
       bodyC &&
-    c.close <= c.open
+    c.close <=
+      c.open
   ) {
     patterns.push(
       "shooting star"
     );
   }
 
-  // Strong bullish candle
   if (
-    c.close > c.open &&
-    bodyC / rangeC >= 0.65
+    c.close >
+      c.open &&
+    bodyC /
+      rangeC >=
+      0.65
   ) {
     patterns.push(
       "strong bullish candle"
     );
   }
 
-  // Strong bearish candle
   if (
-    c.close < c.open &&
-    bodyC / rangeC >= 0.65
+    c.close <
+      c.open &&
+    bodyC /
+      rangeC >=
+      0.65
   ) {
     patterns.push(
       "strong bearish candle"
     );
   }
 
-  // Three-candle momentum
   if (
-    a.close > a.open &&
-    b.close > b.open &&
-    c.close > c.open
+    a.close >
+      a.open &&
+    b.close >
+      b.open &&
+    c.close >
+      c.open
   ) {
     patterns.push(
       "three bullish candles"
@@ -1271,9 +1795,12 @@ function detectCandlestickPatterns(
   }
 
   if (
-    a.close < a.open &&
-    b.close < b.open &&
-    c.close < c.open
+    a.close <
+      a.open &&
+    b.close <
+      b.open &&
+    c.close <
+      c.open
   ) {
     patterns.push(
       "three bearish candles"
@@ -1298,8 +1825,11 @@ function marketPsychology(
     candles.length < 6
   ) {
     return {
-      direction: "neutral",
-      label: "neutral pressure"
+      direction:
+        "neutral",
+
+      label:
+        "neutral pressure"
     };
   }
 
@@ -1308,19 +1838,27 @@ function marketPsychology(
 
   const bullishCount =
     recent.filter(
-      (c) => c.close > c.open
+      (c) =>
+        c.close >
+        c.open
     ).length;
 
   const bearishCount =
     recent.filter(
-      (c) => c.close < c.open
+      (c) =>
+        c.close <
+        c.open
     ).length;
 
   const last =
-    candles[candles.length - 1];
+    candles[
+      candles.length - 1
+    ];
 
   const previous =
-    candles[candles.length - 2];
+    candles[
+      candles.length - 2
+    ];
 
   const priceMomentum =
     last.close -
@@ -1334,8 +1872,11 @@ function marketPsychology(
     priceMomentum > 0
   ) {
     return {
-      direction: "bullish",
-      label: "buyer pressure"
+      direction:
+        "bullish",
+
+      label:
+        "buyer pressure"
     };
   }
 
@@ -1347,8 +1888,11 @@ function marketPsychology(
     priceMomentum < 0
   ) {
     return {
-      direction: "bearish",
-      label: "seller pressure"
+      direction:
+        "bearish",
+
+      label:
+        "seller pressure"
     };
   }
 
@@ -1357,8 +1901,11 @@ function marketPsychology(
     adxValue < 18
   ) {
     return {
-      direction: "neutral",
-      label: "weak trend / ranging"
+      direction:
+        "neutral",
+
+      label:
+        "weak trend / ranging"
     };
   }
 
@@ -1367,8 +1914,11 @@ function marketPsychology(
     rsiValue > 60
   ) {
     return {
-      direction: "bullish",
-      label: "positive momentum"
+      direction:
+        "bullish",
+
+      label:
+        "positive momentum"
     };
   }
 
@@ -1377,14 +1927,20 @@ function marketPsychology(
     rsiValue < 40
   ) {
     return {
-      direction: "bearish",
-      label: "negative momentum"
+      direction:
+        "bearish",
+
+      label:
+        "negative momentum"
     };
   }
 
   return {
-    direction: "neutral",
-    label: "mixed pressure"
+    direction:
+      "neutral",
+
+    label:
+      "mixed pressure"
   };
 }
 
@@ -1421,19 +1977,34 @@ function analyzeCandles(
     );
 
   const ema9 =
-    ema(closes, 9);
+    ema(
+      closes,
+      9
+    );
 
   const ema21 =
-    ema(closes, 21);
+    ema(
+      closes,
+      21
+    );
 
   const rsiValue =
-    rsi(closes, 14);
+    rsi(
+      closes,
+      14
+    );
 
   const atrValue =
-    atr(aggregated, 14);
+    atr(
+      aggregated,
+      14
+    );
 
   const adxValue =
-    adx(aggregated, 14);
+    adx(
+      aggregated,
+      14
+    );
 
   const stoch =
     stochastic(
@@ -1454,12 +2025,17 @@ function analyzeCandles(
     );
 
   const currentPrice =
-    closes[closes.length - 1];
+    closes[
+      closes.length - 1
+    ];
 
   const previousPrice =
-    closes[closes.length - 2];
+    closes[
+      closes.length - 2
+    ];
 
   let callScore = 0;
+
   let putScore = 0;
 
   const reasons = [];
@@ -1472,8 +2048,11 @@ function analyzeCandles(
     ema9 != null &&
     ema21 != null
   ) {
-    if (ema9 > ema21) {
+    if (
+      ema9 > ema21
+    ) {
       callScore += 22;
+
       reasons.push(
         "EMA bullish"
       );
@@ -1481,6 +2060,7 @@ function analyzeCandles(
       ema9 < ema21
     ) {
       putScore += 22;
+
       reasons.push(
         "EMA bearish"
       );
@@ -1491,7 +2071,9 @@ function analyzeCandles(
   // RSI
   // ----------------------------------------------------------
 
-  if (rsiValue != null) {
+  if (
+    rsiValue != null
+  ) {
     if (
       rsiValue >= 52 &&
       rsiValue <= 68
@@ -1499,7 +2081,9 @@ function analyzeCandles(
       callScore += 14;
 
       reasons.push(
-        `RSI ${rsiValue.toFixed(1)}`
+        `RSI ${rsiValue.toFixed(
+          1
+        )}`
       );
     } else if (
       rsiValue <= 48 &&
@@ -1508,7 +2092,9 @@ function analyzeCandles(
       putScore += 14;
 
       reasons.push(
-        `RSI ${rsiValue.toFixed(1)}`
+        `RSI ${rsiValue.toFixed(
+          1
+        )}`
       );
     } else if (
       rsiValue > 68
@@ -1516,7 +2102,9 @@ function analyzeCandles(
       putScore += 5;
 
       reasons.push(
-        `RSI ${rsiValue.toFixed(1)} high`
+        `RSI ${rsiValue.toFixed(
+          1
+        )} high`
       );
     } else if (
       rsiValue < 32
@@ -1524,11 +2112,15 @@ function analyzeCandles(
       callScore += 5;
 
       reasons.push(
-        `RSI ${rsiValue.toFixed(1)} low`
+        `RSI ${rsiValue.toFixed(
+          1
+        )} low`
       );
     } else {
       reasons.push(
-        `RSI ${rsiValue.toFixed(1)}`
+        `RSI ${rsiValue.toFixed(
+          1
+        )}`
       );
     }
   }
@@ -1537,8 +2129,12 @@ function analyzeCandles(
   // ADX
   // ----------------------------------------------------------
 
-  if (adxValue != null) {
-    if (adxValue >= 25) {
+  if (
+    adxValue != null
+  ) {
+    if (
+      adxValue >= 25
+    ) {
       callScore +=
         ema9 > ema21
           ? 10
@@ -1550,11 +2146,15 @@ function analyzeCandles(
           : 0;
 
       reasons.push(
-        `ADX ${adxValue.toFixed(1)}`
+        `ADX ${adxValue.toFixed(
+          1
+        )}`
       );
     } else {
       reasons.push(
-        `ADX ${adxValue.toFixed(1)} weak`
+        `ADX ${adxValue.toFixed(
+          1
+        )} weak`
       );
     }
   }
@@ -1574,7 +2174,9 @@ function analyzeCandles(
       reasons.push(
         `Stoch K ${stoch.k.toFixed(
           1
-        )} / D ${stoch.d.toFixed(1)}`
+        )} / D ${stoch.d.toFixed(
+          1
+        )}`
       );
     } else if (
       stoch.k <
@@ -1586,13 +2188,17 @@ function analyzeCandles(
       reasons.push(
         `Stoch K ${stoch.k.toFixed(
           1
-        )} / D ${stoch.d.toFixed(1)}`
+        )} / D ${stoch.d.toFixed(
+          1
+        )}`
       );
     } else {
       reasons.push(
         `Stoch K ${stoch.k.toFixed(
           1
-        )} / D ${stoch.d.toFixed(1)}`
+        )} / D ${stoch.d.toFixed(
+          1
+        )}`
       );
     }
   }
@@ -1623,12 +2229,15 @@ function analyzeCandles(
   // CANDLESTICK PATTERNS
   // ----------------------------------------------------------
 
-  for (const pattern of patterns) {
+  for (
+    const pattern of patterns
+  ) {
     const bullish =
       pattern.includes(
         "bullish"
       ) ||
-      pattern === "hammer";
+      pattern ===
+        "hammer";
 
     const bearish =
       pattern.includes(
@@ -1646,7 +2255,9 @@ function analyzeCandles(
     }
   }
 
-  if (patterns.length) {
+  if (
+    patterns.length
+  ) {
     reasons.push(
       patterns
         .slice(0, 2)
@@ -1672,6 +2283,7 @@ function analyzeCandles(
     "bullish"
   ) {
     callScore += 8;
+
     reasons.push(
       psychology.label
     );
@@ -1680,6 +2292,7 @@ function analyzeCandles(
     "bearish"
   ) {
     putScore += 8;
+
     reasons.push(
       psychology.label
     );
@@ -1705,11 +2318,11 @@ function analyzeCandles(
       range > 0
     ) {
       const position =
-        (currentPrice -
-          sr.support) /
-        range;
+        (
+          currentPrice -
+          sr.support
+        ) / range;
 
-      // Avoid CALL too close to resistance.
       if (
         position < 0.75 &&
         psychology.direction ===
@@ -1718,7 +2331,6 @@ function analyzeCandles(
         callScore += 3;
       }
 
-      // Avoid PUT too close to support.
       if (
         position > 0.25 &&
         psychology.direction ===
@@ -1754,10 +2366,11 @@ function analyzeCandles(
   const difference =
     Math.abs(
       callScore -
-        putScore
+      putScore
     );
 
-  let signal = "NO TRADE";
+  let signal =
+    "NO TRADE";
 
   let confidence = 40;
 
@@ -1767,13 +2380,15 @@ function analyzeCandles(
       putScore &&
     difference >= 12
   ) {
-    signal = "CALL";
+    signal =
+      "CALL";
 
     confidence =
       Math.round(
         clamp(
           callScore +
-            difference * 0.35,
+            difference *
+              0.35,
           70,
           95
         )
@@ -1784,20 +2399,20 @@ function analyzeCandles(
       callScore &&
     difference >= 12
   ) {
-    signal = "PUT";
+    signal =
+      "PUT";
 
     confidence =
       Math.round(
         clamp(
           putScore +
-            difference * 0.35,
+            difference *
+              0.35,
           70,
           95
         )
       );
   } else {
-    // NO TRADE should never be presented
-    // as a 70-95% directional confidence.
     confidence =
       Math.round(
         clamp(
@@ -1822,50 +2437,59 @@ function analyzeCandles(
     now.getTime();
 
   const tfMs =
-    tf * 60 * 1000;
+    tf *
+    60 *
+    1000;
 
   let entryTime =
     Math.ceil(
       currentTime /
         tfMs
-    ) * tfMs;
+    ) *
+    tfMs;
 
-  // Make sure signal is visible at least
-  // ENTRY_BUFFER_SECONDS before entry.
   if (
     entryTime -
       currentTime <
     ENTRY_BUFFER_SECONDS *
       1000
   ) {
-    entryTime += tfMs;
+    entryTime +=
+      tfMs;
   }
 
   const expiryTime =
-    entryTime + tfMs;
+    entryTime +
+    tfMs;
 
   const entryInSeconds =
     Math.max(
       0,
       Math.ceil(
-        (entryTime -
-          currentTime) /
-          1000
+        (
+          entryTime -
+          currentTime
+        ) / 1000
       )
     );
 
   const decimals =
-    getPriceDecimals(pair);
+    getPriceDecimals(
+      pair
+    );
 
   return {
     pair,
-    timeframe: tf,
+
+    timeframe:
+      tf,
 
     signal,
 
     confidence,
 
     callScore,
+
     putScore,
 
     currentPrice:
@@ -1974,10 +2598,11 @@ function analyzeCandles(
             )
     },
 
-    reasons: reasons.slice(
-      0,
-      8
-    )
+    reasons:
+      reasons.slice(
+        0,
+        8
+      )
   };
 }
 
@@ -1998,7 +2623,9 @@ function createSignalKey(
   ].join(":");
 }
 
-function findSignalByKey(key) {
+function findSignalByKey(
+  key
+) {
   return signalHistory.find(
     (signal) =>
       signal.key === key
@@ -2022,19 +2649,22 @@ function registerSignal(
     );
 
   const existing =
-    findSignalByKey(key);
+    findSignalByKey(
+      key
+    );
 
   if (existing) {
     return existing;
   }
 
   const signalId =
-    `PO863-${Date.now()}-${Math.random()
+    `PO864-${Date.now()}-${Math.random()
       .toString(36)
       .slice(2, 7)}`;
 
   const record = {
     signalId,
+
     key,
 
     pair:
@@ -2144,19 +2774,26 @@ function getPerformance() {
 
   return {
     total,
+
     pending,
+
     wins,
+
     losses,
+
     draws,
+
     settled,
+
     decisive,
 
     winRate:
       decisive > 0
         ? roundNumber(
-            (wins /
-              decisive) *
-              100,
+            (
+              wins /
+              decisive
+            ) * 100,
             2
           )
         : null,
@@ -2164,9 +2801,10 @@ function getPerformance() {
     winRateIncludingDraws:
       settled > 0
         ? roundNumber(
-            (wins /
-              settled) *
-              100,
+            (
+              wins /
+              settled
+            ) * 100,
             2
           )
         : null
@@ -2194,7 +2832,9 @@ function findCandleAtOrBefore(
 ) {
   let found = null;
 
-  for (const candle of candles) {
+  for (
+    const candle of candles
+  ) {
     if (
       candle.time <=
       timestamp
@@ -2224,7 +2864,10 @@ function determineResult(
     return "DRAW";
   }
 
-  if (signal === "CALL") {
+  if (
+    signal ===
+    "CALL"
+  ) {
     if (
       exitPrice >
       entryPrice
@@ -2242,7 +2885,10 @@ function determineResult(
     return "DRAW";
   }
 
-  if (signal === "PUT") {
+  if (
+    signal ===
+    "PUT"
+  ) {
     if (
       exitPrice <
       entryPrice
@@ -2267,10 +2913,13 @@ function determineResult(
 // AUTOMATIC SETTLEMENT
 // ------------------------------------------------------------
 
-let settlementRunning = false;
+let settlementRunning =
+  false;
 
 async function settlePendingSignals() {
-  if (settlementRunning) {
+  if (
+    settlementRunning
+  ) {
     return;
   }
 
@@ -2293,17 +2942,37 @@ async function settlePendingSignals() {
             now
       );
 
-    if (!pending.length) {
+    if (
+      !pending.length
+    ) {
       return;
     }
 
-    // Group by pair.
-    // This allows multiple timeframes on the
-    // same pair to share one Twelve Data request.
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Before attempting settlement, check provider cooldown.
+    //
+    // If Twelve Data recently returned 429, settlement waits
+    // instead of creating another provider request.
+    // --------------------------------------------------------
+
+    clearProviderCooldownIfExpired();
+
+    if (quotaBlocked) {
+      console.log(
+        `[SETTLEMENT] Provider cooldown active. Waiting ${getProviderCooldownSeconds()}s.`
+      );
+
+      return;
+    }
+
     const grouped =
       new Map();
 
-    for (const signal of pending) {
+    for (
+      const signal of pending
+    ) {
       if (
         !grouped.has(
           signal.pair
@@ -2320,14 +2989,21 @@ async function settlePendingSignals() {
         .push(signal);
     }
 
-    for (const [
-      pair,
-      signals
-    ] of grouped.entries()) {
+    for (
+      const [
+        pair,
+        signals
+      ] of grouped.entries()
+    ) {
+      // Stop if provider quota was blocked
+      // by an earlier settlement request.
+      if (quotaBlocked) {
+        break;
+      }
+
       let candles;
 
       try {
-        // Fresh data is needed for settlement.
         candles =
           await getCandles(
             pair,
@@ -2340,10 +3016,21 @@ async function settlePendingSignals() {
           `[SETTLEMENT] ${pair}: ${error.message}`
         );
 
+        if (
+          error.code ===
+            "provider_http_429" ||
+          error.code ===
+            "provider_quota_blocked"
+        ) {
+          break;
+        }
+
         continue;
       }
 
-      for (const signal of signals) {
+      for (
+        const signal of signals
+      ) {
         try {
           const tf =
             signal.timeframe;
@@ -2364,15 +3051,12 @@ async function settlePendingSignals() {
               signal.expiryTime
             ).getTime();
 
-          // Entry candle must start at the signal entry.
           const entryCandle =
             findCandleAtOrAfter(
               aggregated,
               entryTimestamp
             );
 
-          // Expiry candle must start at or after
-          // the expiry timestamp.
           const expiryCandle =
             findCandleAtOrAfter(
               aggregated,
@@ -2383,8 +3067,6 @@ async function settlePendingSignals() {
             !entryCandle ||
             !expiryCandle
           ) {
-            // If exact expiry candle is not yet
-            // available, leave signal pending.
             continue;
           }
 
@@ -2442,7 +3124,8 @@ async function settlePendingSignals() {
       }
     }
   } finally {
-    settlementRunning = false;
+    settlementRunning =
+      false;
   }
 }
 
@@ -2451,18 +3134,40 @@ async function settlePendingSignals() {
 // ------------------------------------------------------------
 
 async function scanNextBatch() {
-  if (scanRunning) {
+  if (
+    scanRunning
+  ) {
     return;
   }
 
-  if (!TWELVE_DATA_API_KEY) {
+  if (
+    !TWELVE_DATA_API_KEY
+  ) {
     lastScanError =
       "TWELVE_DATA_API_KEY is not configured";
 
     return;
   }
 
-  scanRunning = true;
+  // ----------------------------------------------------------
+  // NEVER start a scan while provider cooldown is active.
+  // ----------------------------------------------------------
+
+  clearProviderCooldownIfExpired();
+
+  if (quotaBlocked) {
+    lastScanError =
+      `Provider cooldown active for ${getProviderCooldownSeconds()}s`;
+
+    console.warn(
+      `[SCAN] ${lastScanError}`
+    );
+
+    return;
+  }
+
+  scanRunning =
+    true;
 
   const batch = [];
 
@@ -2473,7 +3178,10 @@ async function scanNextBatch() {
       i++
     ) {
       const index =
-        (scanCursor + i) %
+        (
+          scanCursor +
+          i
+        ) %
         PAIRS.length;
 
       batch.push(
@@ -2483,7 +3191,9 @@ async function scanNextBatch() {
 
     const analyses = [];
 
-    for (const pair of batch) {
+    for (
+      const pair of batch
+    ) {
       let candles;
 
       try {
@@ -2497,7 +3207,9 @@ async function scanNextBatch() {
 
         totalScanned += 1;
 
-        for (const timeframe of TIMEFRAMES) {
+        for (
+          const timeframe of TIMEFRAMES
+        ) {
           try {
             const analysis =
               analyzeCandles(
@@ -2527,22 +3239,40 @@ async function scanNextBatch() {
           `[SCAN] ${pair}: ${error.message}`
         );
 
-        // If local quota is exhausted,
-        // stop the batch immediately.
+        // ------------------------------------------------------
+        // CRITICAL:
+        //
+        // HTTP 429 must stop the entire batch immediately.
+        // Do not burn remaining request slots.
+        // ------------------------------------------------------
+
+        if (
+          error.code ===
+            "provider_http_429" ||
+          error.code ===
+            "provider_quota_blocked"
+        ) {
+          console.warn(
+            "[SCAN] Provider quota/rate limit detected. Stopping batch immediately."
+          );
+
+          break;
+        }
+
         if (
           error.code ===
             "local_minute_budget_reached" ||
           error.code ===
-            "daily_safety_budget_reached" ||
-          error.code ===
-            "provider_quota_blocked"
+            "daily_safety_budget_reached"
         ) {
           break;
         }
       }
     }
 
-    if (analyses.length) {
+    if (
+      analyses.length
+    ) {
       const valid =
         analyses.filter(
           (analysis) =>
@@ -2550,14 +3280,14 @@ async function scanNextBatch() {
             "NO TRADE"
         );
 
-      // Register all directional signals.
-      for (const analysis of valid) {
+      for (
+        const analysis of valid
+      ) {
         registerSignal(
           analysis
         );
       }
 
-      // Rank directional setups.
       const ranked =
         [...valid].sort(
           (a, b) =>
@@ -2581,18 +3311,29 @@ async function scanNextBatch() {
       }
     }
 
+    // ----------------------------------------------------------
+    // Cursor advances by actual batch size.
+    //
+    // Even when provider blocks us, the cursor moves normally
+    // so the next successful scan continues through the pair list.
+    // ----------------------------------------------------------
+
     scanCursor =
-      (scanCursor +
-        SCAN_BATCH_SIZE) %
+      (
+        scanCursor +
+        SCAN_BATCH_SIZE
+      ) %
       PAIRS.length;
 
     lastScanAt =
       new Date().toISOString();
 
-    // Don't overwrite a previous useful error
-    // if this scan had successful results.
-    if (analyses.length) {
-      lastScanError = null;
+    if (
+      analyses.length &&
+      !quotaBlocked
+    ) {
+      lastScanError =
+        null;
     }
   } catch (error) {
     lastScanError =
@@ -2603,7 +3344,8 @@ async function scanNextBatch() {
       error
     );
   } finally {
-    scanRunning = false;
+    scanRunning =
+      false;
   }
 }
 
@@ -2619,20 +3361,29 @@ function rankAnalysis(
   }
 
   let score =
-    analysis.confidence || 0;
+    analysis.confidence ||
+    0;
 
   const difference =
     Math.abs(
-      (analysis.callScore || 0) -
-        (analysis.putScore || 0)
+      (
+        analysis.callScore ||
+        0
+      ) -
+      (
+        analysis.putScore ||
+        0
+      )
     );
 
   score +=
-    difference * 0.7;
+    difference *
+    0.7;
 
   const adx =
     analysis.indicators
-      ? analysis.indicators.adx14
+      ? analysis.indicators
+          .adx14
       : null;
 
   if (
@@ -2655,8 +3406,12 @@ function rankAnalysis(
       : null;
 
   if (
-    Number.isFinite(stochK) &&
-    Number.isFinite(stochD)
+    Number.isFinite(
+      stochK
+    ) &&
+    Number.isFinite(
+      stochD
+    )
   ) {
     if (
       analysis.signal ===
@@ -2711,7 +3466,9 @@ function rankAnalysis(
 function chooseBestNoTrade(
   analyses
 ) {
-  if (!analyses.length) {
+  if (
+    !analyses.length
+  ) {
     return null;
   }
 
@@ -2789,7 +3546,7 @@ function enrichSelected(
 }
 
 // ------------------------------------------------------------
-// HEALTH DATA
+// HEALTH / BUDGET
 // ------------------------------------------------------------
 
 function getApiBudget() {
@@ -2821,6 +3578,9 @@ function getScannerData() {
   const minuteUsed =
     getMinuteRequestCount();
 
+  const providerCooldown =
+    getProviderCooldownSeconds();
+
   return {
     running:
       scanRunning,
@@ -2841,11 +3601,20 @@ function getScannerData() {
 
     totalApiRequests,
 
+    provider429Count,
+
+    lastProviderHttpStatus,
+
+    lastProviderErrorAt,
+
     quotaBlocked,
 
     providerQuotaMessage,
 
     providerQuotaResetAt,
+
+    providerCooldownSeconds:
+      providerCooldown,
 
     minuteBlocked,
 
@@ -2880,7 +3649,7 @@ function getScannerData() {
 }
 
 // ------------------------------------------------------------
-// ROUTES
+// ROOT
 // ------------------------------------------------------------
 
 app.get(
@@ -2888,10 +3657,16 @@ app.get(
   (req, res) => {
     res.json({
       ok: true,
+
       service:
         "PO AI Predictor API",
-      version: VERSION,
-      source: SOURCE,
+
+      version:
+        VERSION,
+
+      source:
+        SOURCE,
+
       message:
         "Backend is running."
     });
@@ -2965,6 +3740,15 @@ app.get(
       totalApiRequests:
         totalApiRequests,
 
+      provider429Count:
+        provider429Count,
+
+      lastProviderHttpStatus:
+        lastProviderHttpStatus,
+
+      lastProviderErrorAt:
+        lastProviderErrorAt,
+
       quotaBlocked:
         quotaBlocked,
 
@@ -2973,6 +3757,9 @@ app.get(
 
       providerQuotaResetAt:
         providerQuotaResetAt,
+
+      providerCooldownSeconds:
+        getProviderCooldownSeconds(),
 
       minuteBlocked:
         minuteBlocked,
@@ -3025,6 +3812,23 @@ app.get(
 
       settlementGraceSeconds:
         SETTLEMENT_GRACE_SECONDS,
+
+      providerProtection: {
+        requestLimitPerMinute:
+          REQUEST_LIMIT_PER_MINUTE,
+
+        provider429CooldownSeconds:
+          DEFAULT_PROVIDER_COOLDOWN_SECONDS,
+
+        maxProviderCooldownSeconds:
+          MAX_PROVIDER_COOLDOWN_SECONDS,
+
+        stopBatchOn429:
+          true,
+
+        retryAfterHeader:
+          true
+      },
 
       indicators: {
         ema9ema21:
@@ -3134,7 +3938,8 @@ app.get(
         selectedAge == null
           ? null
           : Math.floor(
-              selectedAge / 1000
+              selectedAge /
+                1000
             ),
 
       performance:
@@ -3306,16 +4111,23 @@ app.get(
       );
 
     if (
-      !isSupportedPair(pair)
+      !isSupportedPair(
+        pair
+      )
     ) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Unsupported pair",
-        pair,
-        supportedPairs:
-          PAIRS
-      });
+      return res
+        .status(400)
+        .json({
+          ok: false,
+
+          error:
+            "Unsupported pair",
+
+          pair,
+
+          supportedPairs:
+            PAIRS
+        });
     }
 
     if (
@@ -3323,14 +4135,19 @@ app.get(
         timeframe
       )
     ) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Unsupported timeframe",
-        timeframe,
-        supportedTimeframes:
-          TIMEFRAMES
-      });
+      return res
+        .status(400)
+        .json({
+          ok: false,
+
+          error:
+            "Unsupported timeframe",
+
+          timeframe,
+
+          supportedTimeframes:
+            TIMEFRAMES
+        });
     }
 
     try {
@@ -3338,7 +4155,8 @@ app.get(
         await getCandles(
           pair,
           {
-            forceFresh: true
+            forceFresh:
+              true
           }
         );
 
@@ -3375,21 +4193,31 @@ app.get(
           new Date().toISOString()
       });
     } catch (error) {
-      return res.status(503).json({
-        ok: false,
+      return res
+        .status(503)
+        .json({
+          ok: false,
 
-        version:
-          VERSION,
+          version:
+            VERSION,
 
-        error:
-          error.message,
+          error:
+            error.message,
 
-        quota:
-          getScannerData(),
+          errorCode:
+            error.code ||
+            null,
 
-        time:
-          new Date().toISOString()
-      });
+          retryAfterSeconds:
+            error.retryAfterSeconds ||
+            null,
+
+          quota:
+            getScannerData(),
+
+          time:
+            new Date().toISOString()
+        });
     }
   }
 );
@@ -3400,15 +4228,20 @@ app.get(
 
 app.use(
   (req, res) => {
-    res.status(404).json({
-      ok: false,
-      error:
-        "Endpoint not found",
-      path:
-        req.path,
-      version:
-        VERSION
-    });
+    res
+      .status(404)
+      .json({
+        ok: false,
+
+        error:
+          "Endpoint not found",
+
+        path:
+          req.path,
+
+        version:
+          VERSION
+      });
   }
 );
 
@@ -3463,7 +4296,8 @@ app.listen(
 
     console.log(
       `Scanner interval: ${
-        SCAN_EVERY_MS / 1000
+        SCAN_EVERY_MS /
+        1000
       } seconds`
     );
 
@@ -3472,6 +4306,10 @@ app.listen(
         SETTLEMENT_INTERVAL_MS /
         1000
       } seconds`
+    );
+
+    console.log(
+      `Provider 429 cooldown: ${DEFAULT_PROVIDER_COOLDOWN_SECONDS} seconds`
     );
 
     console.log(
@@ -3536,31 +4374,22 @@ setInterval(
 );
 
 // ------------------------------------------------------------
-// MINUTE BUDGET RESET STATE
+// STATE MAINTENANCE
 // ------------------------------------------------------------
 
 setInterval(
   () => {
     cleanupMinuteRequests();
 
+    clearProviderCooldownIfExpired();
+
     if (
       getMinuteRequestCount() <
       REQUEST_LIMIT_PER_MINUTE
     ) {
       minuteBlocked = false;
-      minuteResetAt = null;
-    }
 
-    if (
-      quotaBlocked &&
-      quotaBlockedUntil &&
-      nowMs() >=
-        quotaBlockedUntil
-    ) {
-      quotaBlocked = false;
-      quotaBlockedUntil = null;
-      providerQuotaMessage = null;
-      providerQuotaResetAt = null;
+      minuteResetAt = null;
     }
 
     resetDailyBudgetIfNeeded();
