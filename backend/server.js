@@ -10,3402 +10,2292 @@ app.use(express.json());
 
 /* =========================================================
    PO AI PREDICTOR
-   V8.5
-   SMART LIVE SCANNER
-   CANDLESTICK + MARKET BEHAVIOR CONFLUENCE
-========================================================= */
+   V8.4.1 — QUOTA-SAFE + CACHE-SAFE
+   Source: Twelve Data LIVE
+   ========================================================= */
 
-const VERSION = 'V8.5';
-const PORT = Number(process.env.PORT || 10000);
-const TIMEZONE = 'UTC';
+const VERSION = 'V8.4.1';
+const PORT = process.env.PORT || 10000;
+
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '';
 
 const TWELVE_DATA_URL =
-    process.env.TWELVE_DATA_URL ||
-    'https://api.twelvedata.com/time_series';
+  process.env.TWELVE_DATA_URL ||
+  'https://api.twelvedata.com/time_series';
 
-const TWELVE_DATA_API_KEY =
-    process.env.TWELVE_DATA_API_KEY || '';
+const TIMEZONE = 'UTC';
 
-
-/* =========================================================
-   LIVE PAIRS
-========================================================= */
-
+/*
+  Supported live pairs.
+  One Twelve Data 1-minute request gives us the candles
+  needed to build 1m / 2m / 3m locally.
+*/
 const PAIRS = [
-    'EUR/USD',
-    'GBP/USD',
-    'USD/JPY',
-    'USD/CHF',
-    'AUD/USD',
-    'USD/CAD',
-    'NZD/USD',
-    'EUR/GBP',
-    'EUR/JPY',
-    'GBP/JPY',
-    'AUD/JPY',
-    'CAD/JPY',
-    'CHF/JPY',
-    'EUR/AUD',
-    'EUR/CAD',
-    'EUR/CHF',
-    'GBP/AUD',
-    'GBP/CAD',
-    'GBP/CHF',
-    'NZD/JPY',
-    'NZD/CAD',
-    'AUD/CAD',
-    'AUD/CHF',
-    'CAD/CHF'
+  'EUR/USD',
+  'GBP/USD',
+  'USD/JPY',
+  'USD/CHF',
+  'AUD/USD',
+  'USD/CAD',
+  'NZD/USD',
+  'EUR/GBP',
+  'EUR/JPY',
+  'GBP/JPY',
+  'AUD/JPY',
+  'CAD/JPY',
+  'CHF/JPY',
+  'EUR/AUD',
+  'EUR/CAD',
+  'EUR/CHF',
+  'GBP/AUD',
+  'GBP/CAD',
+  'GBP/CHF',
+  'NZD/JPY',
+  'NZD/CAD',
+  'AUD/CAD',
+  'AUD/CHF',
+  'CAD/CHF'
 ];
 
 const TIMEFRAMES = [1, 2, 3];
 
+const MAX_CANDLES = 180;
+const MIN_CANDLES = 60;
 
-/* =========================================================
-   CONFIG
-========================================================= */
+/*
+  Scanner deliberately works in small batches.
+  This prevents a single scan from spending the whole quota.
+*/
+const SCAN_BATCH_SIZE = Math.max(
+  1,
+  Number(process.env.SCAN_BATCH_SIZE || 8)
+);
 
-const MAX_CANDLES =
-    Number(process.env.MAX_CANDLES || 180);
-
-const MIN_CANDLES =
-    Number(process.env.MIN_CANDLES || 60);
-
-const SCAN_BATCH_SIZE =
-    Math.max(
-        1,
-        Math.min(
-            PAIRS.length,
-            Number(process.env.SCAN_BATCH_SIZE || 8)
-        )
-    );
-
+/*
+  Do not scan every minute.
+  15 minutes is the V8.4 architecture.
+*/
 const SCAN_EVERY_MS =
-    Math.max(
-        60_000,
-        Number(process.env.SCAN_EVERY_MINUTES || 15) *
-        60_000
-    );
+  Math.max(
+    1,
+    Number(process.env.SCAN_EVERY_MINUTES || 15)
+  ) * 60 * 1000;
 
+/*
+  Successful pair data remains usable for this period.
+  We never refetch a fresh pair while it is still valid.
+*/
 const CACHE_TTL_MS =
-    Math.max(
-        60_000,
-        Number(process.env.CACHE_TTL_MINUTES || 15) *
-        60_000
-    );
+  Math.max(
+    1,
+    Number(process.env.CACHE_TTL_MINUTES || 15)
+  ) * 60 * 1000;
 
+/*
+  Analysis results can be reused briefly by the frontend.
+*/
 const RESULT_TTL_MS =
-    Math.max(
-        10_000,
-        Number(process.env.RESULT_TTL_SECONDS || 30) *
-        1000
-    );
+  Math.max(
+    1,
+    Number(process.env.RESULT_TTL_SECONDS || 30)
+  ) * 1000;
 
+/*
+  Safety limits.
+  These are backend limits, not claims about the Twelve Data plan.
+*/
+const DAILY_REQUEST_LIMIT = Math.max(
+  1,
+  Number(process.env.DAILY_REQUEST_LIMIT || 768)
+);
+
+const SAFETY_RESERVE = Math.max(
+  0,
+  Number(process.env.SAFETY_RESERVE || 32)
+);
+
+const MAX_DAILY_REQUESTS = Math.max(
+  1,
+  DAILY_REQUEST_LIMIT - SAFETY_RESERVE
+);
+
+/*
+  We intentionally stop requesting when the backend believes
+  the daily safe budget has been reached.
+*/
 const ENTRY_BUFFER_SECONDS = 30;
 
-const DAILY_REQUEST_LIMIT =
-    Number(process.env.DAILY_REQUEST_LIMIT || 768);
-
-const SAFETY_RESERVE =
-    Number(process.env.SAFETY_RESERVE || 32);
-
-const MAX_SAFE_REQUESTS =
-    Math.max(
-        1,
-        DAILY_REQUEST_LIMIT - SAFETY_RESERVE
-    );
-
-
 /* =========================================================
-   CACHE
-========================================================= */
+   STATE
+   ========================================================= */
 
 const pairCache = new Map();
 const resultCache = new Map();
 
+let scanRunning = false;
+let scanCursor = 0;
+let lastScanAt = null;
+let lastScanError = null;
+
+let totalScanned = 0;
+let totalFailed = 0;
+let totalApiRequests = 0;
+
+let quotaBlocked = false;
+let providerQuotaMessage = null;
+let providerQuotaResetAt = null;
+
+let dailyRequests = 0;
+let dailyCreditsUsed = 0;
+
+let currentUtcDay = getUtcDayKey(new Date());
 
 /* =========================================================
-   STATE
-========================================================= */
+   HELPERS
+   ========================================================= */
 
-const state = {
-    scanRunning: false,
-    scanCursor: 0,
-
-    lastScanAt: null,
-    lastScanError: null,
-
-    totalScanned: 0,
-    totalFailed: 0,
-
-    totalApiRequests: 0,
-
-    dailyRequestsUsed: 0,
-    dailyResetAt: null,
-
-    quotaBlocked: false,
-    quotaBlockReason: null,
-
-    lastProviderMessage: null
-};
-
-
-/* =========================================================
-   BASIC HELPERS
-========================================================= */
-
-function utcDateKey(date = new Date()) {
-    return date.toISOString().slice(0, 10);
+function getUtcDayKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
 }
 
-
-function resetDailyBudgetIfNeeded() {
-    const key = utcDateKey();
-
-    if (state.dailyResetAt !== key) {
-        state.dailyResetAt = key;
-
-        state.dailyRequestsUsed = 0;
-
-        state.quotaBlocked = false;
-        state.quotaBlockReason = null;
-
-        state.lastProviderMessage = null;
-    }
+function getNextUtcMidnight(date = new Date()) {
+  const next = new Date(date);
+  next.setUTCDate(next.getUTCDate() + 1);
+  next.setUTCHours(0, 0, 0, 0);
+  return next;
 }
 
+function resetDailyStateIfNeeded() {
+  const nowDay = getUtcDayKey(new Date());
+
+  if (nowDay !== currentUtcDay) {
+    currentUtcDay = nowDay;
+
+    dailyRequests = 0;
+    dailyCreditsUsed = 0;
+
+    /*
+      We reset our local block at UTC midnight.
+      The provider may still have a different restriction,
+      so a provider quota error will immediately block again.
+    */
+    quotaBlocked = false;
+    providerQuotaMessage = null;
+    providerQuotaResetAt = null;
+
+    console.log(
+      `[QUOTA] New UTC day ${currentUtcDay}. Local counters reset.`
+    );
+  }
+}
+
+function getDailyCreditsLeft() {
+  return Math.max(
+    0,
+    MAX_DAILY_REQUESTS - dailyCreditsUsed
+  );
+}
+
+function getDailyRequestsLeft() {
+  return Math.max(
+    0,
+    MAX_DAILY_REQUESTS - dailyRequests
+  );
+}
+
+function isBudgetAvailable() {
+  resetDailyStateIfNeeded();
+
+  if (quotaBlocked) {
+    return false;
+  }
+
+  if (dailyRequests >= MAX_DAILY_REQUESTS) {
+    return false;
+  }
+
+  return true;
+}
 
 function normalizePair(pair) {
-    return String(pair || '')
-        .trim()
-        .toUpperCase()
-        .replace('-', '/')
-        .replace(/\s+/g, '');
+  if (!pair) return null;
+
+  const value = String(pair).trim().toUpperCase();
+
+  if (PAIRS.includes(value)) {
+    return value;
+  }
+
+  return null;
 }
 
+function normalizeTimeframe(value) {
+  const tf = Number(value);
 
-function isValidPair(pair) {
-    return PAIRS.includes(
-        normalizePair(pair)
-    );
+  if (TIMEFRAMES.includes(tf)) {
+    return tf;
+  }
+
+  return null;
 }
 
-
-function pairToTwelveData(pair) {
-    return normalizePair(pair)
-        .replace('/', '');
+function isFiniteNumber(value) {
+  return Number.isFinite(Number(value));
 }
 
+function round(value, decimals = 5) {
+  if (!Number.isFinite(value)) return null;
 
-function round(value, decimals = 6) {
-    const n = Number(value);
+  const factor = Math.pow(10, decimals);
 
-    if (!Number.isFinite(n)) {
-        return null;
-    }
-
-    const p = 10 ** decimals;
-
-    return Math.round(n * p) / p;
+  return Math.round(value * factor) / factor;
 }
 
+function priceDecimals(pair) {
+  if (pair && pair.includes('JPY')) {
+    return 3;
+  }
 
-function clamp(value, min, max) {
-    return Math.max(
-        min,
-        Math.min(max, value)
-    );
+  return 5;
 }
-
-
-function average(values) {
-    const valid = values.filter(
-        Number.isFinite
-    );
-
-    if (!valid.length) {
-        return null;
-    }
-
-    return valid.reduce(
-        (a, b) => a + b,
-        0
-    ) / valid.length;
-}
-
 
 /* =========================================================
-   EMA
-========================================================= */
+   QUOTA MANAGEMENT
+   ========================================================= */
+
+function blockForProviderQuota(message) {
+  quotaBlocked = true;
+
+  providerQuotaMessage =
+    message ||
+    'Twelve Data quota is currently unavailable.';
+
+  providerQuotaResetAt =
+    getNextUtcMidnight(new Date()).toISOString();
+
+  console.warn(
+    `[QUOTA BLOCKED] ${providerQuotaMessage}`
+  );
+}
+
+function providerErrorMessage(data, statusCode) {
+  if (!data) {
+    return `Twelve Data HTTP ${statusCode}`;
+  }
+
+  if (typeof data === 'string') {
+    return data;
+  }
+
+  return (
+    data.message ||
+    data.error ||
+    data.code ||
+    `Twelve Data HTTP ${statusCode}`
+  );
+}
+
+function looksLikeQuotaError(message, data) {
+  const text = [
+    message,
+    data && data.message,
+    data && data.error,
+    data && data.status,
+    data && data.code
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return (
+    text.includes('quota') ||
+    text.includes('credit') ||
+    text.includes('credits') ||
+    text.includes('rate limit') ||
+    text.includes('too many requests') ||
+    text.includes('api limit') ||
+    text.includes('daily limit') ||
+    text.includes('run out')
+  );
+}
+
+/* =========================================================
+   CACHE
+   ========================================================= */
+
+function getCachedPair(pair) {
+  const cached = pairCache.get(pair);
+
+  if (!cached) {
+    return null;
+  }
+
+  if (
+    Date.now() - cached.timestamp >
+    CACHE_TTL_MS
+  ) {
+    return null;
+  }
+
+  return cached;
+}
+
+function setCachedPair(pair, candles) {
+  pairCache.set(pair, {
+    timestamp: Date.now(),
+    candles
+  });
+}
+
+function getCachedResult(key) {
+  const cached = resultCache.get(key);
+
+  if (!cached) {
+    return null;
+  }
+
+  if (
+    Date.now() - cached.timestamp >
+    RESULT_TTL_MS
+  ) {
+    return null;
+  }
+
+  return cached.result;
+}
+
+function setCachedResult(key, result) {
+  resultCache.set(key, {
+    timestamp: Date.now(),
+    result
+  });
+}
+
+/* =========================================================
+   TWELVE DATA
+   ========================================================= */
+
+async function fetchTwelveData(pair) {
+  resetDailyStateIfNeeded();
+
+  /*
+    IMPORTANT:
+    Never spend another API request while quotaBlocked.
+  */
+  if (quotaBlocked) {
+    throw new Error(
+      providerQuotaMessage ||
+      'Twelve Data quota is blocked.'
+    );
+  }
+
+  /*
+    Backend safety budget.
+  */
+  if (!isBudgetAvailable()) {
+    throw new Error(
+      'Backend daily API safety budget reached.'
+    );
+  }
+
+  if (!TWELVE_DATA_API_KEY) {
+    throw new Error(
+      'TWELVE_DATA_API_KEY is not configured.'
+    );
+  }
+
+  const url = new URL(TWELVE_DATA_URL);
+
+  url.searchParams.set('symbol', pair);
+  url.searchParams.set('interval', '1min');
+  url.searchParams.set(
+    'outputsize',
+    String(MAX_CANDLES)
+  );
+  url.searchParams.set('apikey', TWELVE_DATA_API_KEY);
+  url.searchParams.set('timezone', TIMEZONE);
+
+  totalApiRequests++;
+  dailyRequests++;
+  dailyCreditsUsed++;
+
+  console.log(
+    `[TWELVE DATA] ${pair} request #${dailyRequests}`
+  );
+
+  let response;
+
+  try {
+    response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'PO-AI-Predictor/8.4.1'
+      }
+    });
+  } catch (error) {
+    throw new Error(
+      `Twelve Data network error: ${error.message}`
+    );
+  }
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch (error) {
+    throw new Error(
+      `Twelve Data returned invalid JSON (HTTP ${response.status}).`
+    );
+  }
+
+  const providerMessage =
+    providerErrorMessage(
+      data,
+      response.status
+    );
+
+  /*
+    Detect quota before doing anything else.
+  */
+  if (
+    !response.ok ||
+    data.status === 'error' ||
+    data.code ||
+    data.message
+  ) {
+    if (
+      looksLikeQuotaError(
+        providerMessage,
+        data
+      )
+    ) {
+      blockForProviderQuota(
+        providerMessage
+      );
+    }
+
+    throw new Error(providerMessage);
+  }
+
+  if (
+    !Array.isArray(data.values) ||
+    data.values.length === 0
+  ) {
+    throw new Error(
+      `Twelve Data returned no candles for ${pair}.`
+    );
+  }
+
+  const candles = data.values
+    .map(item => ({
+      time: new Date(item.datetime).getTime(),
+      open: Number(item.open),
+      high: Number(item.high),
+      low: Number(item.low),
+      close: Number(item.close),
+      volume: isFiniteNumber(item.volume)
+        ? Number(item.volume)
+        : null
+    }))
+    .filter(c =>
+      Number.isFinite(c.time) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    )
+    .sort((a, b) => a.time - b.time);
+
+  if (candles.length < MIN_CANDLES) {
+    throw new Error(
+      `${pair}: insufficient candle data (${candles.length}/${MIN_CANDLES}).`
+    );
+  }
+
+  return candles;
+}
+
+async function getPairCandles(pair, options = {}) {
+  const forceRefresh =
+    options.forceRefresh === true;
+
+  const cached = getCachedPair(pair);
+
+  if (cached && !forceRefresh) {
+    return {
+      candles: cached.candles,
+      source: 'CACHE',
+      cachedAt: cached.timestamp
+    };
+  }
+
+  /*
+    If provider quota is blocked, NEVER attempt another call.
+    Return cache if one exists, otherwise throw.
+  */
+  if (quotaBlocked) {
+    if (cached) {
+      return {
+        candles: cached.candles,
+        source: 'CACHE_STALE',
+        cachedAt: cached.timestamp
+      };
+    }
+
+    throw new Error(
+      providerQuotaMessage ||
+      'Twelve Data quota is blocked.'
+    );
+  }
+
+  try {
+    const candles =
+      await fetchTwelveData(pair);
+
+    setCachedPair(pair, candles);
+
+    return {
+      candles,
+      source: 'LIVE',
+      cachedAt: Date.now()
+    };
+  } catch (error) {
+    /*
+      If live request fails, use existing cache.
+    */
+    if (cached) {
+      console.warn(
+        `[CACHE FALLBACK] ${pair}: ${error.message}`
+      );
+
+      return {
+        candles: cached.candles,
+        source: 'CACHE_STALE',
+        cachedAt: cached.timestamp,
+        warning: error.message
+      };
+    }
+
+    throw error;
+  }
+}
+
+/* =========================================================
+   CANDLE AGGREGATION
+   ========================================================= */
+
+function aggregateCandles(candles, timeframe) {
+  if (timeframe === 1) {
+    return candles.slice();
+  }
+
+  const result = [];
+  const bucketMs =
+    timeframe * 60 * 1000;
+
+  let bucket = null;
+
+  for (const candle of candles) {
+    const bucketTime =
+      Math.floor(candle.time / bucketMs) *
+      bucketMs;
+
+    if (!bucket || bucket.time !== bucketTime) {
+      if (bucket) {
+        result.push(bucket);
+      }
+
+      bucket = {
+        time: bucketTime,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume || 0,
+        count: 1
+      };
+    } else {
+      bucket.high = Math.max(
+        bucket.high,
+        candle.high
+      );
+
+      bucket.low = Math.min(
+        bucket.low,
+        candle.low
+      );
+
+      bucket.close = candle.close;
+
+      if (Number.isFinite(candle.volume)) {
+        bucket.volume += candle.volume;
+      }
+
+      bucket.count++;
+    }
+  }
+
+  if (bucket) {
+    result.push(bucket);
+  }
+
+  return result;
+}
+
+/* =========================================================
+   INDICATORS
+   ========================================================= */
 
 function ema(values, period) {
-    if (values.length < period) {
-        return null;
-    }
+  if (
+    !Array.isArray(values) ||
+    values.length < period
+  ) {
+    return null;
+  }
 
-    const k = 2 / (period + 1);
+  const multiplier =
+    2 / (period + 1);
 
-    let value =
-        average(
-            values.slice(0, period)
-        );
+  let current = 0;
 
-    for (
-        let i = period;
-        i < values.length;
-        i++
-    ) {
-        value =
-            values[i] * k +
-            value * (1 - k);
-    }
+  for (let i = 0; i < period; i++) {
+    current += values[i];
+  }
 
-    return value;
+  current /= period;
+
+  for (
+    let i = period;
+    i < values.length;
+    i++
+  ) {
+    current =
+      (values[i] - current) *
+      multiplier +
+      current;
+  }
+
+  return current;
 }
 
+function emaSeries(values, period) {
+  if (
+    !Array.isArray(values) ||
+    values.length < period
+  ) {
+    return [];
+  }
 
-/* =========================================================
-   RSI
-========================================================= */
+  const multiplier =
+    2 / (period + 1);
+
+  const series =
+    new Array(values.length).fill(null);
+
+  let current = 0;
+
+  for (let i = 0; i < period; i++) {
+    current += values[i];
+  }
+
+  current /= period;
+
+  series[period - 1] = current;
+
+  for (
+    let i = period;
+    i < values.length;
+    i++
+  ) {
+    current =
+      (values[i] - current) *
+      multiplier +
+      current;
+
+    series[i] = current;
+  }
+
+  return series;
+}
 
 function rsi(values, period = 14) {
-    if (
-        values.length <
-        period + 1
-    ) {
-        return null;
+  if (
+    !Array.isArray(values) ||
+    values.length <= period
+  ) {
+    return null;
+  }
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = 1; i <= period; i++) {
+    const change =
+      values[i] - values[i - 1];
+
+    if (change >= 0) {
+      gains += change;
+    } else {
+      losses += Math.abs(change);
     }
+  }
 
-    let gains = 0;
-    let losses = 0;
+  let averageGain =
+    gains / period;
 
-    for (
-        let i = 1;
-        i <= period;
-        i++
-    ) {
-        const diff =
-            values[i] -
-            values[i - 1];
+  let averageLoss =
+    losses / period;
 
-        if (diff >= 0) {
-            gains += diff;
-        } else {
-            losses -= diff;
-        }
-    }
+  for (
+    let i = period + 1;
+    i < values.length;
+    i++
+  ) {
+    const change =
+      values[i] - values[i - 1];
 
-    let avgGain =
-        gains / period;
+    const gain =
+      change > 0 ? change : 0;
 
-    let avgLoss =
-        losses / period;
+    const loss =
+      change < 0 ? Math.abs(change) : 0;
 
-    for (
-        let i = period + 1;
-        i < values.length;
-        i++
-    ) {
-        const diff =
-            values[i] -
-            values[i - 1];
+    averageGain =
+      ((averageGain * (period - 1)) +
+        gain) /
+      period;
 
-        const gain =
-            Math.max(0, diff);
+    averageLoss =
+      ((averageLoss * (period - 1)) +
+        loss) /
+      period;
+  }
 
-        const loss =
-            Math.max(0, -diff);
+  if (averageLoss === 0) {
+    return 100;
+  }
 
-        avgGain =
-            (
-                avgGain * (period - 1) +
-                gain
-            ) / period;
+  const rs =
+    averageGain / averageLoss;
 
-        avgLoss =
-            (
-                avgLoss * (period - 1) +
-                loss
-            ) / period;
-    }
-
-    if (avgLoss === 0) {
-        return 100;
-    }
-
-    const rs =
-        avgGain / avgLoss;
-
-    return 100 -
-        (100 / (1 + rs));
+  return 100 - 100 / (1 + rs);
 }
 
+function atr(candles, period = 14) {
+  if (
+    !Array.isArray(candles) ||
+    candles.length <= period
+  ) {
+    return null;
+  }
 
-/* =========================================================
-   TRUE RANGE / ATR
-========================================================= */
+  const trs = [];
 
-function trueRange(
-    candle,
-    previousClose
-) {
-    if (!candle) {
-        return null;
-    }
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
 
-    if (!Number.isFinite(previousClose)) {
-        return candle.high -
-            candle.low;
-    }
-
-    return Math.max(
-        candle.high - candle.low,
-
-        Math.abs(
-            candle.high -
-            previousClose
-        ),
-
-        Math.abs(
-            candle.low -
-            previousClose
-        )
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
     );
+
+    trs.push(tr);
+  }
+
+  if (trs.length < period) {
+    return null;
+  }
+
+  let value = 0;
+
+  for (let i = 0; i < period; i++) {
+    value += trs[i];
+  }
+
+  value /= period;
+
+  for (
+    let i = period;
+    i < trs.length;
+    i++
+  ) {
+    value =
+      ((value * (period - 1)) +
+        trs[i]) /
+      period;
+  }
+
+  return value;
 }
 
+function adx(candles, period = 14) {
+  if (
+    !Array.isArray(candles) ||
+    candles.length < period * 2 + 1
+  ) {
+    return null;
+  }
 
-function atr(
-    candles,
-    period = 14
-) {
-    if (
-        candles.length <
-        period + 1
-    ) {
-        return null;
-    }
+  const trs = [];
+  const plusDM = [];
+  const minusDM = [];
 
-    const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
 
-    for (
-        let i = 0;
-        i < candles.length;
-        i++
-    ) {
-        trs.push(
-            trueRange(
-                candles[i],
-                i
-                    ? candles[i - 1].close
-                    : null
-            )
-        );
-    }
+    const upMove =
+      current.high - previous.high;
 
-    return average(
-        trs.slice(-period)
+    const downMove =
+      previous.low - current.low;
+
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
     );
-}
 
+    trs.push(tr);
 
-/* =========================================================
-   ADX
-========================================================= */
-
-function adx(
-    candles,
-    period = 14
-) {
-    if (
-        candles.length <
-        period * 2 + 1
-    ) {
-        return null;
-    }
-
-    const trs = [];
-    const plusDM = [];
-    const minusDM = [];
-
-    for (
-        let i = 1;
-        i < candles.length;
-        i++
-    ) {
-        const current =
-            candles[i];
-
-        const previous =
-            candles[i - 1];
-
-        trs.push(
-            trueRange(
-                current,
-                previous.close
-            )
-        );
-
-        const upMove =
-            current.high -
-            previous.high;
-
-        const downMove =
-            previous.low -
-            current.low;
-
-        plusDM.push(
-            upMove > downMove &&
-            upMove > 0
-                ? upMove
-                : 0
-        );
-
-        minusDM.push(
-            downMove > upMove &&
-            downMove > 0
-                ? downMove
-                : 0
-        );
-    }
-
-    const dx = [];
-
-    for (
-        let i = period;
-        i < trs.length;
-        i++
-    ) {
-        const trSum =
-            average(
-                trs.slice(
-                    i - period + 1,
-                    i + 1
-                )
-            ) * period;
-
-        const plusSum =
-            plusDM
-                .slice(
-                    i - period + 1,
-                    i + 1
-                )
-                .reduce(
-                    (a, b) => a + b,
-                    0
-                );
-
-        const minusSum =
-            minusDM
-                .slice(
-                    i - period + 1,
-                    i + 1
-                )
-                .reduce(
-                    (a, b) => a + b,
-                    0
-                );
-
-        if (!trSum) {
-            continue;
-        }
-
-        const plusDI =
-            100 *
-            plusSum /
-            trSum;
-
-        const minusDI =
-            100 *
-            minusSum /
-            trSum;
-
-        const denominator =
-            plusDI +
-            minusDI;
-
-        if (!denominator) {
-            continue;
-        }
-
-        dx.push(
-            100 *
-            Math.abs(
-                plusDI -
-                minusDI
-            ) /
-            denominator
-        );
-    }
-
-    if (!dx.length) {
-        return null;
-    }
-
-    return average(
-        dx.slice(-period)
+    plusDM.push(
+      upMove > downMove && upMove > 0
+        ? upMove
+        : 0
     );
-}
 
-
-/* =========================================================
-   STANDARD DEVIATION
-========================================================= */
-
-function standardDeviation(
-    values
-) {
-    const avg =
-        average(values);
-
-    if (!Number.isFinite(avg)) {
-        return null;
-    }
-
-    return Math.sqrt(
-        average(
-            values.map(
-                value =>
-                    (value - avg) ** 2
-            )
-        )
+    minusDM.push(
+      downMove > upMove && downMove > 0
+        ? downMove
+        : 0
     );
-}
+  }
 
+  if (trs.length < period) {
+    return null;
+  }
 
-/* =========================================================
-   BOLLINGER
-========================================================= */
+  let trSum = 0;
+  let plusSum = 0;
+  let minusSum = 0;
 
-function bollinger(
-    values,
-    period = 20,
-    multiplier = 2
-) {
-    if (
-        values.length <
-        period
-    ) {
-        return null;
+  for (let i = 0; i < period; i++) {
+    trSum += trs[i];
+    plusSum += plusDM[i];
+    minusSum += minusDM[i];
+  }
+
+  const dx = [];
+
+  function pushDx() {
+    if (trSum <= 0) {
+      dx.push(0);
+      return;
     }
 
-    const slice =
-        values.slice(-period);
+    const plusDI =
+      100 * (plusSum / trSum);
 
-    const middle =
-        average(slice);
+    const minusDI =
+      100 * (minusSum / trSum);
 
-    const deviation =
-        standardDeviation(slice);
+    const denominator =
+      plusDI + minusDI;
 
-    return {
-        middle,
-        upper:
-            middle +
-            multiplier *
-            deviation,
-        lower:
-            middle -
-            multiplier *
-            deviation
-    };
-}
-
-
-/* =========================================================
-   SUPPORT / RESISTANCE
-========================================================= */
-
-function supportResistance(
-    candles,
-    lookback = 50
-) {
-    const slice =
-        candles.slice(-lookback);
-
-    if (!slice.length) {
-        return {
-            support: null,
-            resistance: null
-        };
-    }
-
-    return {
-        support:
-            Math.min(
-                ...slice.map(
-                    c => c.low
-                )
-            ),
-
-        resistance:
-            Math.max(
-                ...slice.map(
-                    c => c.high
-                )
-            )
-    };
-}
-
-
-/* =========================================================
-   CANDLE HELPERS
-========================================================= */
-
-function candleBody(candle) {
-    return Math.abs(
-        candle.close -
-        candle.open
-    );
-}
-
-
-function candleRange(candle) {
-    return Math.max(
-        0,
-        candle.high -
-        candle.low
-    );
-}
-
-
-function upperWick(candle) {
-    return (
-        candle.high -
-        Math.max(
-            candle.open,
-            candle.close
-        )
-    );
-}
-
-
-function lowerWick(candle) {
-    return (
-        Math.min(
-            candle.open,
-            candle.close
-        ) -
-        candle.low
-    );
-}
-
-
-function isBull(candle) {
-    return candle.close >
-        candle.open;
-}
-
-
-function isBear(candle) {
-    return candle.close <
-        candle.open;
-}
-
-
-/* =========================================================
-   CANDLESTICK PATTERN ENGINE
-========================================================= */
-
-function detectCandlestickPatterns(
-    candles
-) {
-    const patterns = [];
-
-    if (candles.length < 5) {
-        return patterns;
-    }
-
-    const current =
-        candles[candles.length - 1];
-
-    const previous =
-        candles[candles.length - 2];
-
-    const older =
-        candles[candles.length - 3];
-
-    const range =
-        candleRange(current);
-
-    const body =
-        candleBody(current);
-
-    const safeRange =
-        Math.max(
-            range,
-            Number.EPSILON
-        );
-
-
-    /* -----------------------------------------------------
-       BULLISH ENGULFING
-    ----------------------------------------------------- */
-
-    if (
-        isBull(current) &&
-        isBear(previous) &&
-        current.open <=
-            previous.close &&
-        current.close >=
-            previous.open
-    ) {
-        patterns.push({
-            name:
-                'Bullish Engulfing',
-
-            direction:
-                'CALL',
-
-            strength: 3
-        });
-    }
-
-
-    /* -----------------------------------------------------
-       BEARISH ENGULFING
-    ----------------------------------------------------- */
-
-    if (
-        isBear(current) &&
-        isBull(previous) &&
-        current.open >=
-            previous.close &&
-        current.close <=
-            previous.open
-    ) {
-        patterns.push({
-            name:
-                'Bearish Engulfing',
-
-            direction:
-                'PUT',
-
-            strength: 3
-        });
-    }
-
-
-    /* -----------------------------------------------------
-       HAMMER
-    ----------------------------------------------------- */
-
-    if (
-        lowerWick(current) >=
-            body * 2 &&
-
-        upperWick(current) <=
-            body * 1.2 &&
-
-        body / safeRange <=
-            0.45
-    ) {
-        patterns.push({
-            name:
-                'Hammer',
-
-            direction:
-                'CALL',
-
-            strength: 2
-        });
-    }
-
-
-    /* -----------------------------------------------------
-       SHOOTING STAR
-    ----------------------------------------------------- */
-
-    if (
-        upperWick(current) >=
-            body * 2 &&
-
-        lowerWick(current) <=
-            body * 1.2 &&
-
-        body / safeRange <=
-            0.45
-    ) {
-        patterns.push({
-            name:
-                'Shooting Star',
-
-            direction:
-                'PUT',
-
-            strength: 2
-        });
-    }
-
-
-    /* -----------------------------------------------------
-       DOJI
-    ----------------------------------------------------- */
-
-    if (
-        body / safeRange <=
-        0.12
-    ) {
-        patterns.push({
-            name:
-                'Doji',
-
-            direction:
-                'NEUTRAL',
-
-            strength: 1
-        });
-    }
-
-
-    /* -----------------------------------------------------
-       INSIDE BAR CONTEXT
-    ----------------------------------------------------- */
-
-    if (
-        older &&
-        isBull(older) &&
-        isBull(current) &&
-
-        previous.high <
-            older.high &&
-
-        previous.low >
-            older.low
-    ) {
-        patterns.push({
-            name:
-                'Bullish Inside Bar Breakout Context',
-
-            direction:
-                'CALL',
-
-            strength: 2
-        });
-    }
-
-
-    if (
-        older &&
-        isBear(older) &&
-        isBear(current) &&
-
-        previous.high <
-            older.high &&
-
-        previous.low >
-            older.low
-    ) {
-        patterns.push({
-            name:
-                'Bearish Inside Bar Breakout Context',
-
-            direction:
-                'PUT',
-
-            strength: 2
-        });
-    }
-
-
-    return patterns;
-}
-
-
-/* =========================================================
-   MARKET BEHAVIOR / PSYCHOLOGY PROXY
-========================================================= */
-
-function analyzeMarketBehavior(
-    candles,
-    support,
-    resistance
-) {
-    if (candles.length < 8) {
-        return null;
-    }
-
-    const recent =
-        candles.slice(-5);
-
-    const last =
-        recent[recent.length - 1];
-
-    const bodies =
-        recent.map(
-            candleBody
-        );
-
-    const ranges =
-        recent.map(
-            candleRange
-        );
-
-    const averageBody =
-        average(bodies);
-
-    const averageRange =
-        average(ranges);
-
-    const currentRange =
-        candleRange(last);
-
-    const currentBody =
-        candleBody(last);
-
-    const price =
-        last.close;
-
-    const bullishCount =
-        recent.filter(
-            isBull
-        ).length;
-
-    const bearishCount =
-        recent.filter(
-            isBear
-        ).length;
-
-    const bodyRatio =
-        currentRange > 0
-            ? currentBody /
-              currentRange
-            : 0;
-
-
-    const nearSupport =
-        Number.isFinite(
-            support
-        ) &&
-        price > support &&
-        (
-            price -
-            support
-        ) <=
-        Math.max(
-            averageRange * 1.2,
-            price * 0.0005
-        );
-
-
-    const nearResistance =
-        Number.isFinite(
-            resistance
-        ) &&
-        resistance > price &&
-        (
-            resistance -
-            price
-        ) <=
-        Math.max(
-            averageRange * 1.2,
-            price * 0.0005
-        );
-
-
-    const bullishRejection =
-        nearSupport &&
-        lowerWick(last) >
-            currentBody * 1.25;
-
-
-    const bearishRejection =
-        nearResistance &&
-        upperWick(last) >
-            currentBody * 1.25;
-
-
-    const expanding =
-        Number.isFinite(
-            averageRange
-        ) &&
-        currentRange >
-            averageRange * 1.2;
-
-
-    const compressed =
-        Number.isFinite(
-            averageRange
-        ) &&
-        currentRange <
-            averageRange * 0.7;
-
-
-    let callPressure = 0;
-    let putPressure = 0;
-
-    const reasons = [];
-
-
-    /* Buying pressure */
-
-    if (bullishCount >= 4) {
-        callPressure += 2;
-
-        reasons.push(
-            'Recent candles show persistent buying pressure.'
-        );
-    }
-
-
-    /* Selling pressure */
-
-    if (bearishCount >= 4) {
-        putPressure += 2;
-
-        reasons.push(
-            'Recent candles show persistent selling pressure.'
-        );
-    }
-
-
-    /* Support rejection */
-
-    if (bullishRejection) {
-        callPressure += 2;
-
-        reasons.push(
-            'Price is showing bullish rejection near support.'
-        );
-    }
-
-
-    /* Resistance rejection */
-
-    if (bearishRejection) {
-        putPressure += 2;
-
-        reasons.push(
-            'Price is showing bearish rejection near resistance.'
-        );
-    }
-
-
-    /* Strong candle body */
-
-    if (bodyRatio >= 0.65) {
-        if (isBull(last)) {
-            callPressure += 1;
-
-            reasons.push(
-                'The latest candle has a strong bullish body.'
-            );
-        }
-
-        if (isBear(last)) {
-            putPressure += 1;
-
-            reasons.push(
-                'The latest candle has a strong bearish body.'
-            );
-        }
-    }
-
-
-    /* Range expansion */
-
-    if (expanding) {
-        reasons.push(
-            'Recent candle range is expanding, indicating increased short-term activity.'
-        );
-    }
-
-
-    /* Range compression */
-
-    if (compressed) {
-        reasons.push(
-            'Recent candle range is compressed, indicating reduced short-term activity.'
-        );
-    }
-
-
-    return {
-        callPressure,
-        putPressure,
-
-        buyingPressure:
-            bullishCount /
-            recent.length,
-
-        sellingPressure:
-            bearishCount /
-            recent.length,
-
-        nearSupport,
-        nearResistance,
-
-        rejectionCall:
-            bullishRejection,
-
-        rejectionPut:
-            bearishRejection,
-
-        expanding,
-        compressed,
-
-        reasons
-    };
-}
-
-
-/* =========================================================
-   AGGREGATE 1M → 2M / 3M
-========================================================= */
-
-function aggregateCandles(
-    candles,
-    timeframe
-) {
-    if (timeframe === 1) {
-        return candles.slice();
-    }
-
-    const buckets =
-        new Map();
-
-    const milliseconds =
-        timeframe *
-        60_000;
-
-
-    for (const candle of candles) {
-        const bucket =
-            Math.floor(
-                candle.time /
-                milliseconds
-            ) *
-            milliseconds;
-
-        if (!buckets.has(bucket)) {
-            buckets.set(
-                bucket,
-                []
-            );
-        }
-
-        buckets
-            .get(bucket)
-            .push(candle);
-    }
-
-
-    const result = [];
-
-
-    for (
-        const [
-            time,
-            group
-        ] of [
-            ...buckets.entries()
-        ].sort(
-            (a, b) =>
-                a[0] - b[0]
-        )
-    ) {
-        if (!group.length) {
-            continue;
-        }
-
-        result.push({
-            time,
-
-            open:
-                group[0].open,
-
-            high:
-                Math.max(
-                    ...group.map(
-                        c => c.high
-                    )
-                ),
-
-            low:
-                Math.min(
-                    ...group.map(
-                        c => c.low
-                    )
-                ),
-
-            close:
-                group[
-                    group.length - 1
-                ].close,
-
-            volume:
-                group.reduce(
-                    (sum, c) =>
-                        sum +
-                        (
-                            Number(
-                                c.volume
-                            ) || 0
-                        ),
-                    0
-                ),
-
-            completeMinutes:
-                group.length
-        });
-    }
-
-
-    return result;
-}
-
-
-/* =========================================================
-   TWELVE DATA PARSER
-========================================================= */
-
-function parseTwelveData(data) {
-    if (
-        !data ||
-        !Array.isArray(
-            data.values
-        )
-    ) {
-        return [];
-    }
-
-
-    return data.values
-        .map(value => ({
-            time:
-                new Date(
-                    value.datetime
-                ).getTime(),
-
-            open:
-                Number(value.open),
-
-            high:
-                Number(value.high),
-
-            low:
-                Number(value.low),
-
-            close:
-                Number(value.close),
-
-            volume:
-                Number(
-                    value.volume || 0
-                )
-        }))
-
-        .filter(
-            candle =>
-                Number.isFinite(
-                    candle.time
-                ) &&
-
-                Number.isFinite(
-                    candle.open
-                ) &&
-
-                Number.isFinite(
-                    candle.high
-                ) &&
-
-                Number.isFinite(
-                    candle.low
-                ) &&
-
-                Number.isFinite(
-                    candle.close
-                )
-        )
-
-        .sort(
-            (a, b) =>
-                a.time -
-                b.time
-        );
-}
-
-
-/* =========================================================
-   QUOTA DETECTION
-========================================================= */
-
-function providerQuotaError(
-    message = ''
-) {
     const value =
-        String(message)
-            .toLowerCase();
+      denominator === 0
+        ? 0
+        : 100 *
+          Math.abs(
+            plusDI - minusDI
+          ) /
+          denominator;
 
-    return (
-        value.includes('credit') ||
-        value.includes('quota') ||
-        value.includes('rate limit') ||
-        value.includes('api limit') ||
-        value.includes('too many requests')
-    );
+    dx.push(value);
+  }
+
+  pushDx();
+
+  for (
+    let i = period;
+    i < trs.length;
+    i++
+  ) {
+    trSum =
+      trSum -
+      trSum / period +
+      trs[i];
+
+    plusSum =
+      plusSum -
+      plusSum / period +
+      plusDM[i];
+
+    minusSum =
+      minusSum -
+      minusSum / period +
+      minusDM[i];
+
+    pushDx();
+  }
+
+  if (dx.length < period) {
+    return null;
+  }
+
+  let adxValue = 0;
+
+  for (let i = 0; i < period; i++) {
+    adxValue += dx[i];
+  }
+
+  adxValue /= period;
+
+  for (
+    let i = period;
+    i < dx.length;
+    i++
+  ) {
+    adxValue =
+      ((adxValue * (period - 1)) +
+        dx[i]) /
+      period;
+  }
+
+  return adxValue;
 }
 
+function standardDeviation(values) {
+  if (!values.length) {
+    return null;
+  }
 
-/* =========================================================
-   TWELVE DATA FETCH
-========================================================= */
+  const mean =
+    values.reduce(
+      (sum, value) => sum + value,
+      0
+    ) / values.length;
 
-async function fetchTwelveData(
-    pair
-) {
-    resetDailyBudgetIfNeeded();
+  const variance =
+    values.reduce(
+      (sum, value) =>
+        sum +
+        Math.pow(value - mean, 2),
+      0
+    ) / values.length;
 
-
-    if (!TWELVE_DATA_API_KEY) {
-        throw new Error(
-            'TWELVE_DATA_API_KEY is not configured.'
-        );
-    }
-
-
-    if (state.quotaBlocked) {
-        throw new Error(
-            state.quotaBlockReason ||
-            'Twelve Data quota is temporarily blocked.'
-        );
-    }
-
-
-    if (
-        state.dailyRequestsUsed >=
-        MAX_SAFE_REQUESTS
-    ) {
-        state.quotaBlocked = true;
-
-        state.quotaBlockReason =
-            `Daily safety budget reached (${MAX_SAFE_REQUESTS} requests).`;
-
-        throw new Error(
-            state.quotaBlockReason
-        );
-    }
-
-
-    const symbol =
-        pairToTwelveData(pair);
-
-
-    const url =
-        new URL(
-            TWELVE_DATA_URL
-        );
-
-
-    url.searchParams.set(
-        'symbol',
-        symbol
-    );
-
-    url.searchParams.set(
-        'interval',
-        '1min'
-    );
-
-    url.searchParams.set(
-        'outputsize',
-        String(MAX_CANDLES)
-    );
-
-    url.searchParams.set(
-        'timezone',
-        'UTC'
-    );
-
-    url.searchParams.set(
-        'apikey',
-        TWELVE_DATA_API_KEY
-    );
-
-
-    state.dailyRequestsUsed += 1;
-    state.totalApiRequests += 1;
-
-
-    let response;
-
-    try {
-        response =
-            await fetch(
-                url.toString(),
-                {
-                    headers: {
-                        accept:
-                            'application/json'
-                    }
-                }
-            );
-    } catch (error) {
-        throw new Error(
-            `Twelve Data network error: ${error.message}`
-        );
-    }
-
-
-    let data;
-
-    try {
-        data =
-            await response.json();
-    } catch (_) {
-        data = null;
-    }
-
-
-    const providerMessage =
-        data?.message ||
-        data?.code ||
-        '';
-
-
-    if (
-        !response.ok ||
-        data?.status === 'error' ||
-        providerMessage
-    ) {
-        state.lastProviderMessage =
-            String(
-                providerMessage ||
-                `HTTP ${response.status}`
-            );
-
-
-        if (
-            providerQuotaError(
-                providerMessage
-            )
-        ) {
-            state.quotaBlocked = true;
-
-            state.quotaBlockReason =
-                `Twelve Data quota/rate limit: ${state.lastProviderMessage}`;
-        }
-
-
-        throw new Error(
-            state.lastProviderMessage ||
-            `Twelve Data HTTP ${response.status}`
-        );
-    }
-
-
-    const candles =
-        parseTwelveData(data);
-
-
-    if (
-        candles.length <
-        MIN_CANDLES
-    ) {
-        throw new Error(
-            `${pair}: only ${candles.length} candles received; ${MIN_CANDLES} required.`
-        );
-    }
-
-
-    return candles;
+  return Math.sqrt(variance);
 }
 
+function bollinger(candles, period = 20) {
+  if (candles.length < period) {
+    return null;
+  }
 
-/* =========================================================
-   PAIR CACHE
-========================================================= */
+  const closes =
+    candles
+      .slice(-period)
+      .map(c => c.close);
 
-async function getPairCandles(
-    pair,
-    options = {}
-) {
-    resetDailyBudgetIfNeeded();
+  const middle =
+    closes.reduce(
+      (a, b) => a + b,
+      0
+    ) / period;
 
-    const key =
-        normalizePair(pair);
+  const sd =
+    standardDeviation(closes);
 
-    const cached =
-        pairCache.get(key);
-
-    const now =
-        Date.now();
-
-
-    if (
-        !options.forceRefresh &&
-        cached &&
-        now - cached.cachedAt <
-            CACHE_TTL_MS
-    ) {
-        return {
-            candles:
-                cached.candles,
-
-            cachedAt:
-                cached.cachedAt,
-
-            stale:
-                false,
-
-            fromCache:
-                true
-        };
-    }
-
-
-    try {
-        const candles =
-            await fetchTwelveData(
-                key
-            );
-
-
-        pairCache.set(
-            key,
-            {
-                candles,
-                cachedAt: now
-            }
-        );
-
-
-        return {
-            candles,
-            cachedAt: now,
-            stale: false,
-            fromCache: false
-        };
-
-    } catch (error) {
-
-        /*
-          Stale cache is allowed as a
-          fallback if live provider fails.
-        */
-
-        if (
-            cached &&
-            cached.candles?.length >=
-                MIN_CANDLES
-        ) {
-            return {
-                candles:
-                    cached.candles,
-
-                cachedAt:
-                    cached.cachedAt,
-
-                stale:
-                    true,
-
-                fromCache:
-                    true,
-
-                warning:
-                    error.message
-            };
-        }
-
-
-        throw error;
-    }
+  return {
+    middle,
+    upper: middle + 2 * sd,
+    lower: middle - 2 * sd
+  };
 }
 
-
-/* =========================================================
-   ENTRY / EXPIRY
-========================================================= */
-
-function entryAndExpiry(
-    timeframe
-) {
-    const now =
-        new Date();
-
-    const milliseconds =
-        timeframe *
-        60_000;
-
-
-    let entryMs =
-        Math.ceil(
-            now.getTime() /
-            milliseconds
-        ) *
-        milliseconds;
-
-
-    const secondsAway =
-        (
-            entryMs -
-            now.getTime()
-        ) / 1000;
-
-
-    if (
-        secondsAway <
-        ENTRY_BUFFER_SECONDS
-    ) {
-        entryMs +=
-            milliseconds;
-    }
-
-
+function supportResistance(candles) {
+  if (candles.length < 20) {
     return {
-        entryTime:
-            new Date(entryMs),
-
-        expiryTime:
-            new Date(
-                entryMs +
-                milliseconds
-            ),
-
-        entryInSeconds:
-            Math.max(
-                0,
-                Math.floor(
-                    (
-                        entryMs -
-                        now.getTime()
-                    ) / 1000
-                )
-            )
+      support: null,
+      resistance: null
     };
-}
+  }
 
+  const window =
+    candles.slice(-50);
+
+  let support = Infinity;
+  let resistance = -Infinity;
+
+  for (const candle of window) {
+    support =
+      Math.min(support, candle.low);
+
+    resistance =
+      Math.max(
+        resistance,
+        candle.high
+      );
+  }
+
+  return {
+    support:
+      Number.isFinite(support)
+        ? support
+        : null,
+
+    resistance:
+      Number.isFinite(resistance)
+        ? resistance
+        : null
+  };
+}
 
 /* =========================================================
    MARKET ANALYSIS
-========================================================= */
+   ========================================================= */
 
 function calculateMarketAnalysis(
+  pair,
+  timeframe,
+  candles
+) {
+  const tfCandles =
+    aggregateCandles(
+      candles,
+      timeframe
+    );
+
+  if (
+    tfCandles.length <
+    MIN_CANDLES
+  ) {
+    throw new Error(
+      `${pair} ${timeframe}m: insufficient aggregated candles.`
+    );
+  }
+
+  const closes =
+    tfCandles.map(c => c.close);
+
+  const current =
+    tfCandles[tfCandles.length - 1];
+
+  const currentPrice =
+    current.close;
+
+  const ema9Value =
+    ema(closes, 9);
+
+  const ema21Value =
+    ema(closes, 21);
+
+  const rsiValue =
+    rsi(closes, 14);
+
+  const adxValue =
+    adx(tfCandles, 14);
+
+  const atrValue =
+    atr(tfCandles, 14);
+
+  const bb =
+    bollinger(tfCandles, 20);
+
+  const sr =
+    supportResistance(
+      tfCandles
+    );
+
+  if (
+    !Number.isFinite(ema9Value) ||
+    !Number.isFinite(ema21Value) ||
+    !Number.isFinite(rsiValue)
+  ) {
+    throw new Error(
+      `${pair} ${timeframe}m: indicators unavailable.`
+    );
+  }
+
+  let callScore = 0;
+  let putScore = 0;
+
+  const reasons = [];
+
+  /* ---------------- EMA TREND ---------------- */
+
+  if (ema9Value > ema21Value) {
+    callScore += 30;
+    reasons.push('EMA9 above EMA21');
+  } else if (ema9Value < ema21Value) {
+    putScore += 30;
+    reasons.push('EMA9 below EMA21');
+  }
+
+  /* ---------------- RSI ---------------- */
+
+  if (
+    rsiValue >= 52 &&
+    rsiValue <= 68
+  ) {
+    callScore += 20;
+    reasons.push('RSI supports bullish momentum');
+  } else if (
+    rsiValue <= 48 &&
+    rsiValue >= 32
+  ) {
+    putScore += 20;
+    reasons.push('RSI supports bearish momentum');
+  } else if (rsiValue > 70) {
+    putScore += 8;
+    reasons.push('RSI is overbought');
+  } else if (rsiValue < 30) {
+    callScore += 8;
+    reasons.push('RSI is oversold');
+  }
+
+  /* ---------------- PRICE MOMENTUM ---------------- */
+
+  const lookback =
+    Math.min(5, closes.length - 1);
+
+  const previousPrice =
+    closes[
+      closes.length - 1 - lookback
+    ];
+
+  const momentum =
+    currentPrice - previousPrice;
+
+  if (momentum > 0) {
+    callScore += 20;
+    reasons.push('Short-term momentum bullish');
+  } else if (momentum < 0) {
+    putScore += 20;
+    reasons.push('Short-term momentum bearish');
+  }
+
+  /* ---------------- ADX ---------------- */
+
+  if (
+    Number.isFinite(adxValue) &&
+    adxValue >= 20
+  ) {
+    if (ema9Value > ema21Value) {
+      callScore += 15;
+    } else {
+      putScore += 15;
+    }
+
+    reasons.push(
+      `ADX confirms trend (${round(adxValue, 1)})`
+    );
+  } else {
+    reasons.push('ADX indicates weak trend');
+  }
+
+  /* ---------------- SUPPORT / RESISTANCE ---------------- */
+
+  if (
+    Number.isFinite(sr.support) &&
+    Number.isFinite(sr.resistance)
+  ) {
+    const range =
+      sr.resistance - sr.support;
+
+    if (range > 0) {
+      const position =
+        (currentPrice - sr.support) /
+        range;
+
+      /*
+        Avoid calling a CALL immediately into resistance
+        or PUT immediately into support.
+      */
+      if (
+        ema9Value > ema21Value &&
+        position < 0.78
+      ) {
+        callScore += 10;
+      }
+
+      if (
+        ema9Value < ema21Value &&
+        position > 0.22
+      ) {
+        putScore += 10;
+      }
+    }
+  }
+
+  /* ---------------- BOLLINGER / VOLATILITY ---------------- */
+
+  let marketCondition =
+    'RANGING';
+
+  if (bb && atrValue) {
+    const width =
+      bb.upper - bb.lower;
+
+    const relativeWidth =
+      currentPrice !== 0
+        ? width / currentPrice
+        : 0;
+
+    if (
+      relativeWidth < 0.0008
+    ) {
+      marketCondition =
+        'LOW_VOLATILITY_RANGE';
+    } else if (
+      ema9Value > ema21Value
+    ) {
+      marketCondition =
+        'UPTREND';
+    } else if (
+      ema9Value < ema21Value
+    ) {
+      marketCondition =
+        'DOWNTREND';
+    }
+  }
+
+  const strongest =
+    Math.max(
+      callScore,
+      putScore
+    );
+
+  const difference =
+    Math.abs(
+      callScore - putScore
+    );
+
+  let signal = 'NO TRADE';
+
+  /*
+    V8.4.1 deliberately requires both:
+      - enough directional score
+      - enough separation between CALL and PUT
+  */
+  if (
+    strongest >= 65 &&
+    difference >= 15
+  ) {
+    signal =
+      callScore > putScore
+        ? 'CALL'
+        : 'PUT';
+  }
+
+  let confidence = 40;
+
+  if (signal === 'CALL') {
+    confidence = Math.min(
+      95,
+      Math.round(
+        50 +
+        callScore * 0.45 +
+        difference * 0.25
+      )
+    );
+  } else if (signal === 'PUT') {
+    confidence = Math.min(
+      95,
+      Math.round(
+        50 +
+        putScore * 0.45 +
+        difference * 0.25
+      )
+    );
+  } else {
+    confidence = Math.min(
+      69,
+      Math.max(
+        40,
+        Math.round(
+          40 +
+          strongest * 0.30
+        )
+      )
+    );
+  }
+
+  /*
+    Entry is the next timeframe boundary.
+    This keeps ENTRY and EXPIRY synchronized to UTC.
+  */
+  const now =
+    new Date();
+
+  const tfMs =
+    timeframe *
+    60 *
+    1000;
+
+  let entryTime =
+    Math.ceil(
+      now.getTime() / tfMs
+    ) * tfMs;
+
+  /*
+    If the next boundary is less than 30 seconds away,
+    use the following boundary.
+  */
+  if (
+    entryTime -
+      now.getTime() <
+    ENTRY_BUFFER_SECONDS * 1000
+  ) {
+    entryTime += tfMs;
+  }
+
+  const expiryTime =
+    entryTime + tfMs;
+
+  const entryInSeconds =
+    Math.max(
+      0,
+      Math.ceil(
+        (entryTime -
+          now.getTime()) /
+          1000
+      )
+    );
+
+  return {
     pair,
     timeframe,
-    candles,
-    freshness = {}
-) {
-    const timeframeCandles =
-        aggregateCandles(
-            candles,
-            timeframe
-        );
-
-
-    if (
-        timeframeCandles.length <
-        MIN_CANDLES
-    ) {
-        throw new Error(
-            `${pair} ${timeframe}m: insufficient candles (${timeframeCandles.length}).`
-        );
-    }
-
-
-    const closes =
-        timeframeCandles.map(
-            candle =>
-                candle.close
-        );
-
-
-    const currentPrice =
-        closes[
-            closes.length - 1
-        ];
-
-
-    const ema9 =
-        ema(closes, 9);
-
-    const ema21 =
-        ema(closes, 21);
-
-    const rsi14 =
-        rsi(closes, 14);
-
-    const adx14 =
-        adx(
-            timeframeCandles,
-            14
-        );
-
-    const atr14 =
-        atr(
-            timeframeCandles,
-            14
-        );
-
-    const bollingerBands =
-        bollinger(
-            closes,
-            20,
-            2
-        );
-
-    const sr =
-        supportResistance(
-            timeframeCandles,
-            50
-        );
-
-
-    /* =====================================================
-       NEW V8.5 ENGINES
-    ===================================================== */
-
-    const candlestickPatterns =
-        detectCandlestickPatterns(
-            timeframeCandles
-        );
-
-
-    const marketBehavior =
-        analyzeMarketBehavior(
-            timeframeCandles,
-            sr.support,
-            sr.resistance
-        );
-
-
-    /* =====================================================
-       MOMENTUM
-    ===================================================== */
-
-    const recentMomentum =
-        closes.length >= 6
-            ? (
-                (
-                    currentPrice -
-                    closes[
-                        closes.length - 6
-                    ]
-                ) /
-                closes[
-                    closes.length - 6
-                ]
-            ) * 100
-            : 0;
-
-
-    /* =====================================================
-       SCORES
-    ===================================================== */
-
-    let callScore = 0;
-    let putScore = 0;
-
-    const reasons = [];
-
-
-    /* -----------------------------------------------------
-       EMA / TREND — 30
-    ----------------------------------------------------- */
-
-    if (
-        Number.isFinite(ema9) &&
-        Number.isFinite(ema21)
-    ) {
-        if (
-            ema9 >
-            ema21
-        ) {
-            callScore += 30;
-
-            reasons.push(
-                'EMA9 is above EMA21, supporting bullish trend direction.'
-            );
-        }
-
-        else if (
-            ema9 <
-            ema21
-        ) {
-            putScore += 30;
-
-            reasons.push(
-                'EMA9 is below EMA21, supporting bearish trend direction.'
-            );
-        }
-    }
-
-
-    /* -----------------------------------------------------
-       RSI — 20
-    ----------------------------------------------------- */
-
-    if (
-        Number.isFinite(rsi14)
-    ) {
-        if (
-            rsi14 >= 52 &&
-            rsi14 < 70
-        ) {
-            callScore += 20;
-
-            reasons.push(
-                `RSI14 is ${rsi14.toFixed(1)}, supporting bullish momentum.`
-            );
-        }
-
-        else if (
-            rsi14 <= 48 &&
-            rsi14 > 30
-        ) {
-            putScore += 20;
-
-            reasons.push(
-                `RSI14 is ${rsi14.toFixed(1)}, supporting bearish momentum.`
-            );
-        }
-
-        else if (
-            rsi14 >= 70
-        ) {
-            callScore += 8;
-
-            reasons.push(
-                `RSI14 is ${rsi14.toFixed(1)}, but overbought risk limits the bullish score.`
-            );
-        }
-
-        else if (
-            rsi14 <= 30
-        ) {
-            putScore += 8;
-
-            reasons.push(
-                `RSI14 is ${rsi14.toFixed(1)}, but oversold risk limits the bearish score.`
-            );
-        }
-    }
-
-
-    /* -----------------------------------------------------
-       MOMENTUM — 20
-    ----------------------------------------------------- */
-
-    if (
-        recentMomentum > 0
-    ) {
-        callScore += 20;
-
-        reasons.push(
-            `Recent momentum is positive (${recentMomentum.toFixed(3)}%).`
-        );
-    }
-
-    else if (
-        recentMomentum < 0
-    ) {
-        putScore += 20;
-
-        reasons.push(
-            `Recent momentum is negative (${recentMomentum.toFixed(3)}%).`
-        );
-    }
-
-
-    /* -----------------------------------------------------
-       ADX — 15
-    ----------------------------------------------------- */
-
-    if (
-        Number.isFinite(adx14)
-    ) {
-        if (
-            adx14 >= 25
-        ) {
-            if (
-                callScore >=
-                putScore
-            ) {
-                callScore += 15;
-            }
-
-            else {
-                putScore += 15;
-            }
-
-            reasons.push(
-                `ADX14 is ${adx14.toFixed(1)}, confirming meaningful trend strength.`
-            );
-        }
-
-        else {
-            reasons.push(
-                `ADX14 is ${adx14.toFixed(1)}, so trend strength is moderate or weak.`
-            );
-        }
-    }
-
-
-    /* -----------------------------------------------------
-       SUPPORT / RESISTANCE BEHAVIOR
-    ----------------------------------------------------- */
-
-    if (marketBehavior) {
-
-        if (
-            marketBehavior.nearSupport &&
-            marketBehavior.rejectionCall
-        ) {
-            callScore += 5;
-
-            reasons.push(
-                'Price is rejecting support with bullish candle structure.'
-            );
-        }
-
-
-        if (
-            marketBehavior.nearResistance &&
-            marketBehavior.rejectionPut
-        ) {
-            putScore += 5;
-
-            reasons.push(
-                'Price is rejecting resistance with bearish candle structure.'
-            );
-        }
-    }
-
-
-    /* =====================================================
-       CANDLESTICK CONFIRMATION
-       Maximum contribution: 8 points
-    ===================================================== */
-
-    const patternCall =
-        candlestickPatterns
-            .filter(
-                pattern =>
-                    pattern.direction ===
-                    'CALL'
+    signal,
+    confidence,
+
+    currentPrice:
+      round(
+        currentPrice,
+        priceDecimals(pair)
+      ),
+
+    entryTime:
+      new Date(entryTime).toISOString(),
+
+    expiryTime:
+      new Date(expiryTime).toISOString(),
+
+    entryInSeconds,
+
+    marketCondition,
+
+    callScore:
+      Math.min(
+        100,
+        Math.round(callScore)
+      ),
+
+    putScore:
+      Math.min(
+        100,
+        Math.round(putScore)
+      ),
+
+    indicators: {
+      ema9:
+        round(
+          ema9Value,
+          priceDecimals(pair)
+        ),
+
+      ema21:
+        round(
+          ema21Value,
+          priceDecimals(pair)
+        ),
+
+      rsi14:
+        round(rsiValue, 2),
+
+      adx14:
+        Number.isFinite(adxValue)
+          ? round(adxValue, 2)
+          : null,
+
+      atr14:
+        Number.isFinite(atrValue)
+          ? round(
+              atrValue,
+              priceDecimals(pair)
             )
-            .reduce(
-                (sum, pattern) =>
-                    sum +
-                    pattern.strength,
-                0
-            );
+          : null,
 
-
-    const patternPut =
-        candlestickPatterns
-            .filter(
-                pattern =>
-                    pattern.direction ===
-                    'PUT'
+      support:
+        Number.isFinite(sr.support)
+          ? round(
+              sr.support,
+              priceDecimals(pair)
             )
-            .reduce(
-                (sum, pattern) =>
-                    sum +
-                    pattern.strength,
-                0
-            );
+          : null,
 
-
-    callScore +=
-        Math.min(
-            8,
-            patternCall * 2
-        );
-
-
-    putScore +=
-        Math.min(
-            8,
-            patternPut * 2
-        );
-
-
-    for (
-        const pattern of
-        candlestickPatterns
-    ) {
-        if (
-            pattern.direction ===
-            'CALL'
-        ) {
-            reasons.push(
-                `${pattern.name} detected, providing bullish price-action confirmation.`
-            );
-        }
-
-        else if (
-            pattern.direction ===
-            'PUT'
-        ) {
-            reasons.push(
-                `${pattern.name} detected, providing bearish price-action confirmation.`
-            );
-        }
-
-        else {
-            reasons.push(
-                `${pattern.name} detected, so short-term direction needs confirmation.`
-            );
-        }
-    }
-
-
-    /* =====================================================
-       MARKET BEHAVIOR / PSYCHOLOGY PROXY
-    ===================================================== */
-
-    if (marketBehavior) {
-
-        if (
-            marketBehavior.callPressure >
-            marketBehavior.putPressure
-        ) {
-            callScore +=
-                Math.min(
-                    7,
-                    marketBehavior.callPressure * 2
-                );
-
-
-            reasons.push(
-                ...marketBehavior.reasons
-                    .filter(
-                        reason =>
-                            /buying|bullish|support|activity/i
-                                .test(reason)
-                    )
-            );
-        }
-
-
-        else if (
-            marketBehavior.putPressure >
-            marketBehavior.callPressure
-        ) {
-            putScore +=
-                Math.min(
-                    7,
-                    marketBehavior.putPressure * 2
-                );
-
-
-            reasons.push(
-                ...marketBehavior.reasons
-                    .filter(
-                        reason =>
-                            /selling|bearish|resistance|activity/i
-                                .test(reason)
-                    )
-            );
-        }
-    }
-
-
-    /* =====================================================
-       FINAL DECISION
-    ===================================================== */
-
-    const difference =
-        Math.abs(
-            callScore -
-            putScore
-        );
-
-
-    const strongest =
-        Math.max(
-            callScore,
-            putScore
-        );
-
-
-    let signal =
-        'NO TRADE';
-
-
-    /*
-      Directional signal requires:
-
-      strongest score >= 65
-      AND
-      score difference >= 15
-    */
-
-    if (
-        strongest >= 65 &&
-        difference >= 15
-    ) {
-        signal =
-            callScore >
-            putScore
-                ? 'CALL'
-                : 'PUT';
-    }
-
-
-    /* =====================================================
-       CONFIDENCE
-    ===================================================== */
-
-    const confidence =
-        signal === 'NO TRADE'
-
-            ? Math.round(
-                clamp(
-                    40 +
-                    strongest *
-                    0.35,
-
-                    40,
-                    69
-                )
+      resistance:
+        Number.isFinite(sr.resistance)
+          ? round(
+              sr.resistance,
+              priceDecimals(pair)
             )
+          : null,
 
-            : Math.round(
-                clamp(
-                    50 +
-                    strongest *
-                    0.45 +
-                    difference *
-                    0.25,
-
-                    50,
-                    95
-                )
-            );
-
-
-    /* =====================================================
-       MARKET CONDITION
-    ===================================================== */
-
-    let marketCondition =
-        'RANGING';
-
-
-    if (
-        Number.isFinite(adx14) &&
-        adx14 < 18
-    ) {
-        marketCondition =
-            'LOW_VOLATILITY_RANGE';
-    }
-
-    else if (
-        ema9 > ema21 &&
-        recentMomentum > 0
-    ) {
-        marketCondition =
-            'UPTREND';
-    }
-
-    else if (
-        ema9 < ema21 &&
-        recentMomentum < 0
-    ) {
-        marketCondition =
-            'DOWNTREND';
-    }
-
-
-    /* =====================================================
-       FINAL REASON
-    ===================================================== */
-
-    if (
-        signal ===
-        'NO TRADE'
-    ) {
-        reasons.push(
-            'Signals are not sufficiently aligned for a high-confidence directional setup.'
-        );
-    }
-
-    else {
-        reasons.push(
-            `${signal} selected because the strongest directional score is ${Math.round(strongest)} with a ${Math.round(difference)}-point advantage.`
-        );
-    }
-
-
-    /* =====================================================
-       ENTRY / EXPIRY
-    ===================================================== */
-
-    const timing =
-        entryAndExpiry(
-            timeframe
-        );
-
-
-    const uniqueReasons =
-        [
-            ...new Set(
-                reasons.filter(Boolean)
+      bollingerUpper:
+        bb
+          ? round(
+              bb.upper,
+              priceDecimals(pair)
             )
-        ];
+          : null,
 
+      bollingerMiddle:
+        bb
+          ? round(
+              bb.middle,
+              priceDecimals(pair)
+            )
+          : null,
 
-    /* =====================================================
-       RESULT
-    ===================================================== */
+      bollingerLower:
+        bb
+          ? round(
+              bb.lower,
+              priceDecimals(pair)
+            )
+          : null
+    },
 
-    return {
-        pair,
+    candles:
+      tfCandles.length,
 
-        timeframe,
+    source: 'Twelve Data LIVE',
 
-        signal,
+    analysisTime:
+      new Date().toISOString(),
 
-        confidence,
-
-        currentPrice:
-            round(
-                currentPrice,
-                pair.includes('JPY')
-                    ? 3
-                    : 5
-            ),
-
-        entryTime:
-            timing.entryTime
-                .toISOString(),
-
-        expiryTime:
-            timing.expiryTime
-                .toISOString(),
-
-        entryInSeconds:
-            timing.entryInSeconds,
-
-        marketCondition,
-
-        callScore:
-            Math.round(
-                clamp(
-                    callScore,
-                    0,
-                    100
-                )
-            ),
-
-        putScore:
-            Math.round(
-                clamp(
-                    putScore,
-                    0,
-                    100
-                )
-            ),
-
-
-        /* =================================================
-           TECHNICAL INDICATORS
-        ================================================= */
-
-        indicators: {
-            ema9:
-                round(
-                    ema9,
-                    6
-                ),
-
-            ema21:
-                round(
-                    ema21,
-                    6
-                ),
-
-            rsi14:
-                round(
-                    rsi14,
-                    2
-                ),
-
-            adx14:
-                round(
-                    adx14,
-                    2
-                ),
-
-            atr14:
-                round(
-                    atr14,
-                    6
-                ),
-
-            support:
-                round(
-                    sr.support,
-                    6
-                ),
-
-            resistance:
-                round(
-                    sr.resistance,
-                    6
-                ),
-
-            bollinger:
-                bollingerBands
-                    ? {
-                        middle:
-                            round(
-                                bollingerBands.middle,
-                                6
-                            ),
-
-                        upper:
-                            round(
-                                bollingerBands.upper,
-                                6
-                            ),
-
-                        lower:
-                            round(
-                                bollingerBands.lower,
-                                6
-                            )
-                    }
-                    : null
-        },
-
-
-        /* =================================================
-           CANDLESTICK PATTERNS
-        ================================================= */
-
-        candlestickPatterns:
-            candlestickPatterns.map(
-                pattern => ({
-                    name:
-                        pattern.name,
-
-                    direction:
-                        pattern.direction,
-
-                    strength:
-                        pattern.strength
-                })
-            ),
-
-
-        /* =================================================
-           MARKET BEHAVIOR
-        ================================================= */
-
-        marketBehavior:
-            marketBehavior
-                ? {
-                    buyingPressure:
-                        round(
-                            marketBehavior.buyingPressure,
-                            3
-                        ),
-
-                    sellingPressure:
-                        round(
-                            marketBehavior.sellingPressure,
-                            3
-                        ),
-
-                    nearSupport:
-                        marketBehavior.nearSupport,
-
-                    nearResistance:
-                        marketBehavior.nearResistance,
-
-                    bullishRejection:
-                        marketBehavior.rejectionCall,
-
-                    bearishRejection:
-                        marketBehavior.rejectionPut,
-
-                    rangeExpanding:
-                        marketBehavior.expanding,
-
-                    rangeCompressed:
-                        marketBehavior.compressed
-                }
-                : null,
-
-
-        candles:
-            timeframeCandles.length,
-
-
-        source:
-            'Twelve Data LIVE',
-
-
-        analysisTime:
-            new Date().toISOString(),
-
-
-        lastCandle:
-            timeframeCandles[
-                timeframeCandles.length - 1
-            ]?.time
-
-                ? new Date(
-                    timeframeCandles[
-                        timeframeCandles.length - 1
-                    ].time
-                ).toISOString()
-
-                : null,
-
-
-        staleData:
-            Boolean(
-                freshness.stale
-            ),
-
-
-        dataWarning:
-            freshness.warning ||
-            null,
-
-
-        reasons:
-            uniqueReasons
-    };
+    reasons:
+      reasons.slice(0, 6)
+  };
 }
 
-
 /* =========================================================
-   RESULT RANKING
-========================================================= */
+   BEST RESULT SELECTION
+   ========================================================= */
 
 function rankResult(result) {
-    if (!result) {
-        return -Infinity;
-    }
+  if (!result) {
+    return -Infinity;
+  }
 
+  if (
+    result.signal === 'NO TRADE'
+  ) {
+    return (
+      result.confidence * 0.35
+    );
+  }
 
-    const difference =
-        Math.abs(
-            (
-                result.callScore ||
-                0
-            ) -
-            (
-                result.putScore ||
-                0
-            )
-        );
+  const score =
+    result.confidence +
+    Math.abs(
+      result.callScore -
+      result.putScore
+    ) *
+      0.6;
 
+  let bonus = 0;
 
-    let rank =
-        result.signal ===
-        'NO TRADE'
+  if (
+    result.marketCondition ===
+      'UPTREND' &&
+    result.signal === 'CALL'
+  ) {
+    bonus += 8;
+  }
 
-            ? result.confidence *
-              0.35
+  if (
+    result.marketCondition ===
+      'DOWNTREND' &&
+    result.signal === 'PUT'
+  ) {
+    bonus += 8;
+  }
 
-            : result.confidence +
-              difference *
-              0.6;
+  if (
+    result.indicators.adx14 !== null &&
+    result.indicators.adx14 >= 25
+  ) {
+    bonus += 5;
+  }
 
-
-    if (
-        result.marketCondition ===
-        'UPTREND' &&
-        result.signal ===
-        'CALL'
-    ) {
-        rank += 8;
-    }
-
-
-    if (
-        result.marketCondition ===
-        'DOWNTREND' &&
-        result.signal ===
-        'PUT'
-    ) {
-        rank += 8;
-    }
-
-
-    if (
-        (
-            result.indicators?.adx14 ||
-            0
-        ) >= 25
-    ) {
-        rank += 5;
-    }
-
-
-    const matchingPattern =
-        result
-            .candlestickPatterns
-            ?.some(
-                pattern =>
-                    pattern.direction ===
-                    result.signal &&
-                    pattern.direction !==
-                    'NEUTRAL'
-            );
-
-
-    if (matchingPattern) {
-        rank += 3;
-    }
-
-
-    return rank;
+  return score + bonus;
 }
-
-
-/* =========================================================
-   BEST RESULT
-========================================================= */
 
 function chooseBest(results) {
-    return results
-        .filter(Boolean)
-        .sort(
-            (a, b) =>
-                rankResult(b) -
-                rankResult(a)
-        )[0] || null;
+  if (!results.length) {
+    return null;
+  }
+
+  const sorted =
+    results
+      .slice()
+      .sort(
+        (a, b) =>
+          rankResult(b) -
+          rankResult(a)
+      );
+
+  return sorted[0];
 }
 
-
 /* =========================================================
-   ANALYZE ONE PAIR
-========================================================= */
+   PAIR ANALYSIS
+   ========================================================= */
 
 async function analyzePair(
-    pair,
-    options = {}
+  pair,
+  options = {}
 ) {
-    const normalized =
-        normalizePair(pair);
+  const normalized =
+    normalizePair(pair);
 
+  if (!normalized) {
+    throw new Error(
+      `Unsupported pair: ${pair}`
+    );
+  }
+
+  const data =
+    await getPairCandles(
+      normalized,
+      options
+    );
+
+  const results = [];
+
+  for (const timeframe of TIMEFRAMES) {
+    const key =
+      `${normalized}:${timeframe}`;
+
+    const cachedResult =
+      getCachedResult(key);
 
     if (
-        !isValidPair(
-            normalized
-        )
+      cachedResult &&
+      !options.forceRefresh
     ) {
-        throw new Error(
-            `Invalid pair: ${pair}`
-        );
+      results.push(
+        cachedResult
+      );
+      continue;
     }
 
+    const result =
+      calculateMarketAnalysis(
+        normalized,
+        timeframe,
+        data.candles
+      );
 
-    const market =
-        await getPairCandles(
-            normalized,
-            options
-        );
+    result.dataSource =
+      data.source;
 
-
-    const results = [];
-
-
-    for (
-        const timeframe of
-        TIMEFRAMES
-    ) {
-        try {
-            results.push(
-                calculateMarketAnalysis(
-                    normalized,
-                    timeframe,
-                    market.candles,
-                    market
-                )
-            );
-        }
-
-        catch (_) {
-            /*
-              One timeframe failure
-              must not destroy the
-              other valid timeframes.
-            */
-        }
+    if (data.warning) {
+      result.dataWarning =
+        data.warning;
     }
 
+    setCachedResult(
+      key,
+      result
+    );
 
-    if (!results.length) {
-        throw new Error(
-            `${normalized}: no valid timeframe analysis.`
-        );
-    }
+    results.push(result);
+  }
 
-
-    const cachedAt =
-        Date.now();
-
-
-    for (
-        const result of
-        results
-    ) {
-        resultCache.set(
-            `${normalized}:${result.timeframe}`,
-            {
-                result,
-                cachedAt
-            }
-        );
-    }
-
-
-    return {
-        pair:
-            normalized,
-
-        source:
-            'Twelve Data LIVE',
-
-        cachedAt:
-            new Date(
-                cachedAt
-            ).toISOString(),
-
-        results
-    };
+  return {
+    pair: normalized,
+    source: data.source,
+    cachedAt: data.cachedAt,
+    results
+  };
 }
 
-
 /* =========================================================
-   SCAN BATCH
-========================================================= */
+   SCANNER
+   ========================================================= */
 
 async function scanBatch() {
-    resetDailyBudgetIfNeeded();
+  resetDailyStateIfNeeded();
 
+  if (scanRunning) {
+    return {
+      skipped: true,
+      reason: 'scan_already_running'
+    };
+  }
 
-    if (state.scanRunning) {
-        return {
-            skipped: true,
-            reason:
-                'scan_already_running'
-        };
-    }
+  /*
+    Do not start a provider scan while quota is blocked.
+  */
+  if (quotaBlocked) {
+    return {
+      skipped: true,
+      reason: 'provider_quota_blocked'
+    };
+  }
 
+  /*
+    Do not consume requests after backend budget.
+  */
+  if (!isBudgetAvailable()) {
+    return {
+      skipped: true,
+      reason: 'daily_budget_reached'
+    };
+  }
 
-    if (state.quotaBlocked) {
-        return {
-            skipped: true,
-            reason:
-                state.quotaBlockReason ||
-                'quota_blocked'
-        };
-    }
+  scanRunning = true;
 
+  const startedAt =
+    new Date().toISOString();
 
-    state.scanRunning =
-        true;
+  const batch =
+    [];
 
-    state.lastScanError =
-        null;
+  for (
+    let i = 0;
+    i < SCAN_BATCH_SIZE;
+    i++
+  ) {
+    const index =
+      (scanCursor + i) %
+      PAIRS.length;
 
+    batch.push(
+      PAIRS[index]
+    );
+  }
 
-    const started =
-        Date.now();
+  let scannedThisRun = 0;
+  let failedThisRun = 0;
 
+  try {
+    for (const pair of batch) {
+      /*
+        If quota gets blocked during a pair,
+        stop immediately.
+      */
+      if (quotaBlocked) {
+        break;
+      }
 
-    const selectedPairs = [];
+      try {
+        const analysis =
+          await analyzePair(
+            pair,
+            {
+              forceRefresh: true
+            }
+          );
 
+        scannedThisRun++;
+        totalScanned++;
 
-    for (
-        let i = 0;
-        i < SCAN_BATCH_SIZE;
-        i++
-    ) {
-        selectedPairs.push(
-            PAIRS[
-                (
-                    state.scanCursor +
-                    i
-                ) %
-                PAIRS.length
-            ]
+        console.log(
+          `[SCAN] ${pair} OK (${analysis.source})`
         );
-    }
+      } catch (error) {
+        failedThisRun++;
+        totalFailed++;
 
+        lastScanError =
+          `${pair}: ${error.message}`;
 
-    let scanned = 0;
-    let failed = 0;
+        console.warn(
+          `[SCAN] ${lastScanError}`
+        );
 
-    const errors = [];
-
-
-    try {
-
-        for (
-            const pair of
-            selectedPairs
-        ) {
-            if (
-                state.quotaBlocked
-            ) {
-                break;
-            }
-
-
-            try {
-
-                /*
-                  IMPORTANT:
-
-                  Use the pair cache when
-                  it is still valid.
-
-                  This protects the
-                  Twelve Data quota.
-                */
-
-                await analyzePair(
-                    pair,
-                    {
-                        forceRefresh:
-                            false
-                    }
-                );
-
-                scanned++;
-            }
-
-            catch (error) {
-                failed++;
-
-                errors.push(
-                    `${pair}: ${error.message}`
-                );
-            }
+        /*
+          Critical quota protection:
+          do not continue requesting more pairs.
+        */
+        if (quotaBlocked) {
+          break;
         }
-
-
-        state.scanCursor =
-            (
-                state.scanCursor +
-                selectedPairs.length
-            ) %
-            PAIRS.length;
-
-
-        state.totalScanned =
-            scanned;
-
-        state.totalFailed =
-            failed;
-
-
-        state.lastScanAt =
-            new Date()
-                .toISOString();
-
-
-        if (errors.length) {
-            state.lastScanError =
-                errors.join(
-                    ' | '
-                );
-        }
-
+      }
     }
 
-    finally {
-        state.scanRunning =
-            false;
-    }
+    scanCursor =
+      (scanCursor +
+        batch.length) %
+      PAIRS.length;
 
+    lastScanAt =
+      new Date().toISOString();
 
     return {
-        scanned,
-
-        failed,
-
-        pairs:
-            selectedPairs,
-
-        durationMs:
-            Date.now() -
-            started,
-
-        errors
+      skipped: false,
+      startedAt,
+      completedAt: lastScanAt,
+      scannedThisRun,
+      failedThisRun,
+      scanCursor,
+      quotaBlocked
     };
+  } finally {
+    scanRunning = false;
+  }
 }
 
-
 /* =========================================================
-   FRESH RESULTS
-========================================================= */
+   ROUTES
+   ========================================================= */
 
-function freshResults() {
-    const now =
-        Date.now();
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    name: 'PO AI Predictor',
+    version: VERSION,
+    source: 'Twelve Data LIVE',
+    status: quotaBlocked
+      ? 'QUOTA_BLOCKED'
+      : 'ONLINE',
+    endpoints: [
+      '/api/health',
+      '/api/analyze',
+      '/api/best',
+      '/api/scan',
+      '/api/scan/status'
+    ]
+  });
+});
+
+/* ---------------------------------------------------------
+   HEALTH
+   --------------------------------------------------------- */
+
+app.get('/api/health', (req, res) => {
+  resetDailyStateIfNeeded();
+
+  const cachedPairs =
+    Array.from(
+      pairCache.entries()
+    ).filter(
+      ([, value]) =>
+        Date.now() -
+          value.timestamp <=
+        CACHE_TTL_MS
+    ).length;
+
+  const cachedResults =
+    Array.from(
+      resultCache.entries()
+    ).filter(
+      ([, value]) =>
+        Date.now() -
+          value.timestamp <=
+        RESULT_TTL_MS
+    ).length;
+
+  res.json({
+    ok: true,
+    version: VERSION,
+    source: 'Twelve Data LIVE',
+    timezone: TIMEZONE,
+
+    pairs: PAIRS.length,
+    supportedTimeframes:
+      TIMEFRAMES,
+
+    cachedPairs,
+    cachedResults,
+
+    scanRunning,
+    scanCursor,
+    scanBatchSize:
+      SCAN_BATCH_SIZE,
+
+    scanEveryMinutes:
+      SCAN_EVERY_MS / 60000,
+
+    cacheTtlMinutes:
+      CACHE_TTL_MS / 60000,
+
+    lastScanAt,
+    lastScanError,
+
+    totalScanned,
+    totalFailed,
+    totalApiRequests,
+
+    apiBudget: {
+      dailyLimit:
+        DAILY_REQUEST_LIMIT,
+
+      safetyReserve:
+        SAFETY_RESERVE,
+
+      maxDailyRequests:
+        MAX_DAILY_REQUESTS,
+
+      dailyRequests,
+
+      dailyCreditsUsed,
+
+      dailyCreditsLeft:
+        getDailyCreditsLeft(),
+
+      dailyRequestsLeft:
+        getDailyRequestsLeft(),
+
+      quotaBlocked,
+
+      providerQuotaMessage,
+
+      quotaResetAt:
+        providerQuotaResetAt
+    },
+
+    time:
+      new Date().toISOString()
+  });
+});
+
+/* ---------------------------------------------------------
+   SCAN STATUS
+   --------------------------------------------------------- */
+
+app.get(
+  '/api/scan/status',
+  (req, res) => {
+    resetDailyStateIfNeeded();
+
+    res.json({
+      ok: true,
+      version: VERSION,
+      scanRunning,
+      scanCursor,
+      scanBatchSize:
+        SCAN_BATCH_SIZE,
+      pairs: PAIRS.length,
+      lastScanAt,
+      lastScanError,
+      quotaBlocked,
+      providerQuotaMessage,
+      quotaResetAt:
+        providerQuotaResetAt,
+      cachedPairs:
+        pairCache.size,
+      cachedResults:
+        resultCache.size,
+      time:
+        new Date().toISOString()
+    });
+  }
+);
+
+/* ---------------------------------------------------------
+   MANUAL SCAN
+   --------------------------------------------------------- */
+
+app.get(
+  '/api/scan',
+  async (req, res) => {
+    try {
+      const result =
+        await scanBatch();
+
+      res.json({
+        ok: true,
+        version: VERSION,
+        ...result
+      });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        version: VERSION,
+        error: error.message
+      });
+    }
+  }
+);
+
+/* ---------------------------------------------------------
+   ANALYZE ONE PAIR
+   --------------------------------------------------------- */
+
+app.get(
+  '/api/analyze',
+  async (req, res) => {
+    resetDailyStateIfNeeded();
+
+    const pair =
+      normalizePair(
+        req.query.pair
+      );
+
+    if (!pair) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          'Valid pair is required.',
+        supportedPairs: PAIRS
+      });
+    }
+
+    try {
+      const analysis =
+        await analyzePair(
+          pair,
+          {
+            forceRefresh:
+              req.query.refresh === '1'
+          }
+        );
+
+      res.json({
+        ok: true,
+        version: VERSION,
+        ...analysis
+      });
+    } catch (error) {
+      const status =
+        quotaBlocked
+          ? 429
+          : 500;
+
+      res.status(status).json({
+        ok: false,
+        version: VERSION,
+        pair,
+        error: error.message,
+        quotaBlocked,
+        quotaResetAt:
+          providerQuotaResetAt,
+        time:
+          new Date().toISOString()
+      });
+    }
+  }
+);
+
+/* ---------------------------------------------------------
+   BEST RESULT
+   --------------------------------------------------------- */
+
+app.get(
+  '/api/best',
+  async (req, res) => {
+    resetDailyStateIfNeeded();
 
     const results = [];
 
+    /*
+      Prefer already cached results.
+      This endpoint does NOT automatically make
+      24 fresh Twelve Data requests.
+    */
+    for (const [
+      key,
+      value
+    ] of resultCache.entries()) {
+      if (
+        Date.now() -
+          value.timestamp >
+        RESULT_TTL_MS
+      ) {
+        continue;
+      }
 
-    for (
-        const item of
-        resultCache.values()
-    ) {
-        if (
-            now -
-            item.cachedAt <=
-            RESULT_TTL_MS
-        ) {
-            results.push(
-                item.result
-            );
-        }
-    }
-
-
-    return results;
-}
-
-
-/* =========================================================
-   HEALTH
-========================================================= */
-
-function healthPayload() {
-    resetDailyBudgetIfNeeded();
-
-
-    return {
-        ok: true,
-
-        version:
-            VERSION,
-
-        source:
-            'Twelve Data LIVE',
-
-        timezone:
-            TIMEZONE,
-
-        pairs:
-            PAIRS.length,
-
-        supportedTimeframes:
-            TIMEFRAMES,
-
-        cachedPairs:
-            pairCache.size,
-
-        cachedResults:
-            freshResults().length,
-
-        scanRunning:
-            state.scanRunning,
-
-        scanCursor:
-            state.scanCursor,
-
-        scanBatchSize:
-            SCAN_BATCH_SIZE,
-
-        lastScanAt:
-            state.lastScanAt,
-
-        lastScanError:
-            state.lastScanError,
-
-        totalScanned:
-            state.totalScanned,
-
-        totalFailed:
-            state.totalFailed,
-
-        totalApiRequests:
-            state.totalApiRequests,
-
-        apiKeyConfigured:
-            Boolean(
-                TWELVE_DATA_API_KEY
-            ),
-
-        quotaBlocked:
-            state.quotaBlocked,
-
-        apiBudget: {
-            dailyRequestLimit:
-                DAILY_REQUEST_LIMIT,
-
-            safetyReserve:
-                SAFETY_RESERVE,
-
-            maxSafeRequests:
-                MAX_SAFE_REQUESTS,
-
-            requestsUsedToday:
-                state.dailyRequestsUsed,
-
-            requestsRemainingSafe:
-                Math.max(
-                    0,
-                    MAX_SAFE_REQUESTS -
-                    state.dailyRequestsUsed
-                )
-        },
-
-        time:
-            new Date().toISOString()
-    };
-}
-
-
-/* =========================================================
-   ROOT
-========================================================= */
-
-app.get(
-    '/',
-    (req, res) => {
-        res.json({
-            ok: true,
-
-            name:
-                'PO AI Predictor API',
-
-            version:
-                VERSION,
-
-            endpoints: [
-                '/api/health',
-                '/api/best',
-                '/api/analyze?pair=EUR/USD',
-                '/api/scan',
-                '/api/scan/status',
-                '/api/selected'
-            ]
-        });
-    }
-);
-
-
-/* =========================================================
-   HEALTH
-========================================================= */
-
-app.get(
-    '/api/health',
-    (req, res) => {
-        res.json(
-            healthPayload()
+      if (value.result) {
+        results.push(
+          value.result
         );
+      }
     }
-);
 
+    /*
+      If cache has no results, perform ONE controlled scan batch.
+      Never scan all 24 pairs from this endpoint.
+    */
+    if (
+      results.length === 0 &&
+      !quotaBlocked
+    ) {
+      try {
+        await scanBatch();
+      } catch (error) {
+        lastScanError =
+          error.message;
+      }
 
-/* =========================================================
-   SCAN STATUS
-========================================================= */
-
-app.get(
-    '/api/scan/status',
-    (req, res) => {
-        resetDailyBudgetIfNeeded();
-
-
-        res.json({
-            ok: true,
-
-            version:
-                VERSION,
-
-            scanRunning:
-                state.scanRunning,
-
-            scanCursor:
-                state.scanCursor,
-
-            scanBatchSize:
-                SCAN_BATCH_SIZE,
-
-            cachedPairs:
-                pairCache.size,
-
-            cachedResults:
-                freshResults().length,
-
-            lastScanAt:
-                state.lastScanAt,
-
-            lastScanError:
-                state.lastScanError,
-
-            totalScanned:
-                state.totalScanned,
-
-            totalFailed:
-                state.totalFailed,
-
-            quotaBlocked:
-                state.quotaBlocked,
-
-            quotaBlockReason:
-                state.quotaBlockReason,
-
-            time:
-                new Date().toISOString()
-        });
-    }
-);
-
-
-/* =========================================================
-   MANUAL SCAN
-========================================================= */
-
-app.get(
-    '/api/scan',
-    async (req, res) => {
-        try {
-            const result =
-                await scanBatch();
-
-
-            res.json({
-                ok: true,
-
-                version:
-                    VERSION,
-
-                ...result,
-
-                time:
-                    new Date()
-                        .toISOString()
-            });
-
-        }
-
-        catch (error) {
-            res.status(500)
-                .json({
-                    ok: false,
-
-                    version:
-                        VERSION,
-
-                    error:
-                        error.message
-                });
-        }
-    }
-);
-
-
-/* =========================================================
-   ANALYZE SPECIFIC PAIR
-========================================================= */
-
-app.get(
-    '/api/analyze',
-    async (req, res) => {
-
-        const pair =
-            normalizePair(
-                req.query.pair
-            );
-
-
+      for (const [
+        ,
+        value
+      ] of resultCache.entries()) {
         if (
-            !isValidPair(pair)
+          Date.now() -
+            value.timestamp <=
+          RESULT_TTL_MS
         ) {
-            return res
-                .status(400)
-                .json({
-                    ok: false,
-
-                    version:
-                        VERSION,
-
-                    error:
-                        'Valid pair is required.',
-
-                    pairs:
-                        PAIRS
-                });
-        }
-
-
-        try {
-
-            const result =
-                await analyzePair(
-                    pair,
-                    {
-                        forceRefresh:
-                            req.query.refresh ===
-                            '1'
-                    }
-                );
-
-
-            res.json({
-                ok: true,
-
-                version:
-                    VERSION,
-
-                ...result
-            });
-
-        }
-
-        catch (error) {
-
-            res.status(503)
-                .json({
-                    ok: false,
-
-                    version:
-                        VERSION,
-
-                    error:
-                        error.message
-                });
-        }
-    }
-);
-
-
-/* =========================================================
-   SMART BEST MARKET
-========================================================= */
-
-app.get(
-    '/api/best',
-    async (req, res) => {
-
-        resetDailyBudgetIfNeeded();
-
-
-        let results =
-            freshResults();
-
-
-        /*
-          If there are no fresh results,
-          run one controlled scan.
-        */
-
-        if (
-            !results.length &&
-            !state.quotaBlocked
-        ) {
-            await scanBatch();
-
-            results =
-                freshResults();
-        }
-
-
-        const best =
-            chooseBest(results);
-
-
-        if (!best) {
-
-            return res
-                .status(503)
-                .json({
-
-                    ok: false,
-
-                    version:
-                        VERSION,
-
-                    error:
-                        state.quotaBlocked
-
-                            ? (
-                                state.quotaBlockReason ||
-                                'Live data quota is temporarily blocked.'
-                            )
-
-                            : 'No selected market is currently available.',
-
-                    quotaBlocked:
-                        state.quotaBlocked,
-
-                    time:
-                        new Date()
-                            .toISOString()
-                });
-        }
-
-
-        res.json({
-            ok: true,
-
-            version:
-                VERSION,
-
-            selectedMarket:
-                best,
-
-            scannedResults:
-                results.length,
-
-            quotaBlocked:
-                state.quotaBlocked,
-
-            time:
-                new Date()
-                    .toISOString()
-        });
-    }
-);
-
-
-/* =========================================================
-   SELECTED COMPATIBILITY ROUTE
-========================================================= */
-
-app.get(
-    '/api/selected',
-    (req, res) => {
-
-        const best =
-            chooseBest(
-                freshResults()
+          if (value.result) {
+            results.push(
+              value.result
             );
-
-
-        if (!best) {
-            return res
-                .status(404)
-                .json({
-
-                    ok: false,
-
-                    version:
-                        VERSION,
-
-                    error:
-                        'No fresh selected market available.'
-                });
+          }
         }
-
-
-        res.json({
-            ok: true,
-
-            version:
-                VERSION,
-
-            selectedMarket:
-                best,
-
-            time:
-                new Date()
-                    .toISOString()
-        });
+      }
     }
+
+    const best =
+      chooseBest(results);
+
+    if (!best) {
+      return res.status(503).json({
+        ok: false,
+        version: VERSION,
+        error:
+          quotaBlocked
+            ? (
+                providerQuotaMessage ||
+                'Twelve Data quota is blocked.'
+              )
+            : 'No selected market is currently available.',
+        quotaBlocked,
+        quotaResetAt:
+          providerQuotaResetAt,
+        cachedResults:
+          results.length,
+        time:
+          new Date().toISOString()
+      });
+    }
+
+    res.json({
+      ok: true,
+      version: VERSION,
+      selectedMarket: best,
+      scannedResults:
+        results.length,
+      quotaBlocked,
+      time:
+        new Date().toISOString()
+    });
+  }
 );
 
+/* ---------------------------------------------------------
+   COMPATIBILITY ROUTE
+   --------------------------------------------------------- */
+
+app.get(
+  '/api/selected',
+  async (req, res) => {
+    try {
+      const results = [];
+
+      for (const [
+        ,
+        value
+      ] of resultCache.entries()) {
+        if (
+          Date.now() -
+            value.timestamp <=
+          RESULT_TTL_MS
+        ) {
+          if (value.result) {
+            results.push(
+              value.result
+            );
+          }
+        }
+      }
+
+      const best =
+        chooseBest(results);
+
+      if (!best) {
+        return res.status(503).json({
+          ok: false,
+          error:
+            quotaBlocked
+              ? (
+                  providerQuotaMessage ||
+                  'Twelve Data quota is blocked.'
+                )
+              : 'No selected market is currently available.',
+          quotaBlocked,
+          quotaResetAt:
+            providerQuotaResetAt
+        });
+      }
+
+      res.json({
+        ok: true,
+        version: VERSION,
+        selectedMarket: best
+      });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: error.message
+      });
+    }
+  }
+);
 
 /* =========================================================
    404
-========================================================= */
+   ========================================================= */
 
 app.use(
-    (req, res) => {
-        res.status(404)
-            .json({
-                ok: false,
-
-                error:
-                    'Not found',
-
-                version:
-                    VERSION
-            });
-    }
+  (req, res) => {
+    res.status(404).json({
+      ok: false,
+      error: 'Endpoint not found.',
+      version: VERSION
+    });
+  }
 );
 
-
 /* =========================================================
-   START SERVER
-========================================================= */
+   SERVER
+   ========================================================= */
 
 app.listen(
-    PORT,
-    () => {
+  PORT,
+  () => {
+    console.log(
+      '=============================================='
+    );
 
-        resetDailyBudgetIfNeeded();
+    console.log(
+      `PO AI PREDICTOR ${VERSION}`
+    );
 
+    console.log(
+      'Source: Twelve Data LIVE'
+    );
 
-        console.log(
-            `[PO AI PREDICTOR] ${VERSION} running on port ${PORT}`
-        );
+    console.log(
+      `Port: ${PORT}`
+    );
 
-        console.log(
-            `[PO AI PREDICTOR] Source: Twelve Data LIVE`
-        );
+    console.log(
+      `Pairs: ${PAIRS.length}`
+    );
 
-        console.log(
-            `[PO AI PREDICTOR] Pairs: ${PAIRS.length}`
-        );
+    console.log(
+      `Timeframes: ${TIMEFRAMES.join(', ')} minutes`
+    );
 
-        console.log(
-            `[PO AI PREDICTOR] Timeframes: ${TIMEFRAMES.join(', ')}`
-        );
+    console.log(
+      `Scan batch: ${SCAN_BATCH_SIZE}`
+    );
 
-        console.log(
-            `[PO AI PREDICTOR] Candlestick engine: ENABLED`
-        );
+    console.log(
+      `Scan interval: ${SCAN_EVERY_MS / 60000} minutes`
+    );
 
-        console.log(
-            `[PO AI PREDICTOR] Market behavior engine: ENABLED`
-        );
+    console.log(
+      `Cache TTL: ${CACHE_TTL_MS / 60000} minutes`
+    );
 
-        console.log(
-            `[PO AI PREDICTOR] Safe daily request budget: ${MAX_SAFE_REQUESTS}`
-        );
+    console.log(
+      `Daily safe request budget: ${MAX_DAILY_REQUESTS}`
+    );
 
+    console.log(
+      `API key configured: ${Boolean(
+        TWELVE_DATA_API_KEY
+      )}`
+    );
 
-        /*
-          Initial controlled scan.
-        */
+    console.log(
+      '=============================================='
+    );
+  }
+);
 
-        setTimeout(
-            () => {
-                scanBatch()
-                    .catch(
-                        error =>
-                            console.error(
-                                '[INITIAL SCAN ERROR]',
-                                error.message
-                            )
-                    );
-            },
-            10_000
-        );
+/* =========================================================
+   AUTOMATIC SCANNER
+   ========================================================= */
 
+/*
+  Delayed startup prevents Render restart from immediately
+  consuming an API request.
+*/
+setTimeout(
+  async () => {
+    try {
+      console.log(
+        '[SCANNER] Initial controlled scan starting...'
+      );
 
-        /*
-          Scheduled controlled scan.
-        */
+      await scanBatch();
+    } catch (error) {
+      lastScanError =
+        error.message;
 
-        setInterval(
-            () => {
-                scanBatch()
-                    .catch(
-                        error =>
-                            console.error(
-                                '[SCHEDULED SCAN ERROR]',
-                                error.message
-                            )
-                    );
-            },
-            SCAN_EVERY_MS
-        );
+      console.error(
+        '[SCANNER] Initial scan error:',
+        error.message
+      );
     }
+  },
+  10000
+);
+
+/*
+  Every 15 minutes:
+  - check quota
+  - scan only one small batch
+  - never scan all 24 at once
+*/
+setInterval(
+  async () => {
+    resetDailyStateIfNeeded();
+
+    if (quotaBlocked) {
+      console.log(
+        '[SCANNER] Skipped — Twelve Data quota blocked.'
+      );
+      return;
+    }
+
+    if (scanRunning) {
+      console.log(
+        '[SCANNER] Skipped — previous scan still running.'
+      );
+      return;
+    }
+
+    try {
+      await scanBatch();
+    } catch (error) {
+      lastScanError =
+        error.message;
+
+      console.error(
+        '[SCANNER] Error:',
+        error.message
+      );
+    }
+  },
+  SCAN_EVERY_MS
 );
