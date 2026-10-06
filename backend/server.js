@@ -3,37 +3,32 @@
 /*
 ============================================================
  PO AI PREDICTOR
- BACKEND V9.0 FINAL
- LIVE ONLY — TWELVE DATA
+ Backend V9.0.3
+ LIVE ONLY - Twelve Data
 
- FINAL ARCHITECTURE
- -----------------------------------------------------------
- One provider response per pair
-        ↓
- Local 1m / 2m / 3m candle construction
-        ↓
- Indicators
-        ↓
- Signal engine
-        ↓
- Ranking
-        ↓
- ONE selectedMarket object
-        ↓
- /api/best
-        ↓
- script.js
-
- IMPORTANT:
- - No OTC
- - No MACD
- - No CCI
- - No external sentiment claims
- - Market Psychology = price-action inference only
- - Maximum 7 Twelve Data requests per minute
- - Daily safety limit
- - Cached pair data
- - Cached analysis results
+ V9.0.3
+ - Single source of truth
+ - One consistent /api/best response
+ - Scan-lock synchronization
+ - Never return null selectedMarket while a scan can provide data
+ - Fresh/stale cache protection
+ - 7 provider requests/minute maximum
+ - Daily safety reserve
+ - 24 LIVE Forex pairs
+ - 1m provider candles
+ - Local 2m / 3m aggregation
+ - Completed candles only
+ - EMA9 / EMA21
+ - RSI14
+ - ADX14
+ - Stochastic14
+ - ATR14
+ - Bollinger20
+ - Support / Resistance
+ - Candlestick patterns
+ - Price-action market psychology
+ - Backend calculates signal
+ - Frontend only displays backend response
 ============================================================
 */
 
@@ -45,10 +40,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* =========================================================
+/* ==========================================================
    CONFIG
-========================================================= */
+========================================================== */
 
+const VERSION = 'V9.0.3';
 const PORT = process.env.PORT || 10000;
 
 const TWELVE_DATA_API_KEY =
@@ -59,7 +55,6 @@ const TWELVE_DATA_API_KEY =
 const TWELVE_DATA_URL =
   'https://api.twelvedata.com/time_series';
 
-const VERSION = 'V9.0 FINAL';
 const SOURCE = 'Twelve Data LIVE';
 const TIMEZONE = 'UTC';
 
@@ -97,50 +92,57 @@ const PAIRS = [
   'CAD/CHF'
 ];
 
-/*
-Twelve Data credit protection.
-
-We intentionally stay below a possible provider limit of 8
-credits/minute.
-*/
+/* Provider safety */
 const PROVIDER_MINUTE_LIMIT = 7;
+const PROVIDER_WINDOW_MS = 60 * 1000;
 
+/*
+ Daily provider allowance:
+ 768 total
+ 32 reserved
+ = 736 usable by scanner
+*/
 const DAILY_REQUEST_LIMIT = 768;
 const DAILY_SAFETY_RESERVE = 32;
-
-const EFFECTIVE_DAILY_LIMIT =
+const MAX_DAILY_REQUESTS =
   DAILY_REQUEST_LIMIT - DAILY_SAFETY_RESERVE;
 
+/* Candles */
 const CANDLE_OUTPUT_SIZE = 180;
+const MIN_CANDLES = 80;
 
+/* Cache */
 const PAIR_CACHE_TTL_MS = 15 * 60 * 1000;
 const RESULT_CACHE_TTL_MS = 30 * 1000;
 
-const PROVIDER_REQUEST_WINDOW_MS = 60 * 1000;
-
+/* Scanner */
 const SCAN_BATCH_SIZE = 7;
 const SCAN_INTERVAL_MS = 60 * 1000;
+const SCAN_PAIR_DELAY_MS = 1500;
 
-const MIN_CANDLES = 80;
-
+/* Signal timing */
 const ENTRY_BUFFER_SECONDS = 30;
 
-const MAX_CANDLE_AGE_SECONDS = 120;
+/* Freshness */
+const MAX_DATA_AGE_SECONDS = 120;
 const HARD_STALE_SECONDS = 300;
 
-/* =========================================================
+/* ==========================================================
    STATE
-========================================================= */
+========================================================== */
 
 const pairCache = new Map();
-const resultCache = new Map();
 
-const providerRequestTimes = [];
+let bestResultCache = null;
+
+let providerRequestTimes = [];
 
 let dailyCreditsUsed = 0;
-let dailyDateKey = getUtcDateKey();
+let dailyUsageDate = utcDateKey(new Date());
 
 let scanRunning = false;
+let scanPromise = null;
+
 let scanCursor = 0;
 let lastScanAt = null;
 let lastScanError = null;
@@ -149,373 +151,426 @@ let totalScanned = 0;
 let totalFailed = 0;
 let totalApiRequests = 0;
 
-/* =========================================================
-   HELPERS
-========================================================= */
+/* ==========================================================
+   BASIC HELPERS
+========================================================== */
+
+function utcDateKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
 
 function nowMs() {
   return Date.now();
-}
-
-function getUtcDateKey() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function resetDailyCounterIfNeeded() {
-  const today = getUtcDateKey();
-
-  if (today !== dailyDateKey) {
-    dailyDateKey = today;
-    dailyCreditsUsed = 0;
-  }
-}
-
-function round(value, decimals = 6) {
-  if (!Number.isFinite(value)) return null;
-
-  const p = Math.pow(10, decimals);
-
-  return Math.round(value * p) / p;
 }
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function safeNumber(value) {
-  const n = Number(value);
+function isFiniteNumber(value) {
+  return Number.isFinite(Number(value));
+}
 
-  return Number.isFinite(n) ? n : null;
+function round(value, digits = 5) {
+  if (!isFiniteNumber(value)) return null;
+
+  const factor = Math.pow(10, digits);
+  return Math.round(Number(value) * factor) / factor;
 }
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function minutesAgo(date) {
-  return Math.floor((Date.now() - new Date(date).getTime()) / 60000);
+function resetDailyUsageIfNeeded() {
+  const today = utcDateKey();
+
+  if (today !== dailyUsageDate) {
+    dailyUsageDate = today;
+    dailyCreditsUsed = 0;
+  }
 }
 
-/* =========================================================
-   PROVIDER RATE LIMIT
-========================================================= */
+function remainingDailyCredits() {
+  resetDailyUsageIfNeeded();
 
-function pruneProviderRequestTimes() {
-  const cutoff = Date.now() - PROVIDER_REQUEST_WINDOW_MS;
+  return Math.max(
+    0,
+    MAX_DAILY_REQUESTS - dailyCreditsUsed
+  );
+}
 
-  while (
-    providerRequestTimes.length &&
-    providerRequestTimes[0] < cutoff
+function cleanupProviderWindow() {
+  const cutoff = nowMs() - PROVIDER_WINDOW_MS;
+
+  providerRequestTimes =
+    providerRequestTimes.filter(ts => ts > cutoff);
+}
+
+function providerRequestsInCurrentMinute() {
+  cleanupProviderWindow();
+  return providerRequestTimes.length;
+}
+
+function canRequestProvider() {
+  resetDailyUsageIfNeeded();
+  cleanupProviderWindow();
+
+  if (dailyCreditsUsed >= MAX_DAILY_REQUESTS) {
+    return {
+      ok: false,
+      reason: 'Daily safety limit reached'
+    };
+  }
+
+  if (
+    providerRequestTimes.length >=
+    PROVIDER_MINUTE_LIMIT
   ) {
-    providerRequestTimes.shift();
+    return {
+      ok: false,
+      reason: 'Provider minute safety limit reached'
+    };
   }
-}
 
-function providerMinuteAvailable() {
-  pruneProviderRequestTimes();
-
-  return providerRequestTimes.length < PROVIDER_MINUTE_LIMIT;
-}
-
-function dailyCreditsAvailable() {
-  resetDailyCounterIfNeeded();
-
-  return dailyCreditsUsed < EFFECTIVE_DAILY_LIMIT;
-}
-
-async function waitForProviderSlot() {
-  while (!providerMinuteAvailable()) {
-    pruneProviderRequestTimes();
-
-    const oldest = providerRequestTimes[0];
-
-    if (!oldest) break;
-
-    const waitMs =
-      PROVIDER_REQUEST_WINDOW_MS -
-      (Date.now() - oldest) +
-      1000;
-
-    await sleep(Math.max(1000, waitMs));
-  }
+  return {
+    ok: true,
+    reason: null
+  };
 }
 
 function registerProviderRequest() {
-  providerRequestTimes.push(Date.now());
+  resetDailyUsageIfNeeded();
+
+  providerRequestTimes.push(nowMs());
 
   dailyCreditsUsed += 1;
   totalApiRequests += 1;
 }
 
-/* =========================================================
-   TWELVE DATA
-========================================================= */
+/* ==========================================================
+   HTTP FETCH
+========================================================== */
 
-async function fetchPairFromProvider(pair) {
-  resetDailyCounterIfNeeded();
+async function fetchJson(url) {
+  const controller = new AbortController();
 
-  if (!TWELVE_DATA_API_KEY) {
-    throw new Error('TWELVE_DATA_API_KEY is missing');
-  }
-
-  if (!dailyCreditsAvailable()) {
-    throw new Error('Daily safety limit reached');
-  }
-
-  await waitForProviderSlot();
-
-  const url = new URL(TWELVE_DATA_URL);
-
-  url.searchParams.set('symbol', pair);
-  url.searchParams.set('interval', '1min');
-  url.searchParams.set('outputsize', String(CANDLE_OUTPUT_SIZE));
-  url.searchParams.set('timezone', 'UTC');
-  url.searchParams.set('order', 'asc');
-  url.searchParams.set('apikey', TWELVE_DATA_API_KEY);
-
-  registerProviderRequest();
-
-  const response = await fetch(url.toString());
-
-  let data;
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 20000);
 
   try {
-    data = await response.json();
-  } catch {
-    throw new Error('Invalid Twelve Data response');
-  }
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json'
+      },
+      signal: controller.signal
+    });
 
-  if (!response.ok) {
+    const text = await response.text();
+
+    let data;
+
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Provider returned invalid JSON (${response.status})`
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        data?.message ||
+        data?.code ||
+        `HTTP ${response.status}`
+      );
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/* ==========================================================
+   TWELVE DATA
+========================================================== */
+
+async function fetchOneMinuteCandles(pair) {
+  if (!TWELVE_DATA_API_KEY) {
     throw new Error(
-      `Twelve Data HTTP ${response.status}`
+      'TWELVE_DATA_API_KEY is not configured'
     );
   }
 
+  const permission = canRequestProvider();
+
+  if (!permission.ok) {
+    throw new Error(permission.reason);
+  }
+
+  const url = new URL(TWELVE_DATA_URL);
+
+  url.searchParams.set(
+    'symbol',
+    pair
+  );
+
+  url.searchParams.set(
+    'interval',
+    '1min'
+  );
+
+  url.searchParams.set(
+    'outputsize',
+    String(CANDLE_OUTPUT_SIZE)
+  );
+
+  url.searchParams.set(
+    'timezone',
+    'UTC'
+  );
+
+  url.searchParams.set(
+    'order',
+    'ASC'
+  );
+
+  url.searchParams.set(
+    'apikey',
+    TWELVE_DATA_API_KEY
+  );
+
+  registerProviderRequest();
+
+  const data = await fetchJson(url.toString());
+
   if (
     data &&
+    typeof data === 'object' &&
     (
       data.status === 'error' ||
-      data.code ||
-      data.message
+      data.code
     )
   ) {
     throw new Error(
       data.message ||
-      data.code ||
-      'Twelve Data provider error'
+      `Twelve Data error ${data.code || ''}`.trim()
     );
   }
 
-  if (!Array.isArray(data.values)) {
-    throw new Error('Twelve Data returned no candle values');
+  if (!Array.isArray(data?.values)) {
+    throw new Error(
+      'Twelve Data returned no candle values'
+    );
   }
 
   const candles = data.values
-    .map(item => ({
-      time: new Date(item.datetime).toISOString(),
-      open: safeNumber(item.open),
-      high: safeNumber(item.high),
-      low: safeNumber(item.low),
-      close: safeNumber(item.close),
-      volume: safeNumber(item.volume)
-    }))
+    .map(row => {
+      const timestamp =
+        Date.parse(
+          `${row.datetime}Z`
+        );
+
+      return {
+        time: Number.isFinite(timestamp)
+          ? timestamp
+          : Date.parse(row.datetime),
+
+        open: Number(row.open),
+        high: Number(row.high),
+        low: Number(row.low),
+        close: Number(row.close),
+        volume: isFiniteNumber(row.volume)
+          ? Number(row.volume)
+          : null
+      };
+    })
     .filter(c =>
-      c.open !== null &&
-      c.high !== null &&
-      c.low !== null &&
-      c.close !== null &&
-      Number.isFinite(new Date(c.time).getTime())
+      Number.isFinite(c.time) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
     )
-    .sort(
-      (a, b) =>
-        new Date(a.time).getTime() -
-        new Date(b.time).getTime()
-    );
+    .sort((a, b) => a.time - b.time);
 
   if (candles.length < MIN_CANDLES) {
     throw new Error(
-      `${pair}: insufficient candles (${candles.length})`
+      `Insufficient candles: ${candles.length}`
     );
   }
 
-  const latest = candles[candles.length - 1];
-
-  const ageSeconds =
-    (Date.now() - new Date(latest.time).getTime()) / 1000;
-
-  if (ageSeconds > HARD_STALE_SECONDS) {
-    throw new Error(
-      `${pair}: data too stale (${Math.round(ageSeconds)}s)`
-    );
-  }
-
-  return {
-    pair,
-    candles,
-    latest,
-    fetchedAt: new Date().toISOString(),
-    ageSeconds: Math.max(0, Math.round(ageSeconds))
-  };
+  return candles;
 }
 
-/* =========================================================
-   LOCAL CANDLE AGGREGATION
-========================================================= */
+/* ==========================================================
+   COMPLETED CANDLES
+========================================================== */
 
-function aggregateCandles(candles, timeframeMinutes) {
-  if (timeframeMinutes === 1) {
+function completedCandles(candles) {
+  if (!Array.isArray(candles)) {
+    return [];
+  }
+
+  const currentMinuteStart =
+    Math.floor(nowMs() / 60000) * 60000;
+
+  return candles.filter(
+    candle =>
+      candle.time < currentMinuteStart
+  );
+}
+
+/* ==========================================================
+   TIMEFRAME AGGREGATION
+========================================================== */
+
+function aggregateCandles(candles, minutes) {
+  if (minutes === 1) {
     return candles.slice();
   }
 
-  const bucketMap = new Map();
+  const buckets = new Map();
 
   for (const candle of candles) {
-    const timestamp =
-      new Date(candle.time).getTime();
-
     const bucketSize =
-      timeframeMinutes * 60 * 1000;
+      minutes * 60 * 1000;
 
     const bucket =
-      Math.floor(timestamp / bucketSize) *
+      Math.floor(candle.time / bucketSize) *
       bucketSize;
 
-    if (!bucketMap.has(bucket)) {
-      bucketMap.set(bucket, {
-        time: new Date(bucket).toISOString(),
+    if (!buckets.has(bucket)) {
+      buckets.set(bucket, {
+        time: bucket,
         open: candle.open,
         high: candle.high,
         low: candle.low,
         close: candle.close,
-        volume: candle.volume || 0
+        volume: candle.volume || 0,
+        count: 1
       });
     } else {
-      const item = bucketMap.get(bucket);
+      const item = buckets.get(bucket);
 
-      item.high = Math.max(
-        item.high,
-        candle.high
-      );
+      item.high =
+        Math.max(item.high, candle.high);
 
-      item.low = Math.min(
-        item.low,
-        candle.low
-      );
+      item.low =
+        Math.min(item.low, candle.low);
 
-      item.close = candle.close;
+      item.close =
+        candle.close;
 
-      item.volume += candle.volume || 0;
+      if (Number.isFinite(candle.volume)) {
+        item.volume += candle.volume;
+      }
+
+      item.count += 1;
     }
   }
 
-  return Array.from(bucketMap.values())
-    .sort(
-      (a, b) =>
-        new Date(a.time).getTime() -
-        new Date(b.time).getTime()
-    );
+  return [...buckets.values()]
+    .filter(item => item.count === minutes)
+    .map(item => ({
+      time: item.time,
+      open: item.open,
+      high: item.high,
+      low: item.low,
+      close: item.close,
+      volume: item.volume
+    }))
+    .sort((a, b) => a.time - b.time);
 }
 
-/*
-Do not use a currently-forming candle as the signal candle.
+/* ==========================================================
+   BASIC MATH
+========================================================== */
 
-We use the latest completed bucket.
-*/
-function completedCandles(candles, timeframeMinutes) {
-  if (!candles.length) return [];
-
-  const bucketSize =
-    timeframeMinutes * 60 * 1000;
-
-  const now = Date.now();
-
-  return candles.filter(c => {
-    const t = new Date(c.time).getTime();
-
-    return (
-      t + bucketSize <= now
-    );
-  });
-}
-
-/* =========================================================
-   INDICATORS
-========================================================= */
-
-function ema(values, period) {
-  if (values.length < period) return null;
-
-  const multiplier =
-    2 / (period + 1);
-
-  let previous = 0;
-
-  for (let i = 0; i < period; i++) {
-    previous += values[i];
+function sma(values, period) {
+  if (values.length < period) {
+    return null;
   }
 
-  previous /= period;
+  const slice =
+    values.slice(values.length - period);
 
-  for (
-    let i = period;
-    i < values.length;
-    i++
-  ) {
-    previous =
-      (values[i] - previous) *
-      multiplier +
-      previous;
-  }
-
-  return previous;
+  return (
+    slice.reduce(
+      (sum, value) => sum + value,
+      0
+    ) / period
+  );
 }
 
 function emaSeries(values, period) {
-  if (values.length < period) return [];
+  const output =
+    new Array(values.length).fill(null);
 
-  const result = [];
+  if (values.length < period) {
+    return output;
+  }
+
+  let sum = 0;
+
+  for (let i = 0; i < period; i++) {
+    sum += values[i];
+  }
+
+  let ema = sum / period;
+
+  output[period - 1] = ema;
 
   const multiplier =
     2 / (period + 1);
-
-  let previous = 0;
-
-  for (let i = 0; i < period; i++) {
-    previous += values[i];
-  }
-
-  previous /= period;
-
-  result.push(previous);
 
   for (
     let i = period;
     i < values.length;
     i++
   ) {
-    previous =
-      (values[i] - previous) *
+    ema =
+      (values[i] - ema) *
       multiplier +
-      previous;
+      ema;
 
-    result.push(previous);
+    output[i] = ema;
   }
 
-  return result;
+  return output;
 }
 
+function ema(values, period) {
+  const series =
+    emaSeries(values, period);
+
+  return series[series.length - 1] ?? null;
+}
+
+/* ==========================================================
+   RSI
+========================================================== */
+
 function rsi(values, period = 14) {
-  if (values.length <= period) return null;
+  if (values.length <= period) {
+    return null;
+  }
 
   let gain = 0;
   let loss = 0;
 
   for (let i = 1; i <= period; i++) {
-    const diff =
+    const change =
       values[i] - values[i - 1];
 
-    if (diff >= 0) gain += diff;
-    else loss -= diff;
+    if (change >= 0) {
+      gain += change;
+    } else {
+      loss += Math.abs(change);
+    }
   }
 
   let avgGain = gain / period;
@@ -526,27 +581,29 @@ function rsi(values, period = 14) {
     i < values.length;
     i++
   ) {
-    const diff =
+    const change =
       values[i] - values[i - 1];
 
     const currentGain =
-      diff > 0 ? diff : 0;
+      Math.max(change, 0);
 
     const currentLoss =
-      diff < 0 ? -diff : 0;
+      Math.max(-change, 0);
 
     avgGain =
-      (avgGain * (period - 1) +
+      ((avgGain * (period - 1)) +
         currentGain) /
       period;
 
     avgLoss =
-      (avgLoss * (period - 1) +
+      ((avgLoss * (period - 1)) +
         currentLoss) /
       period;
   }
 
-  if (avgLoss === 0) return 100;
+  if (avgLoss === 0) {
+    return 100;
+  }
 
   const rs =
     avgGain / avgLoss;
@@ -554,52 +611,61 @@ function rsi(values, period = 14) {
   return 100 - 100 / (1 + rs);
 }
 
-function trueRange(candles, index) {
-  if (index === 0) {
-    return (
-      candles[index].high -
-      candles[index].low
-    );
-  }
-
-  const current = candles[index];
-  const previous = candles[index - 1];
-
-  return Math.max(
-    current.high - current.low,
-    Math.abs(
-      current.high - previous.close
-    ),
-    Math.abs(
-      current.low - previous.close
-    )
-  );
-}
+/* ==========================================================
+   ATR
+========================================================== */
 
 function atr(candles, period = 14) {
-  if (candles.length <= period) return null;
-
-  let value = 0;
-
-  for (let i = 0; i < period; i++) {
-    value += trueRange(candles, i);
+  if (candles.length <= period) {
+    return null;
   }
 
-  value /= period;
+  const trs = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
+
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
+    );
+
+    trs.push(tr);
+  }
+
+  if (trs.length < period) {
+    return null;
+  }
+
+  let value =
+    trs
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) /
+    period;
 
   for (
     let i = period;
-    i < candles.length;
+    i < trs.length;
     i++
   ) {
     value =
-      (value * (period - 1) +
-        trueRange(candles, i)) /
+      ((value * (period - 1)) +
+        trs[i]) /
       period;
   }
 
   return value;
 }
+
+/* ==========================================================
+   ADX
+========================================================== */
 
 function adx(candles, period = 14) {
   if (candles.length < period * 2 + 2) {
@@ -620,6 +686,18 @@ function adx(candles, period = 14) {
     const downMove =
       previous.low - current.low;
 
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
+    );
+
+    trs.push(tr);
+
     plusDM.push(
       upMove > downMove && upMove > 0
         ? upMove
@@ -631,113 +709,121 @@ function adx(candles, period = 14) {
         ? downMove
         : 0
     );
-
-    trs.push(
-      Math.max(
-        current.high - current.low,
-        Math.abs(
-          current.high - previous.close
-        ),
-        Math.abs(
-          current.low - previous.close
-        )
-      )
-    );
   }
 
-  let tr14 = 0;
-  let plus14 = 0;
-  let minus14 = 0;
-
-  for (let i = 0; i < period; i++) {
-    tr14 += trs[i];
-    plus14 += plusDM[i];
-    minus14 += minusDM[i];
+  if (trs.length < period) {
+    return null;
   }
+
+  let atrValue =
+    trs
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) /
+    period;
+
+  let plusValue =
+    plusDM
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) /
+    period;
+
+  let minusValue =
+    minusDM
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) /
+    period;
 
   const dxValues = [];
-
-  function calculateDX() {
-    const plusDI =
-      tr14 === 0
-        ? 0
-        : 100 * (plus14 / tr14);
-
-    const minusDI =
-      tr14 === 0
-        ? 0
-        : 100 * (minus14 / tr14);
-
-    const denominator =
-      plusDI + minusDI;
-
-    if (denominator === 0) return 0;
-
-    return (
-      100 *
-      Math.abs(
-        plusDI - minusDI
-      ) /
-      denominator
-    );
-  }
-
-  dxValues.push(calculateDX());
 
   for (
     let i = period;
     i < trs.length;
     i++
   ) {
-    tr14 =
-      tr14 -
-      tr14 / period +
-      trs[i];
+    if (i > period) {
+      atrValue =
+        ((atrValue * (period - 1)) +
+          trs[i]) /
+        period;
 
-    plus14 =
-      plus14 -
-      plus14 / period +
-      plusDM[i];
+      plusValue =
+        ((plusValue * (period - 1)) +
+          plusDM[i]) /
+        period;
 
-    minus14 =
-      minus14 -
-      minus14 / period +
-      minusDM[i];
+      minusValue =
+        ((minusValue * (period - 1)) +
+          minusDM[i]) /
+        period;
+    }
 
-    dxValues.push(calculateDX());
+    const plusDI =
+      atrValue === 0
+        ? 0
+        : (100 * plusValue) /
+          atrValue;
+
+    const minusDI =
+      atrValue === 0
+        ? 0
+        : (100 * minusValue) /
+          atrValue;
+
+    const denominator =
+      plusDI + minusDI;
+
+    const dx =
+      denominator === 0
+        ? 0
+        : 100 *
+          Math.abs(
+            plusDI - minusDI
+          ) /
+          denominator;
+
+    dxValues.push(dx);
   }
 
   if (dxValues.length < period) {
     return null;
   }
 
-  let result = 0;
-
-  for (let i = 0; i < period; i++) {
-    result += dxValues[i];
-  }
-
-  result /= period;
+  let adxValue =
+    dxValues
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) /
+    period;
 
   for (
     let i = period;
     i < dxValues.length;
     i++
   ) {
-    result =
-      (result * (period - 1) +
+    adxValue =
+      ((adxValue * (period - 1)) +
         dxValues[i]) /
       period;
   }
 
-  return result;
+  return adxValue;
 }
 
-function stochastic(candles, period = 14) {
-  if (candles.length < period) return null;
+/* ==========================================================
+   STOCHASTIC
+========================================================== */
+
+function stochastic(
+  candles,
+  period = 14
+) {
+  if (candles.length < period) {
+    return null;
+  }
 
   const recent =
-    candles.slice(-period);
+    candles.slice(
+      candles.length - period
+    );
 
   const highest =
     Math.max(
@@ -750,7 +836,7 @@ function stochastic(candles, period = 14) {
     );
 
   const close =
-    candles[candles.length - 1].close;
+    recent[recent.length - 1].close;
 
   if (highest === lowest) {
     return 50;
@@ -758,50 +844,65 @@ function stochastic(candles, period = 14) {
 
   return (
     100 *
-    ((close - lowest) /
-      (highest - lowest))
+    (close - lowest) /
+    (highest - lowest)
   );
 }
 
-function bollinger(candles, period = 20) {
-  if (candles.length < period) return null;
+/* ==========================================================
+   BOLLINGER
+========================================================== */
 
-  const values =
-    candles
-      .slice(-period)
-      .map(c => c.close);
+function bollinger(
+  values,
+  period = 20,
+  multiplier = 2
+) {
+  if (values.length < period) {
+    return null;
+  }
 
-  const mean =
-    values.reduce(
+  const recent =
+    values.slice(
+      values.length - period
+    );
+
+  const middle =
+    recent.reduce(
       (a, b) => a + b,
       0
-    ) / values.length;
+    ) / period;
 
   const variance =
-    values.reduce(
+    recent.reduce(
       (sum, value) =>
         sum +
-        Math.pow(value - mean, 2),
+        Math.pow(
+          value - middle,
+          2
+        ),
       0
-    ) / values.length;
+    ) / period;
 
-  const deviation =
+  const std =
     Math.sqrt(variance);
 
   return {
-    middle: mean,
-    upper: mean + 2 * deviation,
-    lower: mean - 2 * deviation
+    middle,
+    upper:
+      middle + multiplier * std,
+    lower:
+      middle - multiplier * std
   };
 }
 
-/* =========================================================
+/* ==========================================================
    SUPPORT / RESISTANCE
-========================================================= */
+========================================================== */
 
-function supportResistance(candles, lookback = 40) {
+function supportResistance(candles) {
   const recent =
-    candles.slice(-lookback);
+    candles.slice(-40);
 
   if (!recent.length) {
     return {
@@ -822,15 +923,15 @@ function supportResistance(candles, lookback = 40) {
   };
 }
 
-/* =========================================================
+/* ==========================================================
    CANDLE PATTERNS
-========================================================= */
+========================================================== */
 
 function candlePattern(candles) {
   if (candles.length < 3) {
     return {
-      name: 'NONE',
       direction: 'NEUTRAL',
+      pattern: 'NONE',
       strength: 0
     };
   }
@@ -844,303 +945,290 @@ function candlePattern(candles) {
   const c =
     candles[candles.length - 1];
 
-  const body =
+  const bodyA =
+    Math.abs(a.close - a.open);
+
+  const bodyB =
+    Math.abs(b.close - b.open);
+
+  const bodyC =
     Math.abs(c.close - c.open);
 
-  const range =
+  const rangeC =
     Math.max(
       c.high - c.low,
       0.00000001
     );
 
-  const upperWick =
-    c.high - Math.max(
-      c.open,
-      c.close
-    );
+  const upperWickC =
+    c.high -
+    Math.max(c.open, c.close);
 
-  const lowerWick =
-    Math.min(
-      c.open,
-      c.close
-    ) - c.low;
+  const lowerWickC =
+    Math.min(c.open, c.close) -
+    c.low;
 
-  const bullish =
-    c.close > c.open;
-
-  const bearish =
-    c.close < c.open;
-
-  /* Bullish engulfing */
-  if (
+  const bullishEngulfing =
     b.close < b.open &&
-    bullish &&
+    c.close > c.open &&
     c.open <= b.close &&
-    c.close >= b.open
-  ) {
-    return {
-      name: 'BULLISH_ENGULFING',
-      direction: 'CALL',
-      strength: 8
-    };
-  }
+    c.close >= b.open;
 
-  /* Bearish engulfing */
-  if (
+  const bearishEngulfing =
     b.close > b.open &&
-    bearish &&
+    c.close < c.open &&
     c.open >= b.close &&
-    c.close <= b.open
+    c.close <= b.open;
+
+  if (bullishEngulfing) {
+    return {
+      direction: 'CALL',
+      pattern: 'BULLISH ENGULFING',
+      strength: 12
+    };
+  }
+
+  if (bearishEngulfing) {
+    return {
+      direction: 'PUT',
+      pattern: 'BEARISH ENGULFING',
+      strength: 12
+    };
+  }
+
+  if (
+    lowerWickC > bodyC * 2 &&
+    lowerWickC > upperWickC &&
+    c.close >= c.open
   ) {
     return {
-      name: 'BEARISH_ENGULFING',
+      direction: 'CALL',
+      pattern: 'HAMMER / LOWER REJECTION',
+      strength: 9
+    };
+  }
+
+  if (
+    upperWickC > bodyC * 2 &&
+    upperWickC > lowerWickC &&
+    c.close <= c.open
+  ) {
+    return {
       direction: 'PUT',
+      pattern: 'SHOOTING STAR / UPPER REJECTION',
+      strength: 9
+    };
+  }
+
+  const bodyRatio =
+    bodyC / rangeC;
+
+  if (
+    bodyRatio >= 0.65 &&
+    c.close > c.open
+  ) {
+    return {
+      direction: 'CALL',
+      pattern: 'STRONG BULLISH CANDLE',
+      strength: 7
+    };
+  }
+
+  if (
+    bodyRatio >= 0.65 &&
+    c.close < c.open
+  ) {
+    return {
+      direction: 'PUT',
+      pattern: 'STRONG BEARISH CANDLE',
+      strength: 7
+    };
+  }
+
+  if (
+    a.close > a.open &&
+    b.close > b.open &&
+    c.close > c.open
+  ) {
+    return {
+      direction: 'CALL',
+      pattern: 'THREE BULLISH CANDLES',
       strength: 8
     };
   }
 
-  /* Hammer */
   if (
-    lowerWick > body * 2 &&
-    upperWick < body * 1.2
+    a.close < a.open &&
+    b.close < b.open &&
+    c.close < c.open
   ) {
     return {
-      name: 'HAMMER',
-      direction: 'CALL',
-      strength: 6
-    };
-  }
-
-  /* Shooting star */
-  if (
-    upperWick > body * 2 &&
-    lowerWick < body * 1.2
-  ) {
-    return {
-      name: 'SHOOTING_STAR',
       direction: 'PUT',
-      strength: 6
-    };
-  }
-
-  /* Strong bullish candle */
-  if (
-    bullish &&
-    body / range > 0.65
-  ) {
-    return {
-      name: 'STRONG_BULLISH',
-      direction: 'CALL',
-      strength: 4
-    };
-  }
-
-  /* Strong bearish candle */
-  if (
-    bearish &&
-    body / range > 0.65
-  ) {
-    return {
-      name: 'STRONG_BEARISH',
-      direction: 'PUT',
-      strength: 4
-    };
-  }
-
-  /*
-  Three candle continuation.
-  */
-  if (
-    a.close < b.close &&
-    b.close < c.close
-  ) {
-    return {
-      name: 'THREE_CANDLE_UP',
-      direction: 'CALL',
-      strength: 5
-    };
-  }
-
-  if (
-    a.close > b.close &&
-    b.close > c.close
-  ) {
-    return {
-      name: 'THREE_CANDLE_DOWN',
-      direction: 'PUT',
-      strength: 5
+      pattern: 'THREE BEARISH CANDLES',
+      strength: 8
     };
   }
 
   return {
-    name: 'NEUTRAL',
     direction: 'NEUTRAL',
+    pattern: 'MIXED PRICE ACTION',
     strength: 0
   };
 }
 
-/* =========================================================
+/* ==========================================================
    MARKET PSYCHOLOGY
-========================================================= */
+========================================================== */
 
 function marketPsychology(
   candles,
-  ema9,
-  ema21,
-  rsiValue,
-  adxValue
+  ema9Value,
+  ema21Value,
+  adxValue,
+  rsiValue
 ) {
-  const latest =
+  const last =
     candles[candles.length - 1];
 
   const previous =
     candles[candles.length - 2];
 
-  if (!latest || !previous) {
-    return {
-      label: 'NEUTRAL',
-      direction: 'NEUTRAL',
-      score: 0
-    };
-  }
+  const move =
+    last.close - previous.close;
 
   const body =
     Math.abs(
-      latest.close - latest.open
+      last.close - last.open
     );
 
   const range =
     Math.max(
-      latest.high - latest.low,
+      last.high - last.low,
       0.00000001
     );
 
   const bodyRatio =
     body / range;
 
-  let score = 0;
-  let direction = 'NEUTRAL';
-  let label = 'BALANCED';
-
   if (
-    ema9 !== null &&
-    ema21 !== null &&
-    ema9 > ema21
+    ema9Value > ema21Value &&
+    move > 0 &&
+    adxValue >= 25 &&
+    rsiValue >= 50
   ) {
-    score += 2;
-    direction = 'CALL';
+    return {
+      direction: 'CALL',
+      label: 'Bullish momentum / buyers in control',
+      strength: 8
+    };
   }
 
   if (
-    ema9 !== null &&
-    ema21 !== null &&
-    ema9 < ema21
+    ema9Value < ema21Value &&
+    move < 0 &&
+    adxValue >= 25 &&
+    rsiValue <= 50
   ) {
-    score -= 2;
-    direction = 'PUT';
+    return {
+      direction: 'PUT',
+      label: 'Bearish momentum / sellers in control',
+      strength: 8
+    };
   }
 
   if (
-    latest.close > previous.close
+    bodyRatio < 0.25
   ) {
-    score += 1;
-  } else if (
-    latest.close < previous.close
-  ) {
-    score -= 1;
+    return {
+      direction: 'NEUTRAL',
+      label: 'Indecision / weak conviction',
+      strength: 0
+    };
   }
 
-  if (
-    bodyRatio >= 0.65
-  ) {
-    score +=
-      latest.close > latest.open
-        ? 2
-        : -2;
+  if (move > 0) {
+    return {
+      direction: 'CALL',
+      label: 'Short-term bullish pressure',
+      strength: 4
+    };
   }
 
-  if (
-    Number.isFinite(adxValue) &&
-    adxValue >= 25
-  ) {
-    score +=
-      direction === 'CALL'
-        ? 1
-        : direction === 'PUT'
-          ? -1
-          : 0;
-  }
-
-  if (
-    Number.isFinite(rsiValue)
-  ) {
-    if (rsiValue > 55) score += 1;
-    if (rsiValue < 45) score -= 1;
-  }
-
-  if (score >= 4) {
-    label = 'BULLISH_PRESSURE';
-    direction = 'CALL';
-  } else if (score <= -4) {
-    label = 'BEARISH_PRESSURE';
-    direction = 'PUT';
-  } else if (score >= 2) {
-    label = 'MILD_BULLISH';
-    direction = 'CALL';
-  } else if (score <= -2) {
-    label = 'MILD_BEARISH';
-    direction = 'PUT';
-  } else {
-    label = 'BALANCED';
-    direction = 'NEUTRAL';
+  if (move < 0) {
+    return {
+      direction: 'PUT',
+      label: 'Short-term bearish pressure',
+      strength: 4
+    };
   }
 
   return {
-    label,
-    direction,
-    score
+    direction: 'NEUTRAL',
+    label: 'Balanced market',
+    strength: 0
   };
 }
 
-/* =========================================================
+/* ==========================================================
+   TIME HELPERS
+========================================================== */
+
+function nextBoundary(
+  timestamp,
+  minutes
+) {
+  const size =
+    minutes * 60 * 1000;
+
+  return (
+    Math.floor(
+      timestamp / size
+    ) + 1
+  ) * size;
+}
+
+/* ==========================================================
    ANALYZE TIMEFRAME
-========================================================= */
+========================================================== */
 
 function analyzeTimeframe(
   pair,
   timeframe,
   candles
 ) {
-  if (candles.length < MIN_CANDLES / timeframe) {
+  if (
+    !Array.isArray(candles) ||
+    candles.length < MIN_CANDLES
+  ) {
     return null;
   }
 
   const closes =
     candles.map(c => c.close);
 
-  const ema9 =
+  const ema9Value =
     ema(closes, 9);
 
-  const ema21 =
+  const ema21Value =
     ema(closes, 21);
 
   const rsiValue =
     rsi(closes, 14);
 
-  const adxValue =
-    adx(candles, 14);
-
   const atrValue =
     atr(candles, 14);
+
+  const adxValue =
+    adx(candles, 14);
 
   const stochasticValue =
     stochastic(candles, 14);
 
-  const bollingerValue =
-    bollinger(candles, 20);
+  const bb =
+    bollinger(closes, 20, 2);
 
   const sr =
-    supportResistance(candles, 40);
+    supportResistance(candles);
 
   const pattern =
     candlePattern(candles);
@@ -1148,96 +1236,117 @@ function analyzeTimeframe(
   const psychology =
     marketPsychology(
       candles,
-      ema9,
-      ema21,
-      rsiValue,
-      adxValue
+      ema9Value,
+      ema21Value,
+      adxValue,
+      rsiValue
     );
 
-  const current =
+  const last =
     candles[candles.length - 1];
 
-  const price =
-    current.close;
+  const currentPrice =
+    last.close;
 
   let callScore = 0;
   let putScore = 0;
 
-  /* =======================================================
-     EMA
-  ======================================================= */
+  const reasons = [];
 
+  /* EMA */
   if (
-    ema9 !== null &&
-    ema21 !== null
+    ema9Value !== null &&
+    ema21Value !== null
   ) {
-    if (ema9 > ema21) {
+    if (ema9Value > ema21Value) {
       callScore += 20;
-    } else if (ema9 < ema21) {
+
+      reasons.push(
+        'EMA9 is above EMA21'
+      );
+    } else if (
+      ema9Value < ema21Value
+    ) {
       putScore += 20;
+
+      reasons.push(
+        'EMA9 is below EMA21'
+      );
     }
   }
 
-  /* =======================================================
-     RSI
-  ======================================================= */
-
+  /* RSI */
   if (rsiValue !== null) {
     if (
       rsiValue >= 52 &&
       rsiValue <= 68
     ) {
       callScore += 12;
-    }
 
-    if (
-      rsiValue <= 48 &&
-      rsiValue >= 32
+      reasons.push(
+        'RSI supports bullish momentum'
+      );
+    } else if (
+      rsiValue >= 32 &&
+      rsiValue <= 48
     ) {
       putScore += 12;
-    }
 
-    /*
-    Avoid blindly buying extreme RSI.
-    */
-    if (rsiValue > 75) {
+      reasons.push(
+        'RSI supports bearish momentum'
+      );
+    } else if (
+      rsiValue > 75
+    ) {
       putScore += 4;
-    }
 
-    if (rsiValue < 25) {
+      reasons.push(
+        'RSI is overbought'
+      );
+    } else if (
+      rsiValue < 25
+    ) {
       callScore += 4;
+
+      reasons.push(
+        'RSI is oversold'
+      );
     }
   }
 
-  /* =======================================================
-     ADX
-  ======================================================= */
-
-  if (adxValue !== null) {
+  /* ADX */
+  if (
+    adxValue !== null
+  ) {
     if (adxValue >= 25) {
       if (
-        ema9 !== null &&
-        ema21 !== null
+        ema9Value > ema21Value
       ) {
-        if (ema9 > ema21) {
-          callScore += 15;
-        } else {
-          putScore += 15;
-        }
+        callScore += 15;
+
+        reasons.push(
+          'ADX confirms trend strength'
+        );
+      } else if (
+        ema9Value < ema21Value
+      ) {
+        putScore += 15;
+
+        reasons.push(
+          'ADX confirms trend strength'
+        );
       }
     } else {
-      /*
-      Weak trend = reduce confidence.
-      */
       callScore -= 4;
       putScore -= 4;
+
+      reasons.push(
+        'ADX shows weak trend strength'
+      );
     }
   }
 
-  /* =======================================================
-     STOCHASTIC
-  ======================================================= */
-
+  /* Stochastic */
   if (
     stochasticValue !== null
   ) {
@@ -1246,127 +1355,144 @@ function analyzeTimeframe(
       stochasticValue <= 85
     ) {
       callScore += 8;
-    }
 
-    if (
-      stochasticValue <= 50 &&
-      stochasticValue >= 15
+      reasons.push(
+        'Stochastic supports CALL momentum'
+      );
+    } else if (
+      stochasticValue >= 15 &&
+      stochasticValue < 50
     ) {
       putScore += 8;
+
+      reasons.push(
+        'Stochastic supports PUT momentum'
+      );
     }
   }
 
-  /* =======================================================
-     PRICE ACTION
-  ======================================================= */
-
-  if (
-    pattern.direction === 'CALL'
-  ) {
+  /* Pattern */
+  if (pattern.direction === 'CALL') {
     callScore += pattern.strength;
+
+    reasons.push(
+      pattern.pattern
+    );
   }
 
-  if (
-    pattern.direction === 'PUT'
-  ) {
+  if (pattern.direction === 'PUT') {
     putScore += pattern.strength;
+
+    reasons.push(
+      pattern.pattern
+    );
   }
 
-  /* =======================================================
-     PSYCHOLOGY
-  ======================================================= */
-
+  /* Psychology */
   if (
     psychology.direction === 'CALL'
   ) {
-    callScore += 8;
+    callScore += psychology.strength;
+
+    reasons.push(
+      psychology.label
+    );
   }
 
   if (
     psychology.direction === 'PUT'
   ) {
-    putScore += 8;
+    putScore += psychology.strength;
+
+    reasons.push(
+      psychology.label
+    );
   }
 
-  /* =======================================================
-     SUPPORT / RESISTANCE
-  ======================================================= */
-
-  let nearSupport = false;
-  let nearResistance = false;
-
+  /* Support / resistance */
   if (
     sr.support !== null &&
-    atrValue !== null
-  ) {
-    const distance =
-      Math.abs(
-        price - sr.support
-      );
-
-    nearSupport =
-      distance <= atrValue * 0.8;
-  }
-
-  if (
     sr.resistance !== null &&
     atrValue !== null
   ) {
-    const distance =
+    const supportDistance =
       Math.abs(
-        sr.resistance - price
+        currentPrice - sr.support
       );
 
-    nearResistance =
-      distance <= atrValue * 0.8;
-  }
+    const resistanceDistance =
+      Math.abs(
+        currentPrice - sr.resistance
+      );
 
-  if (nearSupport) {
-    callScore += 6;
-  }
-
-  if (nearResistance) {
-    putScore += 6;
-  }
-
-  /* =======================================================
-     BOLLINGER
-  ======================================================= */
-
-  if (bollingerValue) {
     if (
-      price >
-      bollingerValue.middle
+      supportDistance <=
+      atrValue * 0.8
+    ) {
+      callScore += 6;
+
+      reasons.push(
+        'Price is near support'
+      );
+    }
+
+    if (
+      resistanceDistance <=
+      atrValue * 0.8
+    ) {
+      putScore += 6;
+
+      reasons.push(
+        'Price is near resistance'
+      );
+    }
+  }
+
+  /* Bollinger */
+  if (
+    bb &&
+    atrValue !== null
+  ) {
+    if (
+      currentPrice > bb.middle
     ) {
       callScore += 3;
-    } else if (
-      price <
-      bollingerValue.middle
+    }
+
+    if (
+      currentPrice < bb.middle
     ) {
       putScore += 3;
     }
 
-    /*
-    Do not chase extreme outer band.
-    */
     if (
-      price >=
-      bollingerValue.upper
+      currentPrice >= bb.upper
     ) {
       callScore -= 5;
+      putScore += 3;
+
+      reasons.push(
+        'Price is near Bollinger upper band'
+      );
     }
 
     if (
-      price <=
-      bollingerValue.lower
+      currentPrice <= bb.lower
     ) {
       putScore -= 5;
+      callScore += 3;
+
+      reasons.push(
+        'Price is near Bollinger lower band'
+      );
     }
   }
 
-  /* =======================================================
-     FINAL DIRECTION
-  ======================================================= */
+  callScore =
+    Math.max(0, callScore);
+
+  putScore =
+    Math.max(0, putScore);
 
   const strongestScore =
     Math.max(
@@ -1381,9 +1507,8 @@ function analyzeTimeframe(
     );
 
   const gap =
-    Math.abs(
-      callScore - putScore
-    );
+    strongestScore -
+    weakestScore;
 
   let signal = 'NO TRADE';
 
@@ -1393,9 +1518,7 @@ function analyzeTimeframe(
     gap >= 12
   ) {
     signal = 'CALL';
-  }
-
-  if (
+  } else if (
     putScore >= 55 &&
     putScore > callScore &&
     gap >= 12
@@ -1403,133 +1526,142 @@ function analyzeTimeframe(
     signal = 'PUT';
   }
 
-  /*
-  Confidence is deliberately conservative.
-  */
+  /* Volatility */
+  let volatility = 'NORMAL';
+
+  if (
+    atrValue !== null &&
+    currentPrice > 0
+  ) {
+    const atrPercent =
+      (atrValue / currentPrice) *
+      100;
+
+    if (atrPercent >= 0.12) {
+      volatility = 'HIGH';
+    } else if (
+      atrPercent <= 0.03
+    ) {
+      volatility = 'LOW';
+    }
+  }
+
   let confidence =
     50 +
     (strongestScore - 55) * 0.7 +
     gap * 0.55;
 
-  if (signal === 'NO TRADE') {
-    confidence =
-      Math.min(
-        59,
-        45 + gap * 0.35
-      );
+  if (
+    volatility === 'HIGH'
+  ) {
+    confidence -= 5;
   }
 
   confidence =
-    Math.round(
-      clamp(
-        confidence,
-        45,
-        97
-      )
+    clamp(
+      confidence,
+      45,
+      97
     );
 
-  /*
-  Volatility quality.
-  */
-  let volatilityQuality =
-    'NORMAL';
-
   if (
-    atrValue !== null &&
-    price !== 0
-  ) {
-    const atrPercent =
-      (atrValue / price) * 100;
-
-    if (atrPercent < 0.01) {
-      volatilityQuality = 'LOW';
-    } else if (
-      atrPercent > 0.25
-    ) {
-      volatilityQuality = 'HIGH';
-    }
-  }
-
-  /*
-  If volatility is extremely high,
-  do not pretend confidence is higher.
-  */
-  if (
-    volatilityQuality === 'HIGH'
+    signal === 'NO TRADE'
   ) {
     confidence =
-      Math.max(
-        45,
-        confidence - 5
+      Math.min(
+        confidence,
+        59
       );
   }
 
-  const candleTime =
-    new Date(current.time);
+  /* Entry / expiry */
+  const now = nowMs();
 
-  const bucketMs =
-    timeframe *
-    60 *
-    1000;
-
-  /*
-  Entry is the next candle opening time.
-  */
-  const entryDate =
-    new Date(
-      candleTime.getTime() +
-      bucketMs
+  let entryTime =
+    nextBoundary(
+      now,
+      timeframe
     );
 
-  /*
-  If the calculated entry is too close,
-  move to the following candle.
-  */
-  const secondsToEntry =
+  let secondsToEntry =
     Math.floor(
-      (entryDate.getTime() -
-        Date.now()) /
+      (entryTime - now) /
       1000
     );
-
-  let finalEntry =
-    entryDate;
 
   if (
     secondsToEntry <
     ENTRY_BUFFER_SECONDS
   ) {
-    finalEntry =
-      new Date(
-        entryDate.getTime() +
-        bucketMs
+    entryTime +=
+      timeframe *
+      60 *
+      1000;
+
+    secondsToEntry =
+      Math.floor(
+        (entryTime - now) /
+        1000
       );
   }
 
-  const expiryDate =
-    new Date(
-      finalEntry.getTime() +
-      bucketMs
-    );
+  const expiryTime =
+    entryTime +
+    timeframe *
+    60 *
+    1000;
 
-  const finalEntryInSeconds =
+  /*
+   If the entry is too close, do not expose
+   a risky immediate signal.
+  */
+  if (
+    secondsToEntry < 15
+  ) {
+    signal = 'NO TRADE';
+    confidence =
+      Math.min(
+        confidence,
+        59
+      );
+  }
+
+  const latestCandleAgeSeconds =
     Math.max(
       0,
       Math.floor(
-        (finalEntry.getTime() -
-          Date.now()) /
+        (now - last.time) /
         1000
       )
     );
 
-  /*
-  Signal should not be too close to expiry.
-  */
   if (
-    finalEntryInSeconds < 15
+    latestCandleAgeSeconds >
+    HARD_STALE_SECONDS
   ) {
     signal = 'NO TRADE';
+
+    confidence =
+      Math.min(
+        confidence,
+        55
+      );
+
+    reasons.push(
+      'Market data is too old'
+    );
   }
+
+  if (
+    signal === 'NO TRADE'
+  ) {
+    reasons.push(
+      'Signal quality threshold not fully confirmed'
+    );
+  }
+
+  const entryPrice =
+    currentPrice;
 
   return {
     pair,
@@ -1537,74 +1669,86 @@ function analyzeTimeframe(
 
     signal,
 
-    confidence,
+    confidence:
+      Math.round(confidence),
 
-    currentPrice: round(
-      price,
-      6
-    ),
+    currentPrice:
+      round(currentPrice, 6),
+
+    entryPrice:
+      round(entryPrice, 6),
 
     entryTime:
-      finalEntry.toISOString(),
+      new Date(entryTime).toISOString(),
 
     expiryTime:
-      expiryDate.toISOString(),
+      new Date(expiryTime).toISOString(),
 
     entryInSeconds:
-      finalEntryInSeconds,
+      Math.max(
+        0,
+        secondsToEntry
+      ),
 
     lastCandle:
-      current.time,
+      new Date(last.time).toISOString(),
+
+    dataAgeSeconds:
+      latestCandleAgeSeconds,
+
+    callScore:
+      round(callScore, 2),
+
+    putScore:
+      round(putScore, 2),
+
+    gap:
+      round(gap, 2),
+
+    volatility,
 
     indicators: {
-      ema9: round(ema9, 6),
-      ema21: round(ema21, 6),
-      rsi14: round(rsiValue, 2),
-      adx14: round(adxValue, 2),
-      atr14: round(atrValue, 6),
-      stochastic14: round(
-        stochasticValue,
-        2
-      ),
+      ema9:
+        round(ema9Value, 6),
 
-      support: round(
-        sr.support,
-        6
-      ),
+      ema21:
+        round(ema21Value, 6),
 
-      resistance: round(
-        sr.resistance,
-        6
-      ),
+      rsi14:
+        round(rsiValue, 2),
 
-      bollingerUpper:
-        bollingerValue
-          ? round(
-              bollingerValue.upper,
-              6
-            )
-          : null,
+      adx14:
+        round(adxValue, 2),
 
-      bollingerMiddle:
-        bollingerValue
-          ? round(
-              bollingerValue.middle,
-              6
-            )
-          : null,
+      stochastic14:
+        round(stochasticValue, 2),
 
-      bollingerLower:
-        bollingerValue
-          ? round(
-              bollingerValue.lower,
-              6
-            )
-          : null
+      atr14:
+        round(atrValue, 6),
+
+      bollinger: bb
+        ? {
+            upper:
+              round(bb.upper, 6),
+            middle:
+              round(bb.middle, 6),
+            lower:
+              round(bb.lower, 6)
+          }
+        : null
+    },
+
+    supportResistance: {
+      support:
+        round(sr.support, 6),
+
+      resistance:
+        round(sr.resistance, 6)
     },
 
     priceAction: {
       pattern:
-        pattern.name,
+        pattern.pattern,
 
       direction:
         pattern.direction,
@@ -1620,206 +1764,424 @@ function analyzeTimeframe(
       direction:
         psychology.direction,
 
-      score:
-        psychology.score
+      strength:
+        psychology.strength
     },
 
-    score: {
-      call:
-        round(callScore, 2),
-
-      put:
-        round(putScore, 2),
-
-      gap:
-        round(gap, 2)
-    },
-
-    quality: {
-      volatility:
-        volatilityQuality,
-
-      nearSupport,
-      nearResistance
-    }
+    reasons:
+      [...new Set(reasons)].slice(0, 10)
   };
 }
 
-/* =========================================================
-   PAIR ANALYSIS
-========================================================= */
+/* ==========================================================
+   ANALYZE PAIR
+========================================================== */
 
-function analyzePair(pairData) {
-  const results = [];
+function analyzePairFromCandles(
+  pair,
+  candles
+) {
+  const completed =
+    completedCandles(candles);
+
+  const analyses = {};
 
   for (const timeframe of TIMEFRAMES) {
-    const aggregated =
+    const tfCandles =
       aggregateCandles(
-        pairData.candles,
+        completed,
         timeframe
       );
 
-    const completed =
-      completedCandles(
-        aggregated,
-        timeframe
-      );
-
-    const result =
-      analyzeTimeframe(
-        pairData.pair,
-        timeframe,
-        completed
-      );
-
-    if (result) {
-      results.push(result);
+    if (
+      tfCandles.length >= MIN_CANDLES
+    ) {
+      analyses[timeframe] =
+        analyzeTimeframe(
+          pair,
+          timeframe,
+          tfCandles
+        );
+    } else {
+      analyses[timeframe] = null;
     }
   }
 
-  return results;
+  return analyses;
 }
 
-/* =========================================================
-   CACHE
-========================================================= */
+/* ==========================================================
+   CACHE HELPERS
+========================================================== */
 
-function getCachedPair(pair) {
-  const item =
+function cacheFresh(entry) {
+  if (!entry) {
+    return false;
+  }
+
+  return (
+    nowMs() - entry.fetchedAt <=
+    PAIR_CACHE_TTL_MS
+  );
+}
+
+function cacheUsable(entry) {
+  if (!entry) {
+    return false;
+  }
+
+  if (
+    !entry.candles ||
+    !entry.candles.length
+  ) {
+    return false;
+  }
+
+  const latest =
+    entry.candles[
+      entry.candles.length - 1
+    ];
+
+  const age =
+    Math.max(
+      0,
+      Math.floor(
+        (nowMs() - latest.time) /
+        1000
+      )
+    );
+
+  return (
+    age <= HARD_STALE_SECONDS
+  );
+}
+
+/* ==========================================================
+   FETCH + ANALYZE PAIR
+========================================================== */
+
+async function refreshPair(pair) {
+  const existing =
     pairCache.get(pair);
 
-  if (!item) return null;
-
   if (
-    Date.now() - item.cachedAt >
-    PAIR_CACHE_TTL_MS
+    existing &&
+    cacheFresh(existing) &&
+    cacheUsable(existing)
   ) {
-    return null;
+    return existing;
   }
 
-  return item;
-}
+  try {
+    const candles =
+      await fetchOneMinuteCandles(pair);
 
-function getAnyPairCache(pair) {
-  return pairCache.get(pair) || null;
-}
+    const analyses =
+      analyzePairFromCandles(
+        pair,
+        candles
+      );
 
-function setPairCache(pair, data) {
-  pairCache.set(
-    pair,
-    {
-      ...data,
-      cachedAt: Date.now()
+    const entry = {
+      pair,
+      candles,
+      analyses,
+      fetchedAt: nowMs(),
+      source: SOURCE
+    };
+
+    pairCache.set(
+      pair,
+      entry
+    );
+
+    totalScanned += 1;
+
+    return entry;
+  } catch (error) {
+    totalFailed += 1;
+
+    /*
+     Stale-cache fallback.
+     We still use it only while it is inside
+     the hard stale window.
+    */
+    if (
+      existing &&
+      cacheUsable(existing)
+    ) {
+      existing.lastError =
+        error.message;
+
+      return existing;
     }
-  );
+
+    throw error;
+  }
 }
 
-function getCachedResult(key) {
-  const item =
-    resultCache.get(key);
+/* ==========================================================
+   CANDIDATES
+========================================================== */
 
-  if (!item) return null;
+function collectCandidates() {
+  const candidates = [];
 
-  if (
-    Date.now() - item.cachedAt >
-    RESULT_CACHE_TTL_MS
-  ) {
-    resultCache.delete(key);
-    return null;
+  for (const pair of PAIRS) {
+    const entry =
+      pairCache.get(pair);
+
+    if (!entry) {
+      continue;
+    }
+
+    if (!cacheUsable(entry)) {
+      continue;
+    }
+
+    for (const timeframe of TIMEFRAMES) {
+      const market =
+        entry.analyses?.[timeframe];
+
+      if (!market) {
+        continue;
+      }
+
+      candidates.push({
+        ...market
+      });
+    }
   }
 
-  return item.value;
+  return candidates;
 }
 
-function setCachedResult(key, value) {
-  resultCache.set(
-    key,
-    {
-      value,
-      cachedAt: Date.now()
-    }
-  );
-}
-
-/* =========================================================
+/* ==========================================================
    RANKING
-========================================================= */
+========================================================== */
 
-function rankingScore(result) {
-  if (!result) return -9999;
-
+function rankingScore(market) {
   let score =
-    result.confidence;
+    Number(market.confidence || 0);
 
   if (
-    result.signal === 'NO TRADE'
+    market.signal === 'NO TRADE'
   ) {
     score -= 30;
   }
 
   score +=
     Math.min(
-      15,
-      result.score.gap
+      Number(market.gap || 0),
+      15
     );
 
   if (
-    result.indicators.adx14 !== null &&
-    result.indicators.adx14 >= 25
+    Number(
+      market.indicators?.adx14 || 0
+    ) >= 25
   ) {
     score += 5;
   }
 
+  const entrySeconds =
+    Number(
+      market.entryInSeconds || 0
+    );
+
   if (
-    result.entryInSeconds >= 30 &&
-    result.entryInSeconds <= 180
+    entrySeconds >= 30 &&
+    entrySeconds <= 180
   ) {
     score += 4;
   }
 
   if (
-    result.quality.volatility ===
-    'HIGH'
+    market.volatility === 'HIGH'
   ) {
     score -= 5;
+  }
+
+  if (
+    Number(
+      market.dataAgeSeconds || 0
+    ) > MAX_DATA_AGE_SECONDS
+  ) {
+    score -= 8;
   }
 
   return score;
 }
 
-function chooseBest(results) {
-  if (!results.length) {
+function chooseBest(candidates) {
+  if (!candidates.length) {
     return null;
   }
 
-  const sorted =
-    results
-      .slice()
-      .sort(
-        (a, b) =>
-          rankingScore(b) -
-          rankingScore(a)
-      );
-
-  return sorted[0];
+  return candidates
+    .slice()
+    .sort(
+      (a, b) =>
+        rankingScore(b) -
+        rankingScore(a)
+    )[0];
 }
 
-/* =========================================================
-   BUILD API CONTRACT
-========================================================= */
+/* ==========================================================
+   SCANNER
+========================================================== */
+
+async function scanBatch() {
+  /*
+   If another scan is active, return the SAME promise.
+   This is the important synchronization fix.
+  */
+  if (scanRunning && scanPromise) {
+    return scanPromise;
+  }
+
+  scanRunning = true;
+
+  scanPromise =
+    (async () => {
+      let localError = null;
+
+      try {
+        const start =
+          scanCursor;
+
+        const batch =
+          [];
+
+        for (
+          let i = 0;
+          i < SCAN_BATCH_SIZE;
+          i++
+        ) {
+          const index =
+            (start + i) %
+            PAIRS.length;
+
+          batch.push(
+            PAIRS[index]
+          );
+        }
+
+        for (
+          let i = 0;
+          i < batch.length;
+          i++
+        ) {
+          const pair =
+            batch[i];
+
+          try {
+            await refreshPair(pair);
+          } catch (error) {
+            localError =
+              `${pair}: ${error.message}`;
+          }
+
+          if (
+            i <
+            batch.length - 1
+          ) {
+            await sleep(
+              SCAN_PAIR_DELAY_MS
+            );
+          }
+        }
+
+        scanCursor =
+          (start +
+            batch.length) %
+          PAIRS.length;
+
+        lastScanAt =
+          new Date().toISOString();
+
+        lastScanError =
+          localError;
+
+        /*
+         A new scan invalidates the old ranking result.
+        */
+        bestResultCache = null;
+
+        return {
+          ok: true,
+          scannedPairs: batch,
+          error: localError
+        };
+      } finally {
+        scanRunning = false;
+        scanPromise = null;
+      }
+    })();
+
+  return scanPromise;
+}
+
+/* ==========================================================
+   ENSURE DATA
+========================================================== */
+
+async function ensureCandidates() {
+  let candidates =
+    collectCandidates();
+
+  if (candidates.length > 0) {
+    return candidates;
+  }
+
+  /*
+   No candidates.
+   Force/wait for a synchronized scan.
+  */
+  await scanBatch();
+
+  candidates =
+    collectCandidates();
+
+  /*
+   If we still have no candidate, try one more
+   available batch only when the provider allows it.
+  */
+  if (!candidates.length) {
+    const permission =
+      canRequestProvider();
+
+    if (permission.ok) {
+      await scanBatch();
+      candidates =
+        collectCandidates();
+    }
+  }
+
+  return candidates;
+}
+
+/* ==========================================================
+   API RESPONSE
+========================================================== */
 
 function buildApiResponse(
   selectedMarket,
   extra = {}
 ) {
+  resetDailyUsageIfNeeded();
+
   return {
     ok: true,
 
-    version: VERSION,
+    version:
+      VERSION,
 
-    source: SOURCE,
+    source:
+      SOURCE,
 
-    timezone: TIMEZONE,
+    timezone:
+      TIMEZONE,
 
     selectedMarket:
       selectedMarket || null,
@@ -1827,16 +2189,21 @@ function buildApiResponse(
     supportedTimeframes:
       TIMEFRAMES,
 
-    pairs: PAIRS.length,
+    pairs:
+      PAIRS,
 
     metadata: {
       provider:
-        'Twelve Data',
+        SOURCE,
 
-      liveOnly: true,
+      liveOnly:
+        true,
 
       providerMinuteLimit:
         PROVIDER_MINUTE_LIMIT,
+
+      providerRequestsThisMinute:
+        providerRequestsInCurrentMinute(),
 
       dailyLimit:
         DAILY_REQUEST_LIMIT,
@@ -1844,24 +2211,29 @@ function buildApiResponse(
       dailySafetyReserve:
         DAILY_SAFETY_RESERVE,
 
+      maxDailyRequests:
+        MAX_DAILY_REQUESTS,
+
       dailyCreditsUsed:
         dailyCreditsUsed,
 
       dailyCreditsRemaining:
-        Math.max(
-          0,
-          EFFECTIVE_DAILY_LIMIT -
-            dailyCreditsUsed
-        ),
+        remainingDailyCredits(),
 
-      cacheTTLSeconds:
+      pairCacheTtlSeconds:
         PAIR_CACHE_TTL_MS / 1000,
 
-      resultTTLSeconds:
+      resultCacheTtlSeconds:
         RESULT_CACHE_TTL_MS / 1000,
 
       entryBufferSeconds:
-        ENTRY_BUFFER_SECONDS
+        ENTRY_BUFFER_SECONDS,
+
+      maxDataAgeSeconds:
+        MAX_DATA_AGE_SECONDS,
+
+      hardStaleSeconds:
+        HARD_STALE_SECONDS
     },
 
     scanner: {
@@ -1871,6 +2243,12 @@ function buildApiResponse(
 
       scanBatchSize:
         SCAN_BATCH_SIZE,
+
+      cachedPairs:
+        pairCache.size,
+
+      candidateCount:
+        collectCandidates().length,
 
       lastScanAt,
 
@@ -1887,362 +2265,118 @@ function buildApiResponse(
   };
 }
 
-/* =========================================================
-   SCAN ONE PAIR
-========================================================= */
-
-async function scanPair(pair) {
-  try {
-    let pairData =
-      getCachedPair(pair);
-
-    if (!pairData) {
-      pairData =
-        await fetchPairFromProvider(
-          pair
-        );
-
-      setPairCache(
-        pair,
-        pairData
-      );
-    }
-
-    const analyses =
-      analyzePair(pairData);
-
-    if (!analyses.length) {
-      throw new Error(
-        `${pair}: no valid timeframe analysis`
-      );
-    }
-
-    totalScanned += 1;
-
-    return {
-      pair,
-      data: pairData,
-      analyses
-    };
-  } catch (error) {
-    totalFailed += 1;
-
-    /*
-    Stale cache fallback.
-    */
-    const stale =
-      getAnyPairCache(pair);
-
-    if (stale) {
-      try {
-        const analyses =
-          analyzePair(stale);
-
-        if (analyses.length) {
-          return {
-            pair,
-            data: stale,
-            analyses,
-            stale: true
-          };
-        }
-      } catch {
-        /* continue */
-      }
-    }
-
-    throw error;
-  }
-}
-
-/* =========================================================
-   FULL / BATCH SCAN
-========================================================= */
-
-async function scanBatch() {
-  if (scanRunning) {
-    return;
-  }
-
-  scanRunning = true;
-  lastScanError = null;
-
-  try {
-    let processed = 0;
-
-    /*
-    Start at cursor.
-    */
-    while (
-      processed < SCAN_BATCH_SIZE &&
-      scanCursor < PAIRS.length
-    ) {
-      const pair =
-        PAIRS[scanCursor];
-
-      try {
-        await scanPair(pair);
-      } catch (error) {
-        lastScanError =
-          `${pair}: ${error.message}`;
-      }
-
-      scanCursor += 1;
-      processed += 1;
-
-      /*
-      Respect provider spacing.
-      */
-      if (
-        processed < SCAN_BATCH_SIZE
-      ) {
-        await sleep(1500);
-      }
-    }
-
-    /*
-    When all pairs are visited,
-    restart cursor for next cycle.
-    */
-    if (
-      scanCursor >= PAIRS.length
-    ) {
-      scanCursor = 0;
-    }
-
-    lastScanAt =
-      new Date().toISOString();
-  } finally {
-    scanRunning = false;
-  }
-}
-
-/*
-Background scanner.
-
-Because requests are rate-limited,
-the scanner processes only a safe batch.
-*/
-setInterval(() => {
-  scanBatch().catch(error => {
-    lastScanError =
-      error.message;
-  });
-}, SCAN_INTERVAL_MS);
-
-/* =========================================================
-   BEST MARKET
-========================================================= */
-
-async function getBestMarket() {
-  const cacheKey =
-    'BEST_MARKET';
-
-  const cached =
-    getCachedResult(cacheKey);
-
-  if (cached) {
-    return cached;
-  }
-
-  /*
-  First collect already-cached analyses.
-  */
-  const candidates = [];
-
-  for (const pair of PAIRS) {
-    const cachedPair =
-      getAnyPairCache(pair);
-
-    if (!cachedPair) {
-      continue;
-    }
-
-    try {
-      const analyses =
-        analyzePair(cachedPair);
-
-      for (const analysis of analyses) {
-        candidates.push(
-          analysis
-        );
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
-  /*
-  If there is not enough cached data,
-  synchronously fill a safe batch.
-  */
-  if (
-    candidates.length === 0
-  ) {
-    await scanBatch();
-
-    for (const pair of PAIRS) {
-      const cachedPair =
-        getAnyPairCache(pair);
-
-      if (!cachedPair) continue;
-
-      try {
-        const analyses =
-          analyzePair(cachedPair);
-
-        candidates.push(
-          ...analyses
-        );
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  const best =
-    chooseBest(candidates);
-
-  if (!best) {
-    return null;
-  }
-
-  const response =
-    buildApiResponse(
-      best,
-      {
-        candidateCount:
-          candidates.length
-      }
-    );
-
-  setCachedResult(
-    cacheKey,
-    response
-  );
-
-  return response;
-}
-
-/* =========================================================
-   ROUTES
-========================================================= */
-
-app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    name: 'PO AI Predictor',
-    version: VERSION,
-    source: SOURCE,
-    message:
-      'PO AI Predictor API is running',
-    endpoints: [
-      '/api/health',
-      '/api/best',
-      '/api/analyze?pair=EUR/USD',
-      '/api/pairs'
-    ]
-  });
-});
-
-/* ---------------------------------------------------------
-   HEALTH
---------------------------------------------------------- */
-
-app.get(
-  '/api/health',
-  (req, res) => {
-    resetDailyCounterIfNeeded();
-
-    res.json(
-      buildApiResponse(
-        null,
-        {
-          health: {
-            status: 'online',
-
-            apiKeyConfigured:
-              Boolean(
-                TWELVE_DATA_API_KEY
-              ),
-
-            cachePairs:
-              pairCache.size,
-
-            cachedResults:
-              resultCache.size,
-
-            providerRequestsLastMinute:
-              providerRequestTimes.length,
-
-            quotaBlocked:
-              !dailyCreditsAvailable(),
-
-            uptimeSeconds:
-              Math.floor(
-                process.uptime()
-              )
-          }
-        }
-      )
-    );
-  }
-);
-
-/* ---------------------------------------------------------
-   PAIRS
---------------------------------------------------------- */
-
-app.get(
-  '/api/pairs',
-  (req, res) => {
-    res.json(
-      buildApiResponse(
-        null,
-        {
-          pairsList:
-            PAIRS
-        }
-      )
-    );
-  }
-);
-
-/* ---------------------------------------------------------
-   BEST
---------------------------------------------------------- */
+/* ==========================================================
+   /api/best
+========================================================== */
 
 app.get(
   '/api/best',
   async (req, res) => {
     try {
-      const result =
-        await getBestMarket();
+      resetDailyUsageIfNeeded();
 
-      if (!result) {
-        return res.status(503).json({
-          ...buildApiResponse(null),
-          ok: false,
-          error:
-            'No selected market available yet'
-        });
+      /*
+       Short result cache.
+       Return the exact same API contract.
+      */
+      if (
+        bestResultCache &&
+        nowMs() -
+          bestResultCache.createdAt <=
+          RESULT_CACHE_TTL_MS
+      ) {
+        return res.json(
+          bestResultCache.response
+        );
       }
 
-      return res.json(result);
+      const candidates =
+        await ensureCandidates();
+
+      if (!candidates.length) {
+        const response =
+          buildApiResponse(
+            null,
+            {
+              error:
+                'No fresh market candidate is currently available. Scanner is waiting for fresh LIVE data.'
+            }
+          );
+
+        return res.json(response);
+      }
+
+      const selectedMarket =
+        chooseBest(candidates);
+
+      const response =
+        buildApiResponse(
+          selectedMarket,
+          {
+            rankedCandidates:
+              candidates
+                .slice()
+                .sort(
+                  (a, b) =>
+                    rankingScore(b) -
+                    rankingScore(a)
+                )
+                .slice(0, 10)
+                .map(item => ({
+                  pair:
+                    item.pair,
+
+                  timeframe:
+                    item.timeframe,
+
+                  signal:
+                    item.signal,
+
+                  confidence:
+                    item.confidence,
+
+                  gap:
+                    item.gap,
+
+                  dataAgeSeconds:
+                    item.dataAgeSeconds
+                }))
+          }
+        );
+
+      bestResultCache = {
+        createdAt:
+          nowMs(),
+
+        response
+      };
+
+      return res.json(
+        response
+      );
     } catch (error) {
-      return res.status(500).json({
-        ...buildApiResponse(null),
-        ok: false,
-        error:
-          error.message
-      });
+      console.error(
+        'GET /api/best:',
+        error
+      );
+
+      return res.status(200).json(
+        buildApiResponse(
+          null,
+          {
+            error:
+              error.message ||
+              'Unable to obtain live market data'
+          }
+        )
+      );
     }
   }
 );
 
-/* ---------------------------------------------------------
-   ANALYZE SPECIFIC PAIR
---------------------------------------------------------- */
+/* ==========================================================
+   /api/analyze
+========================================================== */
 
 app.get(
   '/api/analyze',
@@ -2250,93 +2384,254 @@ app.get(
     const pair =
       String(
         req.query.pair || ''
-      ).trim();
+      )
+        .trim()
+        .toUpperCase();
 
-    if (!pair) {
+    if (!PAIRS.includes(pair)) {
       return res.status(400).json({
         ok: false,
+        version: VERSION,
         error:
-          'Missing pair parameter'
-      });
-    }
-
-    if (
-      !PAIRS.includes(pair)
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          `Unsupported pair: ${pair}`,
+          'Unsupported pair',
         supportedPairs:
           PAIRS
       });
     }
 
     try {
-      const result =
-        await scanPair(pair);
+      const entry =
+        await refreshPair(pair);
+
+      const analyses =
+        entry.analyses;
+
+      const candidates =
+        Object.values(analyses)
+          .filter(Boolean);
 
       const selectedMarket =
-        chooseBest(
-          result.analyses
-        );
+        chooseBest(candidates);
 
       return res.json(
         buildApiResponse(
           selectedMarket,
           {
             pair,
-            analyses:
-              result.analyses
+            analyses
           }
         )
       );
     } catch (error) {
-      return res.status(503).json({
-        ...buildApiResponse(null),
-        ok: false,
-        pair,
-        error:
-          error.message
-      });
+      return res.status(200).json(
+        buildApiResponse(
+          null,
+          {
+            pair,
+            error:
+              error.message
+          }
+        )
+      );
     }
   }
 );
 
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
+/* ==========================================================
+   /api/health
+========================================================== */
 
-app.use(
-  (err, req, res, next) => {
-    console.error(err);
+app.get(
+  '/api/health',
+  (req, res) => {
+    resetDailyUsageIfNeeded();
 
-    res.status(500).json({
-      ok: false,
-      version: VERSION,
-      error:
-        'Internal server error'
+    res.json({
+      ok: true,
+
+      version:
+        VERSION,
+
+      source:
+        SOURCE,
+
+      timezone:
+        TIMEZONE,
+
+      apiConfigured:
+        Boolean(
+          TWELVE_DATA_API_KEY
+        ),
+
+      pairs:
+        PAIRS.length,
+
+      supportedTimeframes:
+        TIMEFRAMES,
+
+      cachedPairs:
+        pairCache.size,
+
+      cachedResults:
+        bestResultCache
+          ? 1
+          : 0,
+
+      scanRunning,
+
+      scanCursor,
+
+      scanBatchSize:
+        SCAN_BATCH_SIZE,
+
+      lastScanAt,
+
+      lastScanError,
+
+      totalScanned,
+
+      totalFailed,
+
+      totalApiRequests,
+
+      providerRequestsThisMinute:
+        providerRequestsInCurrentMinute(),
+
+      dailyCreditsUsed,
+
+      dailyCreditsRemaining:
+        remainingDailyCredits(),
+
+      providerMinuteLimit:
+        PROVIDER_MINUTE_LIMIT,
+
+      dailyLimit:
+        DAILY_REQUEST_LIMIT,
+
+      dailySafetyReserve:
+        DAILY_SAFETY_RESERVE,
+
+      maxDailyRequests:
+        MAX_DAILY_REQUESTS,
+
+      cacheTtlSeconds:
+        PAIR_CACHE_TTL_MS / 1000,
+
+      resultTtlSeconds:
+        RESULT_CACHE_TTL_MS / 1000,
+
+      entryBufferSeconds:
+        ENTRY_BUFFER_SECONDS
     });
   }
 );
 
-/* =========================================================
-   START
-========================================================= */
+/* ==========================================================
+   /api/pairs
+========================================================== */
+
+app.get(
+  '/api/pairs',
+  (req, res) => {
+    res.json({
+      ok: true,
+      version: VERSION,
+      source: SOURCE,
+      pairs: PAIRS,
+      supportedTimeframes:
+        TIMEFRAMES
+    });
+  }
+);
+
+/* ==========================================================
+   ROOT
+========================================================== */
+
+app.get(
+  '/',
+  (req, res) => {
+    res.json({
+      ok: true,
+      name:
+        'PO AI Predictor API',
+      version:
+        VERSION,
+      source:
+        SOURCE,
+      endpoints: [
+        '/api/health',
+        '/api/best',
+        '/api/analyze?pair=EUR/USD',
+        '/api/pairs'
+      ]
+    });
+  }
+);
+
+/* ==========================================================
+   404
+========================================================== */
+
+app.use(
+  (req, res) => {
+    res.status(404).json({
+      ok: false,
+      version: VERSION,
+      error: 'Endpoint not found'
+    });
+  }
+);
+
+/* ==========================================================
+   BACKGROUND SCANNER
+========================================================== */
+
+async function backgroundScan() {
+  try {
+    await scanBatch();
+  } catch (error) {
+    lastScanError =
+      error.message;
+
+    console.error(
+      'Background scan error:',
+      error
+    );
+  }
+}
+
+/*
+Start initial scan shortly after server starts.
+This gives /api/best fresh data as early as possible.
+*/
+setTimeout(
+  () => {
+    backgroundScan();
+  },
+  1500
+);
+
+/*
+Continue scanning every minute.
+7 pairs per batch.
+*/
+setInterval(
+  () => {
+    backgroundScan();
+  },
+  SCAN_INTERVAL_MS
+);
+
+/* ==========================================================
+   START SERVER
+========================================================== */
 
 app.listen(
   PORT,
   () => {
     console.log(
-      '================================================'
-    );
-
-    console.log(
-      `PO AI PREDICTOR ${VERSION}`
-    );
-
-    console.log(
-      `Port: ${PORT}`
+      `PO AI Predictor ${VERSION} running on port ${PORT}`
     );
 
     console.log(
@@ -2348,19 +2643,15 @@ app.listen(
     );
 
     console.log(
-      `Timeframes: ${TIMEFRAMES.join(', ')}`
+      `Timeframes: ${TIMEFRAMES.join(', ')}m`
     );
 
     console.log(
-      `Provider minute limit: ${PROVIDER_MINUTE_LIMIT}`
+      `Provider limit: ${PROVIDER_MINUTE_LIMIT}/minute`
     );
 
     console.log(
-      `Daily effective limit: ${EFFECTIVE_DAILY_LIMIT}`
-    );
-
-    console.log(
-      '================================================'
+      `Daily usable limit: ${MAX_DAILY_REQUESTS}`
     );
   }
 );
