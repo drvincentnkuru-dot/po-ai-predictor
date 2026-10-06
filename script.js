@@ -3,16 +3,26 @@
 /*
 ============================================================
  PO AI PREDICTOR
- Frontend V9.0.3
+ Frontend V9.0.4
 
- Backend:
+ BACKEND:
  https://po-ai-predictor-api.onrender.com
 
  IMPORTANT:
- - Backend is the SINGLE SOURCE OF TRUTH.
- - Frontend does NOT calculate CALL/PUT.
- - Frontend only displays /api/best.
- - One API response contract.
+ Frontend is ONLY a renderer.
+
+ Backend is the SINGLE SOURCE OF TRUTH.
+
+ Frontend does NOT calculate:
+ - CALL / PUT
+ - confidence
+ - score
+ - entry
+ - expiry
+ - freshness
+ - indicators
+
+ Everything comes from ONE /api/best response.
 ============================================================
 */
 
@@ -25,35 +35,58 @@ const BEST_ENDPOINT =
 const HEALTH_ENDPOINT =
   `${API_BASE}/api/health`;
 
+/*
+============================================================
+FRONTEND SETTINGS
+============================================================
+*/
+
 const REFRESH_INTERVAL_MS =
-  15 * 1000;
+  15000;
 
 const FETCH_TIMEOUT_MS =
-  20 * 1000;
+  20000;
 
-/* ==========================================================
-   STATE
-========================================================== */
+const COUNTDOWN_INTERVAL_MS =
+  1000;
 
-let currentMarket = null;
+/*
+============================================================
+STATE
+============================================================
+*/
+
 let currentResponse = null;
+let currentMarket = null;
+
+let requestRunning = false;
 
 let refreshTimer = null;
 let countdownTimer = null;
 
-let requestInProgress = false;
+let lastSuccessfulAt = null;
 
-/* ==========================================================
-   DOM HELPERS
-========================================================== */
+/*
+Expose response for browser debugging.
+*/
+window.__POAI_LAST_RESPONSE = null;
 
-function $(...ids) {
+/*
+============================================================
+DOM HELPERS
+============================================================
+*/
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function firstExisting(ids) {
   for (const id of ids) {
-    const element =
-      document.getElementById(id);
+    const el = byId(id);
 
-    if (element) {
-      return element;
+    if (el) {
+      return el;
     }
   }
 
@@ -61,1173 +94,1308 @@ function $(...ids) {
 }
 
 function setText(
-  element,
+  ids,
   value
 ) {
-  if (!element) return;
+  const list =
+    Array.isArray(ids)
+      ? ids
+      : [ids];
 
-  element.textContent =
-    value === null ||
-    value === undefined ||
-    value === ''
-      ? '—'
-      : String(value);
-}
+  const el =
+    firstExisting(list);
 
-function addClass(
-  element,
-  className
-) {
-  if (element) {
-    element.classList.add(
-      className
-    );
+  if (el) {
+    el.textContent =
+      value === null ||
+      value === undefined
+        ? '--'
+        : String(value);
   }
 }
 
-function removeClass(
-  element,
-  className
+function setHTML(
+  ids,
+  value
 ) {
-  if (element) {
-    element.classList.remove(
-      className
-    );
+  const list =
+    Array.isArray(ids)
+      ? ids
+      : [ids];
+
+  const el =
+    firstExisting(list);
+
+  if (el) {
+    el.innerHTML =
+      value === null ||
+      value === undefined
+        ? ''
+        : String(value);
   }
 }
 
-/* ==========================================================
-   FORMATTERS
-========================================================== */
+function setClass(
+  ids,
+  className
+) {
+  const list =
+    Array.isArray(ids)
+      ? ids
+      : [ids];
+
+  const el =
+    firstExisting(list);
+
+  if (el) {
+    el.className =
+      className;
+  }
+}
+
+function setDisabled(
+  ids,
+  disabled
+) {
+  const list =
+    Array.isArray(ids)
+      ? ids
+      : [ids];
+
+  const el =
+    firstExisting(list);
+
+  if (el) {
+    el.disabled =
+      Boolean(disabled);
+  }
+}
+
+/*
+============================================================
+FORMATTERS
+============================================================
+*/
 
 function numberValue(
   value,
-  fallback = null
+  decimals = 6
 ) {
   const n =
     Number(value);
 
-  return Number.isFinite(n)
-    ? n
-    : fallback;
-}
-
-function formatNumber(
-  value,
-  digits = 2
-) {
-  const n =
-    numberValue(value);
-
-  if (n === null) {
-    return '—';
+  if (!Number.isFinite(n)) {
+    return '--';
   }
 
-  return n.toFixed(digits);
+  return n.toFixed(decimals);
 }
 
-function formatPrice(
+function percentValue(
   value
 ) {
   const n =
-    numberValue(value);
+    Number(value);
 
-  if (n === null) {
-    return '—';
+  if (!Number.isFinite(n)) {
+    return '--';
   }
 
-  /*
-   Forex pairs:
-   JPY often needs 3 decimals.
-   Most other pairs commonly use 5.
-  */
-  if (
-    currentMarket?.pair?.includes(
-      'JPY'
-    )
-  ) {
-    return n.toFixed(3);
-  }
-
-  return n.toFixed(5);
+  return `${Math.round(n)}%`;
 }
 
-function formatUTC(
-  iso
+function formatTime(
+  value
 ) {
-  if (!iso) {
-    return '—';
+  if (!value) {
+    return '--';
   }
 
   const date =
-    new Date(iso);
+    new Date(value);
 
   if (
-    Number.isNaN(
+    !Number.isFinite(
       date.getTime()
     )
   ) {
-    return '—';
+    return '--';
   }
 
-  return (
-    date.toISOString()
-      .slice(11, 19) +
-    ' UTC'
+  return date.toLocaleTimeString(
+    [],
+    {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }
   );
 }
 
-function formatDateUTC(
-  iso
+function formatDateTime(
+  value
 ) {
-  if (!iso) {
-    return '—';
+  if (!value) {
+    return '--';
   }
 
   const date =
-    new Date(iso);
+    new Date(value);
 
   if (
-    Number.isNaN(
+    !Number.isFinite(
       date.getTime()
     )
   ) {
-    return '—';
+    return '--';
   }
 
-  return (
-    date.toISOString()
-      .slice(0, 10) +
-    ' ' +
-    date.toISOString()
-      .slice(11, 19) +
-    ' UTC'
+  return date.toLocaleString(
+    [],
+    {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }
   );
 }
 
-function secondsRemaining(
-  entryTime
+/*
+============================================================
+FETCH WITH TIMEOUT
+============================================================
+*/
+
+async function fetchWithTimeout(
+  url,
+  options = {},
+  timeoutMs = FETCH_TIMEOUT_MS
 ) {
-  if (!entryTime) {
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      timeoutMs
+    );
+
+  try {
+    return await fetch(
+      url,
+      {
+        ...options,
+        signal:
+          controller.signal
+      }
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/*
+============================================================
+STATUS
+============================================================
+*/
+
+function setStatus(
+  message,
+  type = 'normal'
+) {
+  const ids = [
+    'status',
+    'statusText',
+    'connectionStatus',
+    'liveStatus'
+  ];
+
+  const el =
+    firstExisting(ids);
+
+  if (!el) {
+    return;
+  }
+
+  el.textContent =
+    message;
+
+  el.dataset.status =
+    type;
+}
+
+/*
+============================================================
+SIGNAL DISPLAY
+============================================================
+*/
+
+function renderSignal(
+  market
+) {
+  if (!market) {
+    setText(
+      [
+        'signal',
+        'signalText',
+        'prediction',
+        'tradeSignal'
+      ],
+      'NO TRADE'
+    );
+
+    return;
+  }
+
+  const signal =
+    market.signal ||
+    'NO TRADE';
+
+  setText(
+    [
+      'signal',
+      'signalText',
+      'prediction',
+      'tradeSignal'
+    ],
+    signal
+  );
+
+  const signalClass =
+    signal === 'CALL'
+      ? 'signal-call'
+      : signal === 'PUT'
+        ? 'signal-put'
+        : 'signal-no-trade';
+
+  setClass(
+    [
+      'signal',
+      'signalText',
+      'prediction',
+      'tradeSignal'
+    ],
+    signalClass
+  );
+}
+
+/*
+============================================================
+MARKET
+============================================================
+*/
+
+function renderMarket(
+  market
+) {
+  if (!market) {
+    return;
+  }
+
+  setText(
+    [
+      'pair',
+      'currencyPair',
+      'selectedPair',
+      'marketPair'
+    ],
+    market.pair
+  );
+
+  setText(
+    [
+      'timeframe',
+      'selectedTimeframe',
+      'expiryTimeframe',
+      'tf'
+    ],
+    market.timeframe
+      ? `${market.timeframe}m`
+      : '--'
+  );
+
+  setText(
+    [
+      'confidence',
+      'confidenceValue'
+    ],
+    percentValue(
+      market.confidence
+    )
+  );
+
+  setText(
+    [
+      'currentPrice',
+      'price',
+      'marketPrice'
+    ],
+    numberValue(
+      market.currentPrice,
+      6
+    )
+  );
+
+  setText(
+    [
+      'entryPrice',
+      'entry'
+    ],
+    numberValue(
+      market.entryPrice,
+      6
+    )
+  );
+
+  setText(
+    [
+      'entryTime',
+      'entryAt'
+    ],
+    formatTime(
+      market.entryTime
+    )
+  );
+
+  setText(
+    [
+      'expiryTime',
+      'expiryAt'
+    ],
+    formatTime(
+      market.expiryTime
+    )
+  );
+
+  setText(
+    [
+      'lastCandle',
+      'lastCandleTime'
+    ],
+    formatDateTime(
+      market.lastCandle
+    )
+  );
+
+  setText(
+    [
+      'dataAge',
+      'dataAgeSeconds',
+      'dataFreshness'
+    ],
+    Number.isFinite(
+      Number(
+        market.dataAgeSeconds
+      )
+    )
+      ? `${Math.round(
+          Number(
+            market.dataAgeSeconds
+          )
+        )}s`
+      : '--'
+  );
+
+  renderSignal(
+    market
+  );
+}
+
+/*
+============================================================
+COUNTDOWN
+============================================================
+*/
+
+function calculateCountdownSeconds(
+  expiryTime
+) {
+  if (!expiryTime) {
     return null;
   }
 
-  const entry =
+  const expiry =
     new Date(
-      entryTime
+      expiryTime
     ).getTime();
 
-  if (
-    !Number.isFinite(entry)
-  ) {
+  if (!Number.isFinite(expiry)) {
     return null;
   }
 
   return Math.max(
     0,
     Math.floor(
-      (entry - Date.now()) /
-      1000
+      (expiry -
+        Date.now()) /
+        1000
     )
   );
 }
 
-function formatCountdown(
-  seconds
-) {
-  if (
-    !Number.isFinite(
-      seconds
-    )
-  ) {
-    return '—';
+function renderCountdown() {
+  if (!currentMarket) {
+    setText(
+      [
+        'countdown',
+        'entryCountdown',
+        'timer',
+        'countdownTimer'
+      ],
+      '--'
+    );
+
+    return;
   }
 
-  const safe =
-    Math.max(
-      0,
-      Math.floor(seconds)
+  /*
+  Countdown is based on backend expiryTime.
+  */
+  const seconds =
+    calculateCountdownSeconds(
+      currentMarket.expiryTime
     );
+
+  if (
+    seconds === null
+  ) {
+    setText(
+      [
+        'countdown',
+        'entryCountdown',
+        'timer',
+        'countdownTimer'
+      ],
+      '--'
+    );
+
+    return;
+  }
 
   const minutes =
     Math.floor(
-      safe / 60
+      seconds / 60
     );
 
-  const secs =
-    safe % 60;
+  const remaining =
+    seconds % 60;
 
-  return (
-    String(minutes)
-      .padStart(2, '0') +
-    ':' +
-    String(secs)
-      .padStart(2, '0')
-  );
-}
-
-/* ==========================================================
-   SIGNAL DISPLAY
-========================================================== */
-
-function renderSignal(
-  market
-) {
-  const signalElement =
-    $(
-      'signal',
-      'signalText',
-      'marketSignal',
-      'signalValue'
-    );
-
-  if (!signalElement) {
-    return;
-  }
-
-  const signal =
-    String(
-      market?.signal ||
-      'NO TRADE'
-    ).toUpperCase();
+  const text =
+    `${String(minutes).padStart(2, '0')}:` +
+    `${String(remaining).padStart(2, '0')}`;
 
   setText(
-    signalElement,
-    signal
-  );
-
-  removeClass(
-    signalElement,
-    'call'
-  );
-
-  removeClass(
-    signalElement,
-    'put'
-  );
-
-  removeClass(
-    signalElement,
-    'no-trade'
-  );
-
-  removeClass(
-    signalElement,
-    'CALL'
-  );
-
-  removeClass(
-    signalElement,
-    'PUT'
-  );
-
-  if (signal === 'CALL') {
-    addClass(
-      signalElement,
-      'call'
-    );
-
-    addClass(
-      signalElement,
-      'CALL'
-    );
-  } else if (
-    signal === 'PUT'
-  ) {
-    addClass(
-      signalElement,
-      'put'
-    );
-
-    addClass(
-      signalElement,
-      'PUT'
-    );
-  } else {
-    addClass(
-      signalElement,
-      'no-trade'
-    );
-  }
-}
-
-/* ==========================================================
-   MARKET CORE
-========================================================== */
-
-function renderMarketCore(
-  market
-) {
-  setText(
-    $(
-      'selectedPair',
-      'pair',
-      'marketPair',
-      'pairValue'
-    ),
-    market?.pair
-  );
-
-  setText(
-    $(
-      'timeframe',
-      'selectedTimeframe',
-      'marketTimeframe',
-      'timeframeValue'
-    ),
-    market?.timeframe
-      ? `${market.timeframe} MIN`
-      : '—'
-  );
-
-  setText(
-    $(
-      'confidence',
-      'confidenceValue',
-      'marketConfidence'
-    ),
-    market?.confidence !== undefined
-      ? `${market.confidence}%`
-      : '—'
-  );
-
-  setText(
-    $(
-      'currentPrice',
-      'price',
-      'marketPrice',
-      'priceValue'
-    ),
-    formatPrice(
-      market?.currentPrice
-    )
-  );
-
-  setText(
-    $(
-      'entryPrice',
-      'entryPriceValue'
-    ),
-    formatPrice(
-      market?.entryPrice ??
-      market?.currentPrice
-    )
-  );
-
-  setText(
-    $(
-      'entryTime',
-      'entry',
-      'entryTimeValue'
-    ),
-    formatDateUTC(
-      market?.entryTime
-    )
-  );
-
-  setText(
-    $(
-      'expiryTime',
-      'expiry',
-      'expiryTimeValue'
-    ),
-    formatDateUTC(
-      market?.expiryTime
-    )
-  );
-
-  setText(
-    $(
-      'entryInSeconds',
-      'entryCountdown',
+    [
       'countdown',
-      'countdownValue'
-    ),
-    market?.entryInSeconds !== undefined
-      ? formatCountdown(
-          market.entryInSeconds
-        )
-      : '—'
+      'entryCountdown',
+      'timer',
+      'countdownTimer'
+    ],
+    text
   );
 }
 
-/* ==========================================================
-   SCORE DISPLAY
-========================================================== */
+/*
+============================================================
+SCORES
+============================================================
+*/
 
 function renderScores(
   market
-) {
-  setText(
-    $(
-      'callScore',
-      'callScoreValue'
-    ),
-    formatNumber(
-      market?.callScore,
-      1
-    )
-  );
-
-  setText(
-    $(
-      'putScore',
-      'putScoreValue'
-    ),
-    formatNumber(
-      market?.putScore,
-      1
-    )
-  );
-
-  setText(
-    $(
-      'scoreGap',
-      'gap',
-      'gapValue'
-    ),
-    formatNumber(
-      market?.gap,
-      1
-    )
-  );
-
-  setText(
-    $(
-      'support',
-      'supportValue'
-    ),
-    formatPrice(
-      market?.supportResistance
-        ?.support
-    )
-  );
-
-  setText(
-    $(
-      'resistance',
-      'resistanceValue'
-    ),
-    formatPrice(
-      market?.supportResistance
-        ?.resistance
-    )
-  );
-}
-
-/* ==========================================================
-   INDICATORS
-========================================================== */
-
-function renderIndicators(
-  market
-) {
-  const indicators =
-    market?.indicators || {};
-
-  setText(
-    $(
-      'ema9',
-      'ema9Value'
-    ),
-    formatPrice(
-      indicators.ema9
-    )
-  );
-
-  setText(
-    $(
-      'ema21',
-      'ema21Value'
-    ),
-    formatPrice(
-      indicators.ema21
-    )
-  );
-
-  setText(
-    $(
-      'rsi14',
-      'rsi',
-      'rsi14Value'
-    ),
-    formatNumber(
-      indicators.rsi14,
-      2
-    )
-  );
-
-  setText(
-    $(
-      'adx14',
-      'adx',
-      'adx14Value'
-    ),
-    formatNumber(
-      indicators.adx14,
-      2
-    )
-  );
-
-  setText(
-    $(
-      'stochastic14',
-      'stochastic',
-      'stoch',
-      'stochastic14Value'
-    ),
-    formatNumber(
-      indicators.stochastic14,
-      2
-    )
-  );
-
-  setText(
-    $(
-      'atr14',
-      'atr',
-      'atr14Value'
-    ),
-    formatPrice(
-      indicators.atr14
-    )
-  );
-
-  setText(
-    $(
-      'bbUpper',
-      'bollingerUpper'
-    ),
-    formatPrice(
-      indicators.bollinger
-        ?.upper
-    )
-  );
-
-  setText(
-    $(
-      'bbMiddle',
-      'bollingerMiddle'
-    ),
-    formatPrice(
-      indicators.bollinger
-        ?.middle
-    )
-  );
-
-  setText(
-    $(
-      'bbLower',
-      'bollingerLower'
-    ),
-    formatPrice(
-      indicators.bollinger
-        ?.lower
-    )
-  );
-}
-
-/* ==========================================================
-   PRICE ACTION
-========================================================== */
-
-function renderPriceAction(
-  market
-) {
-  const pa =
-    market?.priceAction || {};
-
-  setText(
-    $(
-      'priceAction',
-      'priceActionValue',
-      'pattern',
-      'patternValue'
-    ),
-    pa.pattern
-  );
-
-  setText(
-    $(
-      'priceActionDirection',
-      'patternDirection'
-    ),
-    pa.direction
-  );
-
-  setText(
-    $(
-      'patternStrength',
-      'priceActionStrength'
-    ),
-    pa.strength !== undefined
-      ? pa.strength
-      : '—'
-  );
-}
-
-/* ==========================================================
-   MARKET PSYCHOLOGY
-========================================================== */
-
-function renderPsychology(
-  market
-) {
-  const psychology =
-    market?.marketPsychology ||
-    {};
-
-  setText(
-    $(
-      'marketPsychology',
-      'psychology',
-      'psychologyValue'
-    ),
-    psychology.label
-  );
-
-  setText(
-    $(
-      'psychologyDirection',
-      'marketPsychologyDirection'
-    ),
-    psychology.direction
-  );
-}
-
-/* ==========================================================
-   VOLATILITY
-========================================================== */
-
-function renderVolatility(
-  market
-) {
-  setText(
-    $(
-      'volatility',
-      'volatilityValue'
-    ),
-    market?.volatility
-  );
-}
-
-/* ==========================================================
-   DATA AGE
-========================================================== */
-
-function renderDataAge(
-  market
-) {
-  const age =
-    numberValue(
-      market?.dataAgeSeconds
-    );
-
-  if (age === null) {
-    setText(
-      $(
-        'dataAge',
-        'dataAgeSeconds',
-        'dataFreshness'
-      ),
-      '—'
-    );
-
-    return;
-  }
-
-  setText(
-    $(
-      'dataAge',
-      'dataAgeSeconds',
-      'dataFreshness'
-    ),
-    `${age}s`
-  );
-}
-
-/* ==========================================================
-   REASONS
-========================================================== */
-
-function renderReasons(
-  market
-) {
-  const container =
-    $(
-      'signalReasons',
-      'reasons',
-      'reasonsList',
-      'analysisReasons'
-    );
-
-  if (!container) {
-    return;
-  }
-
-  container.innerHTML = '';
-
-  const reasons =
-    Array.isArray(
-      market?.reasons
-    )
-      ? market.reasons
-      : [];
-
-  if (!reasons.length) {
-    const item =
-      document.createElement(
-        'div'
-      );
-
-    item.textContent =
-      'No additional reason available.';
-
-    container.appendChild(
-      item
-    );
-
-    return;
-  }
-
-  for (const reason of reasons) {
-    const item =
-      document.createElement(
-        'div'
-      );
-
-    item.className =
-      'signal-reason';
-
-    item.textContent =
-      reason;
-
-    container.appendChild(
-      item
-    );
-  }
-}
-
-/* ==========================================================
-   SCANNER
-========================================================== */
-
-function renderScanner(
-  response
-) {
-  const scanner =
-    response?.scanner || {};
-
-  const metadata =
-    response?.metadata || {};
-
-  setText(
-    $(
-      'cachedPairs',
-      'scannerCachedPairs'
-    ),
-    scanner.cachedPairs
-  );
-
-  setText(
-    $(
-      'candidateCount',
-      'scannerCandidates'
-    ),
-    scanner.candidateCount
-  );
-
-  setText(
-    $(
-      'totalScanned',
-      'scannerTotalScanned'
-    ),
-    scanner.totalScanned
-  );
-
-  setText(
-    $(
-      'totalFailed',
-      'scannerTotalFailed'
-    ),
-    scanner.totalFailed
-  );
-
-  setText(
-    $(
-      'totalApiRequests',
-      'scannerApiRequests'
-    ),
-    scanner.totalApiRequests
-  );
-
-  setText(
-    $(
-      'dailyCreditsUsed',
-      'creditsUsed'
-    ),
-    metadata.dailyCreditsUsed
-  );
-
-  setText(
-    $(
-      'dailyCreditsRemaining',
-      'creditsRemaining'
-    ),
-    metadata.dailyCreditsRemaining
-  );
-
-  setText(
-    $(
-      'providerRequestsThisMinute',
-      'minuteRequests'
-    ),
-    metadata.providerRequestsThisMinute
-  );
-
-  setText(
-    $(
-      'scannerStatus',
-      'scanStatus'
-    ),
-    scanner.scanRunning
-      ? 'SCANNING'
-      : 'READY'
-  );
-
-  setText(
-    $(
-      'lastScanAt',
-      'scannerLastScan'
-    ),
-    formatDateUTC(
-      scanner.lastScanAt
-    )
-  );
-
-  setText(
-    $(
-      'lastScanError',
-      'scannerError'
-    ),
-    scanner.lastScanError ||
-      'NONE'
-  );
-}
-
-/* ==========================================================
-   MAIN RENDER
-========================================================== */
-
-function renderMarket(
-  market,
-  response = null
 ) {
   if (!market) {
     return;
   }
 
-  currentMarket =
-    market;
-
-  if (response) {
-    currentResponse =
-      response;
-  }
-
-  renderSignal(
-    market
+  setText(
+    [
+      'callScore',
+      'callScoreValue'
+    ],
+    market.callScore
   );
 
-  renderMarketCore(
-    market
+  setText(
+    [
+      'putScore',
+      'putScoreValue'
+    ],
+    market.putScore
+  );
+
+  setText(
+    [
+      'scoreGap',
+      'gap',
+      'gapValue'
+    ],
+    market.gap
+  );
+}
+
+/*
+============================================================
+INDICATORS
+============================================================
+*/
+
+function renderIndicators(
+  market
+) {
+  if (!market) {
+    return;
+  }
+
+  const i =
+    market.indicators || {};
+
+  setText(
+    [
+      'ema9',
+      'ema9Value'
+    ],
+    numberValue(
+      i.ema9,
+      6
+    )
+  );
+
+  setText(
+    [
+      'ema21',
+      'ema21Value'
+    ],
+    numberValue(
+      i.ema21,
+      6
+    )
+  );
+
+  setText(
+    [
+      'rsi14',
+      'rsi',
+      'rsiValue'
+    ],
+    numberValue(
+      i.rsi14,
+      2
+    )
+  );
+
+  setText(
+    [
+      'adx14',
+      'adx',
+      'adxValue'
+    ],
+    numberValue(
+      i.adx14,
+      2
+    )
+  );
+
+  setText(
+    [
+      'stochastic14',
+      'stochastic',
+      'stochValue'
+    ],
+    numberValue(
+      i.stochastic14,
+      2
+    )
+  );
+
+  setText(
+    [
+      'atr14',
+      'atr',
+      'atrValue'
+    ],
+    numberValue(
+      i.atr14,
+      8
+    )
+  );
+
+  const b =
+    i.bollinger || {};
+
+  setText(
+    [
+      'bollingerUpper',
+      'bbUpper'
+    ],
+    numberValue(
+      b.upper,
+      6
+    )
+  );
+
+  setText(
+    [
+      'bollingerMiddle',
+      'bbMiddle'
+    ],
+    numberValue(
+      b.middle,
+      6
+    )
+  );
+
+  setText(
+    [
+      'bollingerLower',
+      'bbLower'
+    ],
+    numberValue(
+      b.lower,
+      6
+    )
+  );
+}
+
+/*
+============================================================
+SUPPORT / RESISTANCE
+============================================================
+*/
+
+function renderSupportResistance(
+  market
+) {
+  if (!market) {
+    return;
+  }
+
+  const sr =
+    market.supportResistance ||
+    {};
+
+  setText(
+    [
+      'support',
+      'supportValue'
+    ],
+    numberValue(
+      sr.support,
+      6
+    )
+  );
+
+  setText(
+    [
+      'resistance',
+      'resistanceValue'
+    ],
+    numberValue(
+      sr.resistance,
+      6
+    )
+  );
+}
+
+/*
+============================================================
+PRICE ACTION
+============================================================
+*/
+
+function renderPriceAction(
+  market
+) {
+  if (!market) {
+    return;
+  }
+
+  const pa =
+    market.priceAction ||
+    {};
+
+  setText(
+    [
+      'priceAction',
+      'priceActionPattern',
+      'pattern'
+    ],
+    pa.pattern
+  );
+
+  setText(
+    [
+      'priceActionDirection',
+      'patternDirection'
+    ],
+    pa.direction
+  );
+
+  setText(
+    [
+      'priceActionStrength',
+      'patternStrength'
+    ],
+    pa.strength
+  );
+}
+
+/*
+============================================================
+MARKET PSYCHOLOGY
+============================================================
+*/
+
+function renderPsychology(
+  market
+) {
+  if (!market) {
+    return;
+  }
+
+  const p =
+    market.marketPsychology ||
+    {};
+
+  setText(
+    [
+      'marketPsychology',
+      'psychology',
+      'psychologyLabel'
+    ],
+    p.label
+  );
+
+  setText(
+    [
+      'psychologyDirection'
+    ],
+    p.direction
+  );
+
+  setText(
+    [
+      'psychologyStrength'
+    ],
+    p.strength
+  );
+}
+
+/*
+============================================================
+VOLATILITY / FRESHNESS
+============================================================
+*/
+
+function renderQuality(
+  market
+) {
+  if (!market) {
+    return;
+  }
+
+  setText(
+    [
+      'volatility',
+      'volatilityValue'
+    ],
+    market.volatility
+  );
+
+  const freshness =
+    market.freshness ||
+    {};
+
+  setText(
+    [
+      'freshnessStatus',
+      'freshness',
+      'dataStatus'
+    ],
+    freshness.status ||
+      '--'
+  );
+
+  setText(
+    [
+      'freshnessLimit',
+      'maxDataAge'
+    ],
+    Number.isFinite(
+      Number(
+        freshness.maxAgeSeconds
+      )
+    )
+      ? `${freshness.maxAgeSeconds}s`
+      : '--'
+  );
+}
+
+/*
+============================================================
+REASONS
+============================================================
+*/
+
+function renderReasons(
+  market
+) {
+  const reasons =
+    market &&
+    Array.isArray(
+      market.reasons
+    )
+      ? market.reasons
+      : [];
+
+  const el =
+    firstExisting([
+      'reasons',
+      'signalReasons',
+      'analysisReasons',
+      'reasonList'
+    ]);
+
+  if (!el) {
+    return;
+  }
+
+  if (!reasons.length) {
+    el.innerHTML =
+      '<div>No reasons available.</div>';
+
+    return;
+  }
+
+  el.innerHTML =
+    reasons
+      .map(
+        reason =>
+          `<div class="reason-item">${escapeHtml(
+            reason
+          )}</div>`
+      )
+      .join('');
+}
+
+/*
+============================================================
+ESCAPE HTML
+============================================================
+*/
+
+function escapeHtml(
+  value
+) {
+  return String(value)
+    .replace(
+      /&/g,
+      '&amp;'
+    )
+    .replace(
+      /</g,
+      '&lt;'
+    )
+    .replace(
+      />/g,
+      '&gt;'
+    )
+    .replace(
+      /"/g,
+      '&quot;'
+    )
+    .replace(
+      /'/g,
+      '&#039;'
+    );
+}
+
+/*
+============================================================
+SCANNER METADATA
+============================================================
+*/
+
+function renderScanner(
+  response
+) {
+  if (!response) {
+    return;
+  }
+
+  const metadata =
+    response.metadata ||
+    {};
+
+  const scanner =
+    response.scanner ||
+    {};
+
+  setText(
+    [
+      'provider',
+      'dataSource'
+    ],
+    response.source ||
+      metadata.provider ||
+      '--'
+  );
+
+  setText(
+    [
+      'cachedPairs'
+    ],
+    scanner.cachedPairs
+  );
+
+  setText(
+    [
+      'candidateCount'
+    ],
+    scanner.candidateCount
+  );
+
+  setText(
+    [
+      'scanRunning'
+    ],
+    scanner.scanRunning
+      ? 'YES'
+      : 'NO'
+  );
+
+  setText(
+    [
+      'lastScanAt'
+    ],
+    formatDateTime(
+      scanner.lastScanAt
+    )
+  );
+
+  setText(
+    [
+      'lastScanError'
+    ],
+    scanner.lastScanError ||
+      'None'
+  );
+
+  setText(
+    [
+      'providerRequestsThisMinute',
+      'minuteRequests'
+    ],
+    metadata.providerRequestsThisMinute
+  );
+
+  setText(
+    [
+      'dailyCreditsUsed'
+    ],
+    metadata.dailyCreditsUsed
+  );
+
+  setText(
+    [
+      'dailyCreditsRemaining'
+    ],
+    metadata.dailyCreditsRemaining
+  );
+}
+
+/*
+============================================================
+RANKED CANDIDATES
+============================================================
+*/
+
+function renderRankedCandidates(
+  response
+) {
+  const el =
+    firstExisting([
+      'rankedCandidates',
+      'candidateList',
+      'marketCandidates'
+    ]);
+
+  if (!el) {
+    return;
+  }
+
+  const candidates =
+    Array.isArray(
+      response.rankedCandidates
+    )
+      ? response.rankedCandidates
+      : [];
+
+  if (!candidates.length) {
+    el.innerHTML =
+      '<div>No valid fresh candidates.</div>';
+
+    return;
+  }
+
+  el.innerHTML =
+    candidates
+      .map(
+        (item, index) => {
+          const signal =
+            item.signal ||
+            'NO TRADE';
+
+          const freshness =
+            item.freshness &&
+            item.freshness.status
+              ? item.freshness.status
+              : '--';
+
+          return `
+            <div class="candidate-row">
+              <span>${index + 1}. ${escapeHtml(
+                item.pair
+              )}</span>
+              <span>${escapeHtml(
+                `${item.timeframe}m`
+              )}</span>
+              <span>${escapeHtml(
+                signal
+              )}</span>
+              <span>${escapeHtml(
+                `${item.confidence}%`
+              )}</span>
+              <span>${escapeHtml(
+                freshness
+              )}</span>
+              <span>${escapeHtml(
+                `${item.dataAgeSeconds}s`
+              )}</span>
+            </div>
+          `;
+        }
+      )
+      .join('');
+}
+
+/*
+============================================================
+RENDER ONE COMPLETE API RESPONSE
+============================================================
+*/
+
+function renderResponse(
+  response
+) {
+  /*
+  Validate response.
+  */
+  if (
+    !response ||
+    response.ok !== true
+  ) {
+    return false;
+  }
+
+  /*
+  Keep the entire response.
+  */
+  currentResponse =
+    response;
+
+  window.__POAI_LAST_RESPONSE =
+    response;
+
+  /*
+  Single source of truth.
+  */
+  if (
+    response.selectedMarket
+  ) {
+    currentMarket =
+      response.selectedMarket;
+  }
+
+  /*
+  If backend explicitly gives NO TRADE
+  with a selectedMarket, render it.
+  */
+  if (
+    response.selectedMarket &&
+    response.selectedMarket.signal
+  ) {
+    currentMarket =
+      response.selectedMarket;
+  }
+
+  renderMarket(
+    currentMarket
   );
 
   renderScores(
-    market
+    currentMarket
   );
 
   renderIndicators(
-    market
+    currentMarket
+  );
+
+  renderSupportResistance(
+    currentMarket
   );
 
   renderPriceAction(
-    market
+    currentMarket
   );
 
   renderPsychology(
-    market
+    currentMarket
   );
 
-  renderVolatility(
-    market
-  );
-
-  renderDataAge(
-    market
+  renderQuality(
+    currentMarket
   );
 
   renderReasons(
-    market
+    currentMarket
   );
 
-  if (response) {
-    renderScanner(
-      response
-    );
-  }
+  renderScanner(
+    response
+  );
 
-  updateCountdown();
+  renderRankedCandidates(
+    response
+  );
+
+  return true;
 }
 
-/* ==========================================================
-   COUNTDOWN
-========================================================== */
+/*
+============================================================
+GET /api/best
+============================================================
+*/
 
-function updateCountdown() {
-  if (!currentMarket) {
+async function analyzeMarket() {
+  /*
+  Prevent duplicate frontend requests.
+  */
+  if (requestRunning) {
     return;
   }
 
-  const seconds =
-    secondsRemaining(
-      currentMarket.entryTime
-    );
+  requestRunning = true;
 
-  const countdownText =
-    formatCountdown(
-      seconds
-    );
-
-  setText(
-    $(
-      'entryInSeconds',
-      'entryCountdown',
-      'countdown',
-      'countdownValue'
-    ),
-    countdownText
+  setDisabled(
+    [
+      'analyzeBtn',
+      'analyzeButton',
+      'analyzeMarket'
+    ],
+    true
   );
 
-  /*
-   Keep the frontend display synchronized with
-   backend entryTime. It does NOT create a new signal.
-  */
-}
-
-/* ==========================================================
-   FETCH WITH TIMEOUT
-========================================================== */
-
-async function fetchJSON(
-  url
-) {
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => {
-        controller.abort();
-      },
-      FETCH_TIMEOUT_MS
-    );
+  setStatus(
+    'ANALYZING LIVE MARKET...',
+    'loading'
+  );
 
   try {
     const response =
-      await fetch(
-        url,
+      await fetchWithTimeout(
+        BEST_ENDPOINT,
         {
           method: 'GET',
-
+          cache: 'no-store',
           headers: {
             Accept:
               'application/json'
-          },
-
-          cache:
-            'no-store',
-
-          signal:
-            controller.signal
+          }
         }
       );
 
-    const text =
-      await response.text();
-
-    let data;
-
-    try {
-      data =
-        JSON.parse(text);
-    } catch {
-      throw new Error(
-        `Invalid JSON response (${response.status})`
-      );
-    }
-
     if (!response.ok) {
       throw new Error(
-        data?.error ||
-        `HTTP ${response.status}`
+        `Backend HTTP ${response.status}`
       );
     }
 
-    return data;
-  } finally {
-    clearTimeout(
-      timeout
-    );
-  }
-}
-
-/* ==========================================================
-   STATUS
-========================================================== */
-
-function setConnectionStatus(
-  text
-) {
-  setText(
-    $(
-      'status',
-      'connectionStatus',
-      'liveStatus',
-      'backendStatus'
-    ),
-    text
-  );
-}
-
-/* ==========================================================
-   BACKEND HEALTH
-========================================================== */
-
-async function checkBackend() {
-  try {
     const data =
-      await fetchJSON(
-        HEALTH_ENDPOINT
-      );
-
-    if (
-      data?.ok
-    ) {
-      setConnectionStatus(
-        'LIVE DATA CONNECTED'
-      );
-
-      return data;
-    }
-
-    throw new Error(
-      data?.error ||
-      'Backend health check failed'
-    );
-  } catch (error) {
-    setConnectionStatus(
-      'LIVE DATA CONNECTION ISSUE'
-    );
-
-    return null;
-  }
-}
-
-/* ==========================================================
-   ANALYZE MARKET
-========================================================== */
-
-async function analyzeMarket(
-  options = {}
-) {
-  if (
-    requestInProgress &&
-    !options.force
-  ) {
-    return;
-  }
-
-  requestInProgress =
-    true;
-
-  setConnectionStatus(
-    'ANALYZING LIVE MARKET...'
-  );
-
-  try {
-    /*
-     IMPORTANT:
-     Only ONE endpoint determines the signal.
-    */
-    const data =
-      await fetchJSON(
-        `${BEST_ENDPOINT}?_=${Date.now()}`
-      );
+      await response.json();
 
     /*
-     Store the complete backend response.
-    */
-    currentResponse =
-      data;
-
-    window.__POAI_LAST_RESPONSE =
-      data;
-
-    /*
-     Backend is the single source of truth.
+    Exact contract validation.
     */
     if (
-      data?.ok !== true
+      data.ok !== true
     ) {
       throw new Error(
-        data?.error ||
+        data.error ||
         'Backend returned ok=false'
       );
     }
 
+    /*
+    selectedMarket is expected from V9.0.4.
+    */
     if (
-      !data.selectedMarket ||
-      typeof data.selectedMarket !==
-        'object'
+      !data.selectedMarket
     ) {
-      /*
-       Keep the previous valid market instead of
-       destroying the UI.
-      */
-      if (
-        currentMarket
-      ) {
-        setConnectionStatus(
-          'LIVE DATA WAITING FOR FRESH SIGNAL'
-        );
-
-        renderScanner(
-          data
-        );
-
-        return data;
-      }
-
       throw new Error(
-        data.error ||
-        'No selected market is currently available'
+        'Backend response has no selectedMarket'
       );
     }
 
     /*
-     Render EXACTLY what backend selected.
+    Render ONE response.
     */
-    renderMarket(
-      data.selectedMarket,
-      data
-    );
+    const rendered =
+      renderResponse(
+        data
+      );
 
-    setConnectionStatus(
-      'LIVE DATA CONNECTED'
-    );
+    if (!rendered) {
+      throw new Error(
+        'Invalid backend response'
+      );
+    }
 
-    return data;
+    lastSuccessfulAt =
+      new Date();
+
+    const market =
+      data.selectedMarket;
+
+    if (
+      market.signal === 'CALL'
+    ) {
+      setStatus(
+        'LIVE DATA CONNECTED • CALL SIGNAL',
+        'call'
+      );
+    } else if (
+      market.signal === 'PUT'
+    ) {
+      setStatus(
+        'LIVE DATA CONNECTED • PUT SIGNAL',
+        'put'
+      );
+    } else {
+      setStatus(
+        'LIVE DATA CONNECTED • NO TRADE',
+        'no-trade'
+      );
+    }
+
+    renderCountdown();
   } catch (error) {
     console.error(
       'PO AI Predictor:',
@@ -1235,48 +1403,99 @@ async function analyzeMarket(
     );
 
     /*
-     Never erase a valid previous signal just
-     because one refresh failed.
+    Important:
+    Do NOT erase the last valid market because of
+    a temporary network/backend problem.
     */
-    if (
-      currentMarket
-    ) {
-      setConnectionStatus(
-        'LIVE DATA TEMPORARILY UNAVAILABLE'
+    if (currentMarket) {
+      setStatus(
+        'LIVE DATA • TEMPORARY CONNECTION ISSUE • SHOWING LAST VALID SIGNAL',
+        'warning'
       );
-
-      return currentResponse;
+    } else {
+      setStatus(
+        'WAITING FOR LIVE DATA...',
+        'error'
+      );
     }
-
-    setConnectionStatus(
-      'LIVE DATA ERROR'
-    );
-
-    setText(
-      $(
-        'signal',
-        'signalText',
-        'marketSignal',
-        'signalValue'
-      ),
-      'NO DATA'
-    );
-
-    return null;
   } finally {
-    requestInProgress =
+    requestRunning =
       false;
+
+    setDisabled(
+      [
+        'analyzeBtn',
+        'analyzeButton',
+        'analyzeMarket'
+      ],
+      false
+    );
   }
 }
 
-/* ==========================================================
-   AUTO REFRESH
-========================================================== */
+/*
+============================================================
+HEALTH
+============================================================
+*/
+
+async function checkHealth() {
+  try {
+    const response =
+      await fetchWithTimeout(
+        HEALTH_ENDPOINT,
+        {
+          method: 'GET',
+          cache: 'no-store',
+          headers: {
+            Accept:
+              'application/json'
+          }
+        }
+      );
+
+    if (!response.ok) {
+      return;
+    }
+
+    const data =
+      await response.json();
+
+    /*
+    Do not render health over market response.
+    Only store it for diagnostics.
+    */
+    window.__POAI_HEALTH =
+      data;
+
+    /*
+    Warn if API version differs.
+    */
+    if (
+      data.version &&
+      data.version !==
+        'V9.0.4'
+    ) {
+      console.warn(
+        `Frontend V9.0.4 connected to backend ${data.version}`
+      );
+    }
+  } catch (error) {
+    console.warn(
+      'Health check failed:',
+      error
+    );
+  }
+}
+
+/*
+============================================================
+AUTO REFRESH
+============================================================
+*/
 
 function startAutoRefresh() {
-  if (
-    refreshTimer
-  ) {
+  if (refreshTimer) {
     clearInterval(
       refreshTimer
     );
@@ -1291,10 +1510,14 @@ function startAutoRefresh() {
     );
 }
 
+/*
+============================================================
+COUNTDOWN TIMER
+============================================================
+*/
+
 function startCountdown() {
-  if (
-    countdownTimer
-  ) {
+  if (countdownTimer) {
     clearInterval(
       countdownTimer
     );
@@ -1303,44 +1526,133 @@ function startCountdown() {
   countdownTimer =
     setInterval(
       () => {
-        updateCountdown();
+        renderCountdown();
       },
-      1000
+      COUNTDOWN_INTERVAL_MS
     );
 }
 
-/* ==========================================================
-   BUTTON
-========================================================== */
+/*
+============================================================
+ANALYZE BUTTON
+============================================================
+*/
 
 function bindAnalyzeButton() {
   const button =
-    $(
+    firstExisting([
       'analyzeBtn',
-      'analyzeMarketBtn',
       'analyzeButton',
       'analyzeMarket'
-    );
+    ]);
 
   if (!button) {
     return;
   }
 
+  /*
+  Prevent duplicate listeners.
+  */
+  if (
+    button.dataset.poaiBound ===
+    'true'
+  ) {
+    return;
+  }
+
+  button.dataset.poaiBound =
+    'true';
+
   button.addEventListener(
     'click',
     () => {
-      analyzeMarket({
-        force: true
-      });
+      analyzeMarket();
     }
   );
 }
 
-/* ==========================================================
-   INIT
-========================================================== */
+/*
+============================================================
+SELECTED PAIR / TIMEFRAME
 
-async function init() {
+The backend chooses the best market.
+
+These controls are therefore informational unless the
+HTML uses them for a separate /api/analyze request.
+
+No frontend signal calculation is performed.
+============================================================
+*/
+
+function populatePairs(
+  response
+) {
+  if (
+    !response ||
+    !Array.isArray(
+      response.pairs
+    )
+  ) {
+    return;
+  }
+
+  const selects = [
+    firstExisting([
+      'pairSelect',
+      'currencyPair',
+      'pair'
+    ]),
+    firstExisting([
+      'timeframeSelect',
+      'expirySelect',
+      'timeframe'
+    ])
+  ].filter(Boolean);
+
+  const pairSelect =
+    selects[0];
+
+  if (
+    pairSelect &&
+    pairSelect.tagName ===
+      'SELECT'
+  ) {
+    /*
+    Only populate if currently empty.
+    */
+    if (
+      pairSelect.options.length ===
+      0
+    ) {
+      response.pairs.forEach(
+        pair => {
+          const option =
+            document.createElement(
+              'option'
+            );
+
+          option.value =
+            pair;
+
+          option.textContent =
+            pair;
+
+          pairSelect.appendChild(
+            option
+          );
+        }
+      );
+    }
+  }
+}
+
+/*
+============================================================
+INITIALIZE
+============================================================
+*/
+
+async function initPOAI() {
   bindAnalyzeButton();
 
   startCountdown();
@@ -1348,43 +1660,38 @@ async function init() {
   startAutoRefresh();
 
   /*
-   First live request.
+  First market request.
   */
-  await analyzeMarket({
-    force: true
-  });
+  await analyzeMarket();
 
   /*
-   Health is informational only.
-   It does NOT determine the signal.
+  Health is separate diagnostics only.
   */
-  await checkBackend();
+  checkHealth();
 }
 
-/* ==========================================================
-   PUBLIC API
-========================================================== */
+/*
+============================================================
+PUBLIC API
+============================================================
+*/
 
 window.POAI = {
-  version:
-    'V9.0.3',
-
   analyzeMarket,
-
-  checkBackend,
-
-  renderMarket,
-
+  checkHealth,
+  getCurrentResponse:
+    () => currentResponse,
   getCurrentMarket:
     () => currentMarket,
-
-  getLastResponse:
-    () => currentResponse
+  refresh:
+    analyzeMarket
 };
 
-/* ==========================================================
-   START
-========================================================== */
+/*
+============================================================
+START AFTER DOM READY
+============================================================
+*/
 
 if (
   document.readyState ===
@@ -1392,8 +1699,8 @@ if (
 ) {
   document.addEventListener(
     'DOMContentLoaded',
-    init
+    initPOAI
   );
 } else {
-  init();
+  initPOAI();
 }
