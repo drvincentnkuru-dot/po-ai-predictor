@@ -3,38 +3,42 @@
 /*
 ============================================================
  PO AI PREDICTOR
- FRONTEND V9.0.1 FINAL
+ FRONTEND V9.0.2 FINAL
  LIVE ONLY — TWELVE DATA
 
  BACKEND:
  https://po-ai-predictor-api.onrender.com
 
- FINAL ARCHITECTURE
+ MATCHED EXACTLY TO:
+ index.html V9.0
+
+ ARCHITECTURE
  -----------------------------------------------------------
  /api/best
       ↓
  response.selectedMarket
       ↓
- renderMarket(selectedMarket)
+ renderMarket()
+      ↓
+ EXISTING HTML IDs
       ↓
  UI
 
  IMPORTANT:
- - Frontend DOES NOT calculate signal
- - Frontend DOES NOT calculate confidence
- - Frontend DOES NOT select pair
- - Frontend DOES NOT select timeframe
- - Frontend DOES NOT calculate scores
- - Frontend DOES NOT reinterpret indicators
- - Backend selectedMarket is the single source of truth
- - One API response contract
- - Preserves last valid signal during temporary errors
+ - Backend is the single source of truth
+ - Frontend does NOT calculate signals
+ - Frontend does NOT calculate confidence
+ - Frontend does NOT choose pair
+ - Frontend does NOT choose timeframe
+ - Frontend does NOT create a second strategy
+ - Frontend only displays selectedMarket
+ - No server.js changes required
 ============================================================
 */
 
 
 /* ==========================================================
-   CONFIGURATION
+   CONFIG
 ========================================================== */
 
 const API_BASE =
@@ -57,14 +61,14 @@ const FETCH_TIMEOUT_MS = 20000;
 let currentMarket = null;
 let currentResponse = null;
 
-let countdownTimer = null;
 let refreshTimer = null;
+let countdownTimer = null;
 
 let requestInProgress = false;
 
 
 /* ==========================================================
-   DOM HELPERS
+   DOM HELPER
 ========================================================== */
 
 function $(selector) {
@@ -72,478 +76,504 @@ function $(selector) {
 }
 
 function setText(selector, value) {
-  const el = $(selector);
+  const element = $(selector);
 
-  if (!el) return;
+  if (!element) {
+    return;
+  }
 
-  el.textContent =
+  if (
     value === undefined ||
     value === null ||
     value === ''
-      ? '—'
-      : String(value);
-}
-
-function setHTML(selector, value) {
-  const el = $(selector);
-
-  if (!el) return;
-
-  el.innerHTML =
-    value === undefined ||
-    value === null
-      ? ''
-      : String(value);
-}
-
-function addClass(selector, className) {
-  const el = $(selector);
-
-  if (!el) return;
-
-  el.classList.add(className);
-}
-
-function removeClass(selector, className) {
-  const el = $(selector);
-
-  if (!el) return;
-
-  el.classList.remove(className);
+  ) {
+    element.textContent = '—';
+  } else {
+    element.textContent = String(value);
+  }
 }
 
 
 /* ==========================================================
-   SAFE NUMBER FORMATTERS
+   SAFE NUMBER
 ========================================================== */
 
-function numberValue(value, fallback = null) {
-  const n = Number(value);
+function toNumber(value) {
+  const number = Number(value);
 
-  if (!Number.isFinite(n)) {
-    return fallback;
-  }
-
-  return n;
+  return Number.isFinite(number)
+    ? number
+    : null;
 }
 
-function formatNumber(value, decimals = 5) {
-  const n = numberValue(value);
 
-  if (n === null) {
-    return '—';
-  }
-
-  return n.toFixed(decimals);
-}
+/* ==========================================================
+   NUMBER FORMAT
+========================================================== */
 
 function formatPrice(value) {
-  const n = numberValue(value);
+  const number = toNumber(value);
 
-  if (n === null) {
+  if (number === null) {
     return '—';
   }
 
-  /*
-   Forex prices can have different decimal precision.
-   Preserve useful precision without changing backend data.
-  */
-
-  if (Math.abs(n) >= 100) {
-    return n.toFixed(3);
+  if (Math.abs(number) >= 100) {
+    return number.toFixed(3);
   }
 
-  if (Math.abs(n) >= 10) {
-    return n.toFixed(4);
+  if (Math.abs(number) >= 10) {
+    return number.toFixed(4);
   }
 
-  return n.toFixed(5);
+  return number.toFixed(5);
 }
 
-function formatPercent(value) {
-  const n = numberValue(value);
 
-  if (n === null) {
+function formatDecimal(value, decimals = 2) {
+  const number = toNumber(value);
+
+  if (number === null) {
     return '—';
   }
 
-  return `${Math.round(n)}%`;
+  return number.toFixed(decimals);
 }
 
-function formatScore(value) {
-  const n = numberValue(value);
 
-  if (n === null) {
+function formatInteger(value) {
+  const number = toNumber(value);
+
+  if (number === null) {
     return '—';
   }
 
-  return Math.round(n);
+  return Math.round(number);
 }
 
 
 /* ==========================================================
-   TIME HELPERS
+   TIME
 ========================================================== */
 
-function parseTime(value) {
+function parseDate(value) {
   if (!value) {
     return null;
   }
 
-  const time = new Date(value);
+  const date = new Date(value);
 
-  if (Number.isNaN(time.getTime())) {
+  if (Number.isNaN(date.getTime())) {
     return null;
   }
 
-  return time;
+  return date;
 }
+
 
 function formatUTC(value) {
-  const time = parseTime(value);
+  const date = parseDate(value);
 
-  if (!time) {
+  if (!date) {
     return '—';
   }
 
-  return time.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-    timeZone: 'UTC'
-  }) + ' UTC';
+  return (
+    date.toLocaleTimeString(
+      'en-GB',
+      {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+        timeZone: 'UTC'
+      }
+    ) + ' UTC'
+  );
 }
 
-function formatUTCShort(value) {
-  const time = parseTime(value);
-
-  if (!time) {
-    return '—';
-  }
-
-  return time.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: 'UTC',
-    hour12: false
-  }) + ' UTC';
-}
 
 function secondsUntil(value) {
-  const time = parseTime(value);
+  const date = parseDate(value);
 
-  if (!time) {
+  if (!date) {
     return null;
   }
 
   return Math.floor(
-    (time.getTime() - Date.now()) / 1000
+    (date.getTime() - Date.now()) / 1000
   );
 }
 
+
 function formatCountdown(seconds) {
-  if (seconds === null || seconds === undefined) {
+  if (
+    seconds === null ||
+    seconds === undefined
+  ) {
     return '—';
   }
 
-  const s = Math.max(0, Math.floor(Number(seconds)));
-
-  const minutes = Math.floor(s / 60);
-  const remainder = s % 60;
-
-  return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
-}
-
-
-/* ==========================================================
-   ESCAPE HTML
-========================================================== */
-
-function escapeHTML(value) {
-  return String(
-    value === undefined ||
-    value === null
-      ? ''
-      : value
-  )
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
-
-
-/* ==========================================================
-   SIGNAL DISPLAY
-========================================================== */
-
-function updateSignal(signal) {
-  const normalized =
-    String(signal || 'NO TRADE')
-      .trim()
-      .toUpperCase();
-
-  const signalEl =
-    $('#signal') ||
-    $('#signalBadge') ||
-    $('.signal-badge');
-
-  const trendEl =
-    $('#trend') ||
-    $('#trendText') ||
-    $('.trend');
-
-  /*
-   Remove previous signal classes.
-  */
-
-  const possibleClasses = [
-    'call',
-    'put',
-    'no-trade',
-    'CALL',
-    'PUT',
-    'NO-TRADE',
-    'buy',
-    'sell',
-    'bullish',
-    'bearish'
-  ];
-
-  if (signalEl) {
-    possibleClasses.forEach(cls => {
-      signalEl.classList.remove(cls);
-    });
-  }
-
-  if (trendEl) {
-    possibleClasses.forEach(cls => {
-      trendEl.classList.remove(cls);
-    });
-  }
-
-  let displaySignal = normalized;
-
-  if (
-    normalized !== 'CALL' &&
-    normalized !== 'PUT' &&
-    normalized !== 'NO TRADE'
-  ) {
-    displaySignal = 'NO TRADE';
-  }
-
-  if (signalEl) {
-    signalEl.textContent = displaySignal;
-
-    if (displaySignal === 'CALL') {
-      signalEl.classList.add('call');
-    }
-
-    if (displaySignal === 'PUT') {
-      signalEl.classList.add('put');
-    }
-
-    if (displaySignal === 'NO TRADE') {
-      signalEl.classList.add('no-trade');
-    }
-  }
-
-  if (trendEl) {
-    trendEl.textContent =
-      displaySignal === 'CALL'
-        ? 'CALL'
-        : displaySignal === 'PUT'
-          ? 'PUT'
-          : 'NO TRADE';
-
-    if (displaySignal === 'CALL') {
-      trendEl.classList.add('call');
-    }
-
-    if (displaySignal === 'PUT') {
-      trendEl.classList.add('put');
-    }
-
-    if (displaySignal === 'NO TRADE') {
-      trendEl.classList.add('no-trade');
-    }
-  }
-}
-
-
-/* ==========================================================
-   STATUS DISPLAY
-========================================================== */
-
-function setStatus(message, type = '') {
-  const candidates = [
-    $('#status'),
-    $('#statusText'),
-    $('#connectionStatus'),
-    $('.status')
-  ].filter(Boolean);
-
-  candidates.forEach(el => {
-    el.textContent = message;
-
-    el.classList.remove(
-      'success',
-      'error',
-      'warning',
-      'connected',
-      'disconnected'
+  const safeSeconds =
+    Math.max(
+      0,
+      Math.floor(Number(seconds))
     );
 
-    if (type) {
-      el.classList.add(type);
-    }
-  });
-}
+  const minutes =
+    Math.floor(
+      safeSeconds / 60
+    );
 
-function setBackendStatus(online) {
-  if (online) {
-    setStatus('LIVE DATA CONNECTED.', 'success');
-  } else {
-    setStatus('BACKEND CONNECTION ERROR.', 'error');
-  }
+  const remaining =
+    safeSeconds % 60;
+
+  return (
+    String(minutes).padStart(2, '0') +
+    ':' +
+    String(remaining).padStart(2, '0')
+  );
 }
 
 
 /* ==========================================================
-   MARKET IDENTIFICATION
+   BACKEND STATUS
 ========================================================== */
 
-function renderPair(market) {
-  const pair =
-    market && market.pair
-      ? market.pair
-      : '—';
+function setBackendStatus(text) {
+  const element =
+    $('#backendStatus');
 
-  setText('#selectedPair', pair);
-  setText('#pair', pair);
-  setText('#marketPair', pair);
-  setText('#currentPair', pair);
-}
-
-function renderTimeframe(market) {
-  const timeframe =
-    numberValue(
-      market && market.timeframe,
-      null
-    );
-
-  if (timeframe === null) {
+  if (!element) {
     return;
   }
 
-  const text = `${timeframe} MIN`;
-
-  setText('#selectedTimeframe', text);
-  setText('#timeframe', text);
-  setText('#expiryTimeframe', text);
-  setText('#currentTimeframe', text);
+  element.textContent = text;
 }
 
 
 /* ==========================================================
-   CONFIDENCE
+   ERROR BOX
 ========================================================== */
 
-function renderConfidence(market) {
-  const confidence =
-    market
-      ? numberValue(market.confidence, null)
-      : null;
+function showError(message) {
+  const errorBox =
+    $('#errorBox');
 
-  if (confidence === null) {
+  if (!errorBox) {
     return;
   }
 
-  const text = `${Math.round(confidence)}%`;
+  errorBox.textContent =
+    message || 'Unknown error';
 
-  setText('#confidence', text);
-  setText('#confidenceValue', text);
-  setText('#confidenceScore', text);
+  errorBox.classList.remove('hidden');
+}
+
+
+function hideError() {
+  const errorBox =
+    $('#errorBox');
+
+  if (!errorBox) {
+    return;
+  }
+
+  errorBox.textContent = '';
+
+  errorBox.classList.add('hidden');
 }
 
 
 /* ==========================================================
-   ENTRY / EXPIRY
+   SIGNAL
 ========================================================== */
 
-function renderEntryExpiry(market) {
+function renderSignal(market) {
   if (!market) {
     return;
   }
 
-  const entryTime =
-    market.entryTime || null;
+  const signal =
+    String(
+      market.signal || 'NO TRADE'
+    ).trim().toUpperCase();
 
-  const expiryTime =
-    market.expiryTime || null;
+  const signalBadge =
+    $('#signalBadge');
+
+  const trendBadge =
+    $('#trendBadge');
+
+  if (signalBadge) {
+
+    signalBadge.classList.remove(
+      'call',
+      'put',
+      'no-trade',
+      'CALL',
+      'PUT',
+      'NO-TRADE'
+    );
+
+    /*
+     IMPORTANT:
+     We do NOT calculate the signal here.
+
+     We simply display:
+     market.signal
+    */
+
+    if (signal === 'CALL') {
+
+      signalBadge.textContent =
+        'CALL';
+
+      signalBadge.classList.add(
+        'call'
+      );
+
+    } else if (signal === 'PUT') {
+
+      signalBadge.textContent =
+        'PUT';
+
+      signalBadge.classList.add(
+        'put'
+      );
+
+    } else {
+
+      signalBadge.textContent =
+        'NO TRADE';
+
+      signalBadge.classList.add(
+        'no-trade'
+      );
+    }
+  }
+
+
+  if (trendBadge) {
+
+    trendBadge.classList.remove(
+      'call',
+      'put',
+      'no-trade'
+    );
+
+    if (signal === 'CALL') {
+
+      trendBadge.textContent =
+        'CALL';
+
+      trendBadge.classList.add(
+        'call'
+      );
+
+    } else if (signal === 'PUT') {
+
+      trendBadge.textContent =
+        'PUT';
+
+      trendBadge.classList.add(
+        'put'
+      );
+
+    } else {
+
+      trendBadge.textContent =
+        'NO TRADE';
+
+      trendBadge.classList.add(
+        'no-trade'
+      );
+    }
+  }
+}
+
+
+/* ==========================================================
+   MARKET CORE
+========================================================== */
+
+function renderMarketCore(market) {
+  if (!market) {
+    return;
+  }
+
+  /*
+   PAIR
+  */
+
+  setText(
+    '#selectedPair',
+    market.pair
+  );
+
+
+  /*
+   TIMEFRAME
+  */
+
+  if (
+    market.timeframe !== undefined &&
+    market.timeframe !== null
+  ) {
+
+    setText(
+      '#timeframe',
+      `${market.timeframe} MIN`
+    );
+
+  } else {
+
+    setText(
+      '#timeframe',
+      '—'
+    );
+  }
+
+
+  /*
+   CONFIDENCE
+  */
+
+  const confidence =
+    toNumber(
+      market.confidence
+    );
+
+  if (confidence !== null) {
+
+    setText(
+      '#confidence',
+      `${Math.round(confidence)}%`
+    );
+
+  } else {
+
+    setText(
+      '#confidence',
+      '—'
+    );
+  }
+
+
+  /*
+   ENTRY TIME
+  */
 
   setText(
     '#entryTime',
-    formatUTC(entryTime)
+    formatUTC(
+      market.entryTime
+    )
   );
 
-  setText(
-    '#entry',
-    formatUTC(entryTime)
-  );
+
+  /*
+   EXPIRY TIME
+  */
 
   setText(
     '#expiryTime',
-    formatUTC(expiryTime)
+    formatUTC(
+      market.expiryTime
+    )
   );
+
+
+  /*
+   ENTRY PRICE
+
+   V9 backend may not provide a separate
+   entryPrice field.
+
+   Therefore:
+   - use market.entryPrice if available
+   - otherwise use market.currentPrice
+  */
+
+  const entryPrice =
+    market.entryPrice !== undefined &&
+    market.entryPrice !== null
+      ? market.entryPrice
+      : market.currentPrice;
 
   setText(
-    '#expiry',
-    formatUTC(expiryTime)
+    '#entryPrice',
+    formatPrice(entryPrice)
   );
 
-  setText(
-    '#lastCandle',
-    formatUTC(market.lastCandle)
-  );
 
-  const entrySeconds =
-    numberValue(
-      market.entryInSeconds,
-      null
-    );
+  /*
+   COUNTDOWN
+  */
 
-  if (entrySeconds !== null) {
-    setText(
-      '#entryInSeconds',
-      `${Math.max(0, Math.round(entrySeconds))} sec`
-    );
-  }
+  updateCountdown();
 }
 
 
 /* ==========================================================
-   CURRENT PRICE
+   SCORES
 ========================================================== */
 
-function renderCurrentPrice(market) {
+function renderScores(market) {
   if (!market) {
     return;
   }
 
-  const price =
-    formatPrice(market.currentPrice);
+  const score =
+    market.score || {};
 
-  setText('#currentPrice', price);
-  setText('#price', price);
-  setText('#marketPrice', price);
+
+  setText(
+    '#callScore',
+    formatInteger(
+      score.call
+    )
+  );
+
+
+  setText(
+    '#putScore',
+    formatInteger(
+      score.put
+    )
+  );
+
+
+  /*
+   SUPPORT
+  */
+
+  const indicators =
+    market.indicators || {};
+
+  setText(
+    '#support',
+    formatPrice(
+      indicators.support
+    )
+  );
+
+
+  /*
+   RESISTANCE
+  */
+
+  setText(
+    '#resistance',
+    formatPrice(
+      indicators.resistance
+    )
+  );
 }
 
 
 /* ==========================================================
-   INDICATORS
+   TECHNICAL INDICATORS
 ========================================================== */
 
 function renderIndicators(market) {
@@ -554,68 +584,137 @@ function renderIndicators(market) {
   const indicators =
     market.indicators || {};
 
-  /*
-   IMPORTANT:
-   These values are DISPLAY ONLY.
 
-   Frontend does not interpret them.
-   Frontend does not create signal logic from them.
+  /*
+   EMA 9
   */
 
   setText(
     '#ema9',
-    formatPrice(indicators.ema9)
+    formatPrice(
+      indicators.ema9
+    )
   );
+
+
+  /*
+   EMA 21
+  */
 
   setText(
     '#ema21',
-    formatPrice(indicators.ema21)
+    formatPrice(
+      indicators.ema21
+    )
   );
 
-  setText(
-    '#rsi14',
-    formatNumber(indicators.rsi14, 2)
-  );
+
+  /*
+   RSI 14
+
+   IMPORTANT:
+   HTML ID = rsi
+  */
 
   setText(
-    '#adx14',
-    formatNumber(indicators.adx14, 2)
+    '#rsi',
+    formatDecimal(
+      indicators.rsi14,
+      2
+    )
   );
 
-  setText(
-    '#atr14',
-    formatNumber(indicators.atr14, 6)
-  );
+
+  /*
+   ADX 14
+
+   IMPORTANT:
+   HTML ID = adx
+  */
 
   setText(
-    '#stochastic14',
-    formatNumber(indicators.stochastic14, 2)
+    '#adx',
+    formatDecimal(
+      indicators.adx14,
+      2
+    )
   );
 
-  setText(
-    '#support',
-    formatPrice(indicators.support)
-  );
+
+  /*
+   STOCHASTIC
+
+   IMPORTANT:
+   HTML ID = stochastic
+  */
 
   setText(
-    '#resistance',
-    formatPrice(indicators.resistance)
+    '#stochastic',
+    formatDecimal(
+      indicators.stochastic14,
+      2
+    )
   );
 
-  setText(
-    '#bollingerUpper',
-    formatPrice(indicators.bollingerUpper)
-  );
+
+  /*
+   ATR
+
+   IMPORTANT:
+   HTML ID = atr
+  */
 
   setText(
-    '#bollingerMiddle',
-    formatPrice(indicators.bollingerMiddle)
+    '#atr',
+    formatDecimal(
+      indicators.atr14,
+      6
+    )
   );
+}
 
-  setText(
-    '#bollingerLower',
-    formatPrice(indicators.bollingerLower)
-  );
+
+/* ==========================================================
+   MARKET PSYCHOLOGY
+========================================================== */
+
+function renderPsychology(market) {
+  if (!market) {
+    return;
+  }
+
+  const psychology =
+    market.marketPsychology || {};
+
+  /*
+   Display backend value only.
+
+   No frontend interpretation.
+  */
+
+  if (psychology.label) {
+
+    setText(
+      '#psychology',
+      psychology.label
+    );
+
+  } else if (
+    psychology.direction
+  ) {
+
+    setText(
+      '#psychology',
+      psychology.direction
+    );
+
+  } else {
+
+    setText(
+      '#psychology',
+      '—'
+    );
+  }
 }
 
 
@@ -631,143 +730,41 @@ function renderPriceAction(market) {
   const priceAction =
     market.priceAction || {};
 
-  setText(
-    '#priceActionPattern',
-    priceAction.pattern || '—'
-  );
-
-  setText(
-    '#pattern',
-    priceAction.pattern || '—'
-  );
-
-  setText(
-    '#priceActionDirection',
-    priceAction.direction || '—'
-  );
-
-  setText(
-    '#priceActionStrength',
-    priceAction.strength !== undefined
-      ? priceAction.strength
-      : '—'
-  );
-}
-
-
-/* ==========================================================
-   MARKET PSYCHOLOGY
-========================================================== */
-
-function renderMarketPsychology(market) {
-  if (!market) {
-    return;
-  }
-
-  const psychology =
-    market.marketPsychology || {};
-
   /*
-   IMPORTANT:
-   "Market Psychology" is backend price-action inference.
-   Frontend only displays backend values.
+   Display backend value only.
   */
 
-  setText(
-    '#marketPsychology',
-    psychology.label || '—'
-  );
+  if (priceAction.pattern) {
 
-  setText(
-    '#psychologyLabel',
-    psychology.label || '—'
-  );
+    setText(
+      '#priceAction',
+      priceAction.pattern
+    );
 
-  setText(
-    '#psychologyDirection',
-    psychology.direction || '—'
-  );
+  } else if (
+    priceAction.direction
+  ) {
 
-  setText(
-    '#psychologyScore',
-    psychology.score !== undefined
-      ? psychology.score
-      : '—'
-  );
-}
+    setText(
+      '#priceAction',
+      priceAction.direction
+    );
 
+  } else {
 
-/* ==========================================================
-   SCORE
-========================================================== */
-
-function renderScore(market) {
-  if (!market) {
-    return;
+    setText(
+      '#priceAction',
+      '—'
+    );
   }
-
-  const score =
-    market.score || {};
-
-  setText(
-    '#callScore',
-    formatScore(score.call)
-  );
-
-  setText(
-    '#putScore',
-    formatScore(score.put)
-  );
-
-  setText(
-    '#signalGap',
-    formatScore(score.gap)
-  );
 }
 
 
 /* ==========================================================
-   QUALITY
+   ANALYSIS REASONS
 ========================================================== */
 
-function renderQuality(market) {
-  if (!market) {
-    return;
-  }
-
-  const quality =
-    market.quality || {};
-
-  setText(
-    '#volatility',
-    quality.volatility || '—'
-  );
-
-  setText(
-    '#nearSupport',
-    quality.nearSupport === true
-      ? 'YES'
-      : quality.nearSupport === false
-        ? 'NO'
-        : '—'
-  );
-
-  setText(
-    '#nearResistance',
-    quality.nearResistance === true
-      ? 'YES'
-      : quality.nearResistance === false
-        ? 'NO'
-        : '—'
-  );
-}
-
-
-/* ==========================================================
-   DISPLAY-ONLY MARKET FACTS
-========================================================== */
-
-function renderMarketFacts(market) {
+function renderReasons(market) {
   if (!market) {
     return;
   }
@@ -787,97 +784,107 @@ function renderMarketFacts(market) {
   /*
    IMPORTANT:
 
-   This section intentionally does NOT say:
-   - RSI bullish
-   - RSI bearish
-   - EMA bullish
-   - EMA bearish
-   - ADX strong
-   - pattern means CALL
-   - psychology means PUT
+   These are DISPLAY FACTS ONLY.
 
-   It only displays the exact backend values.
+   We do NOT say:
+   RSI > 50 = CALL
+   EMA > EMA = CALL
+   etc.
 
-   Therefore frontend cannot accidentally create
-   a second signal engine.
+   The backend already made the final decision.
   */
 
-  const facts = [];
+  const reasons = [];
+
 
   if (
-    indicators.ema9 !== undefined &&
-    indicators.ema21 !== undefined
+    indicators.ema9 !== undefined
   ) {
-    facts.push(
+    reasons.push(
       `EMA9 ${formatPrice(indicators.ema9)}`
     );
+  }
 
-    facts.push(
+
+  if (
+    indicators.ema21 !== undefined
+  ) {
+    reasons.push(
       `EMA21 ${formatPrice(indicators.ema21)}`
     );
   }
 
-  if (indicators.rsi14 !== undefined) {
-    facts.push(
-      `RSI14 ${formatNumber(indicators.rsi14, 2)}`
+
+  if (
+    indicators.rsi14 !== undefined
+  ) {
+    reasons.push(
+      `RSI14 ${formatDecimal(indicators.rsi14, 2)}`
     );
   }
 
-  if (indicators.adx14 !== undefined) {
-    facts.push(
-      `ADX14 ${formatNumber(indicators.adx14, 2)}`
+
+  if (
+    indicators.adx14 !== undefined
+  ) {
+    reasons.push(
+      `ADX14 ${formatDecimal(indicators.adx14, 2)}`
     );
   }
 
-  if (indicators.stochastic14 !== undefined) {
-    facts.push(
-      `STOCH ${formatNumber(indicators.stochastic14, 2)}`
+
+  if (
+    indicators.stochastic14 !== undefined
+  ) {
+    reasons.push(
+      `STOCH ${formatDecimal(indicators.stochastic14, 2)}`
     );
   }
 
-  if (priceAction.pattern) {
-    facts.push(
+
+  if (
+    priceAction.pattern
+  ) {
+    reasons.push(
       `PATTERN ${priceAction.pattern}`
     );
   }
 
-  if (psychology.label) {
-    facts.push(
+
+  if (
+    psychology.label
+  ) {
+    reasons.push(
       `PSYCHOLOGY ${psychology.label}`
     );
   }
+
 
   if (
     score.call !== undefined &&
     score.put !== undefined
   ) {
-    facts.push(
-      `CALL ${formatScore(score.call)} / PUT ${formatScore(score.put)}`
+    reasons.push(
+      `CALL ${formatInteger(score.call)} / PUT ${formatInteger(score.put)}`
     );
   }
+
 
   if (
     score.gap !== undefined
   ) {
-    facts.push(
-      `GAP ${formatScore(score.gap)}`
+    reasons.push(
+      `GAP ${formatInteger(score.gap)}`
     );
   }
 
-  const factsText =
-    facts.length > 0
-      ? facts.join(' • ')
-      : 'Backend market data received.';
 
-  /*
-   Support several possible IDs so this remains
-   compatible with the existing HTML.
-  */
-
-  setText('#marketReasons', factsText);
-  setText('#signalReasons', factsText);
-  setText('#reasons', factsText);
-  setText('#analysisReasons', factsText);
+  setText(
+    '#reasons',
+    reasons.length
+      ? reasons.join(' • ')
+      : '—'
+  );
 }
 
 
@@ -890,45 +897,45 @@ function renderDataAge(market) {
     return;
   }
 
-  /*
-   Backend V9 response does not necessarily provide dataAge.
-   Therefore only display it when it exists.
-  */
+  let age = null;
 
   if (
-    market.dataAge !== undefined &&
-    market.dataAge !== null
+    market.dataAgeSeconds !== undefined
   ) {
-    const age =
-      numberValue(
-        market.dataAge,
-        null
+    age =
+      toNumber(
+        market.dataAgeSeconds
       );
-
-    if (age !== null) {
-      setText(
-        '#dataAge',
-        `${Math.round(age)} sec`
-      );
-    }
   }
 
   if (
-    market.dataAgeSeconds !== undefined &&
-    market.dataAgeSeconds !== null
+    age === null &&
+    market.dataAge !== undefined
   ) {
-    const age =
-      numberValue(
-        market.dataAgeSeconds,
-        null
+    age =
+      toNumber(
+        market.dataAge
       );
+  }
 
-    if (age !== null) {
-      setText(
-        '#dataAge',
-        `${Math.round(age)} sec`
-      );
-    }
+  if (age !== null) {
+
+    setText(
+      '#dataAge',
+      `${Math.round(age)} sec`
+    );
+
+  } else {
+
+    /*
+     If backend does not provide dataAge,
+     do not invent one.
+    */
+
+    setText(
+      '#dataAge',
+      '—'
+    );
   }
 }
 
@@ -942,46 +949,38 @@ function updateCountdown() {
     return;
   }
 
+  /*
+   The backend provides entryTime.
+
+   Countdown is simply the time remaining
+   until that backend-selected entryTime.
+  */
+
   const seconds =
     secondsUntil(
       currentMarket.entryTime
     );
 
   if (seconds === null) {
+
+    setText(
+      '#countdown',
+      '—'
+    );
+
     return;
   }
 
-  const countdown =
-    formatCountdown(seconds);
 
   setText(
     '#countdown',
-    countdown
-  );
-
-  setText(
-    '#entryCountdown',
-    countdown
-  );
-
-  setText(
-    '#timeToEntry',
-    countdown
-  );
-
-  /*
-   Also expose raw seconds where the HTML supports it.
-  */
-
-  setText(
-    '#countdownSeconds',
-    `${Math.max(0, seconds)} sec`
+    formatCountdown(seconds)
   );
 }
 
 
 /* ==========================================================
-   SCANNER INFORMATION
+   SCANNER
 ========================================================== */
 
 function renderScanner(response) {
@@ -995,335 +994,354 @@ function renderScanner(response) {
   const metadata =
     response.metadata || {};
 
-  setText(
-    '#scannerStatus',
-    scanner.scanRunning === true
-      ? 'RUNNING'
-      : 'READY'
-  );
 
-  setText(
-    '#scanCursor',
-    scanner.scanCursor !== undefined
-      ? scanner.scanCursor
-      : '—'
-  );
+  /*
+   LIVE PAIR SCANNER
 
-  setText(
-    '#scanBatchSize',
-    scanner.scanBatchSize !== undefined
-      ? scanner.scanBatchSize
-      : '—'
-  );
+   Keep this section simple and compatible
+   with existing HTML.
+  */
 
-  setText(
-    '#lastScan',
-    formatUTC(scanner.lastScanAt)
-  );
+  const parts = [];
 
-  setText(
-    '#totalScanned',
-    scanner.totalScanned !== undefined
-      ? scanner.totalScanned
-      : '—'
-  );
 
-  setText(
-    '#totalFailed',
-    scanner.totalFailed !== undefined
-      ? scanner.totalFailed
-      : '—'
-  );
+  if (
+    response.pairs !== undefined
+  ) {
+    parts.push(
+      `${response.pairs} pairs`
+    );
+  }
 
-  setText(
-    '#apiRequests',
-    scanner.totalApiRequests !== undefined
-      ? scanner.totalApiRequests
-      : '—'
-  );
 
-  setText(
-    '#candidateCount',
+  if (
     response.candidateCount !== undefined
-      ? response.candidateCount
-      : '—'
-  );
+  ) {
+    parts.push(
+      `${response.candidateCount} setups`
+    );
+  }
+
+
+  if (
+    scanner.totalScanned !== undefined
+  ) {
+    parts.push(
+      `${scanner.totalScanned} scanned`
+    );
+  }
+
+
+  if (
+    scanner.totalFailed !== undefined
+  ) {
+    parts.push(
+      `${scanner.totalFailed} failed`
+    );
+  }
+
 
   if (
     metadata.dailyCreditsUsed !== undefined
   ) {
-    setText(
-      '#dailyCreditsUsed',
-      metadata.dailyCreditsUsed
+    parts.push(
+      `${metadata.dailyCreditsUsed} credits`
     );
   }
 
-  if (
-    metadata.dailyCreditsRemaining !== undefined
-  ) {
-    setText(
-      '#dailyCreditsRemaining',
-      metadata.dailyCreditsRemaining
-    );
+
+  setText(
+    '#scanInfo',
+    parts.length
+      ? parts.join(' • ')
+      : 'LIVE'
+  );
+
+
+  /*
+   Scanner detail
+  */
+
+  const scannerElement =
+    $('#scanner');
+
+  if (!scannerElement) {
+    return;
   }
 
-  if (
-    metadata.providerMinuteLimit !== undefined
-  ) {
-    setText(
-      '#providerMinuteLimit',
-      metadata.providerMinuteLimit
-    );
-  }
+
+  const status =
+    scanner.scanRunning === true
+      ? 'SCANNING'
+      : 'READY';
+
+
+  const batch =
+    scanner.scanBatchSize !== undefined
+      ? scanner.scanBatchSize
+      : '—';
+
+
+  const lastScan =
+    scanner.lastScanAt
+      ? formatUTC(
+          scanner.lastScanAt
+        )
+      : '—';
+
+
+  scannerElement.textContent =
+    `${status} • Batch ${batch} • Last scan ${lastScan}`;
 }
 
 
 /* ==========================================================
-   RENDER COMPLETE MARKET
+   COMPLETE MARKET RENDER
 ========================================================== */
 
-function renderMarket(market, response = null) {
+function renderMarket(
+  market,
+  response = null
+) {
   if (!market) {
     return;
   }
 
   /*
-   This is the most important architectural rule:
+   SINGLE SOURCE OF TRUTH
 
-   market = response.selectedMarket
-
-   Everything shown below is read directly from
-   that object.
-
-   No frontend prediction engine exists here.
+   Everything comes from:
+   response.selectedMarket
   */
 
-  currentMarket = market;
+  currentMarket =
+    market;
 
   if (response) {
-    currentResponse = response;
+    currentResponse =
+      response;
   }
 
-  /*
-   Core signal
-  */
-
-  updateSignal(market.signal);
 
   /*
-   Market
+   Signal
   */
 
-  renderPair(market);
-  renderTimeframe(market);
+  renderSignal(
+    market
+  );
+
 
   /*
-   Confidence
+   Core market
   */
 
-  renderConfidence(market);
+  renderMarketCore(
+    market
+  );
+
 
   /*
-   Entry / expiry
+   Scores
   */
 
-  renderEntryExpiry(market);
+  renderScores(
+    market
+  );
 
-  /*
-   Current price
-  */
-
-  renderCurrentPrice(market);
 
   /*
    Indicators
   */
 
-  renderIndicators(market);
+  renderIndicators(
+    market
+  );
+
+
+  /*
+   Psychology
+  */
+
+  renderPsychology(
+    market
+  );
+
 
   /*
    Price action
   */
 
-  renderPriceAction(market);
+  renderPriceAction(
+    market
+  );
+
 
   /*
-   Market psychology
+   Reasons
   */
 
-  renderMarketPsychology(market);
+  renderReasons(
+    market
+  );
+
 
   /*
-   Backend score
+   Data age
   */
 
-  renderScore(market);
+  renderDataAge(
+    market
+  );
+
 
   /*
-   Backend quality
-  */
-
-  renderQuality(market);
-
-  /*
-   Display-only facts.
-
-   No interpretation.
-  */
-
-  renderMarketFacts(market);
-
-  /*
-   Data age if available
-  */
-
-  renderDataAge(market);
-
-  /*
-   Countdown
-  */
-
-  updateCountdown();
-
-  /*
-   Scanner metadata
+   Scanner
   */
 
   if (response) {
-    renderScanner(response);
+    renderScanner(
+      response
+    );
   }
-
-  /*
-   Optional generic market timestamp
-  */
-
-  setText(
-    '#updatedAt',
-    formatUTCShort(
-      market.lastCandle
-    )
-  );
-
-  setText(
-    '#marketUpdatedAt',
-    formatUTCShort(
-      market.lastCandle
-    )
-  );
 }
 
 
 /* ==========================================================
-   FETCH WITH TIMEOUT
+   FETCH JSON
 ========================================================== */
 
 async function fetchJSON(
   url,
-  options = {},
   timeout = FETCH_TIMEOUT_MS
 ) {
   const controller =
     new AbortController();
 
-  const timeoutId =
+  const timer =
     setTimeout(
-      () => controller.abort(),
+      () => {
+        controller.abort();
+      },
       timeout
     );
 
+
   try {
+
     const response =
       await fetch(
         url,
         {
-          ...options,
-          signal: controller.signal,
+          method: 'GET',
           cache: 'no-store',
+          signal: controller.signal,
           headers: {
-            Accept: 'application/json',
-            ...(options.headers || {})
+            'Accept':
+              'application/json'
           }
         }
       );
 
+
     const text =
       await response.text();
 
-    let data = null;
+
+    let data;
+
 
     try {
+
       data =
         text
           ? JSON.parse(text)
           : null;
+
     } catch (error) {
+
       throw new Error(
         `Invalid JSON response (${response.status})`
       );
     }
 
+
     if (!response.ok) {
+
       const message =
         data &&
         data.error
           ? data.error
           : `HTTP ${response.status}`;
 
-      throw new Error(message);
+      throw new Error(
+        message
+      );
     }
+
 
     return data;
 
   } finally {
-    clearTimeout(timeoutId);
+
+    clearTimeout(
+      timer
+    );
   }
 }
 
 
 /* ==========================================================
-   BACKEND HEALTH CHECK
+   HEALTH CHECK
 ========================================================== */
 
 async function checkBackend() {
   try {
+
     const data =
       await fetchJSON(
         HEALTH_ENDPOINT
       );
 
+
     if (
       data &&
-      (
-        data.ok === true ||
-        data.status === 'ok'
-      )
+      data.ok === true
     ) {
-      setBackendStatus(true);
 
-      /*
-       Health is informational only.
-       It does not control the market signal.
-      */
+      setBackendStatus(
+        'LIVE'
+      );
 
       return data;
     }
 
-    throw new Error(
-      'Backend health check failed'
+
+    setBackendStatus(
+      'ERROR'
     );
 
+    return null;
+
   } catch (error) {
+
     console.error(
-      '[POAI] Backend health error:',
+      '[POAI] Health check error:',
       error
     );
 
+
     /*
-     Do not erase the last valid market.
-     Only update connection status.
+     Do not destroy existing market.
     */
 
-    setBackendStatus(false);
+    if (!currentMarket) {
+
+      setBackendStatus(
+        'ERROR'
+      );
+    }
+
 
     return null;
   }
@@ -1335,25 +1353,29 @@ async function checkBackend() {
 ========================================================== */
 
 async function analyzeMarket() {
+
   if (requestInProgress) {
     return;
   }
 
-  requestInProgress = true;
+
+  requestInProgress =
+    true;
+
 
   const button =
-    $('#analyzeButton') ||
-    $('#analyzeBtn') ||
-    $('button[data-action="analyze"]');
+    $('#analyzeBtn');
+
 
   if (button) {
-    button.disabled = true;
 
-    /*
-     Preserve original button text where possible.
-    */
+    button.disabled =
+      true;
 
-    if (!button.dataset.originalText) {
+    if (
+      !button.dataset.originalText
+    ) {
+
       button.dataset.originalText =
         button.textContent;
     }
@@ -1362,18 +1384,25 @@ async function analyzeMarket() {
       'ANALYZING...';
   }
 
+
+  hideError();
+
+
   try {
-    setStatus(
-      'CONNECTING TO LIVE DATA...',
-      'warning'
+
+    setBackendStatus(
+      'CONNECTING'
     );
 
-    /*
-     ONE endpoint.
-     ONE response.
-     ONE selectedMarket.
 
-     No pair/timeframe request is sent from frontend.
+    /*
+     ONE API CALL
+
+     No pair parameter.
+     No timeframe parameter.
+     No second prediction engine.
+
+     Backend chooses everything.
     */
 
     const data =
@@ -1381,50 +1410,73 @@ async function analyzeMarket() {
         BEST_ENDPOINT
       );
 
+
     /*
-     Strict response validation.
+     Validate backend response.
     */
 
-    if (!data || data.ok !== true) {
+    if (
+      !data ||
+      data.ok !== true
+    ) {
+
       throw new Error(
-        data && data.error
+        data &&
+        data.error
           ? data.error
           : 'Backend returned ok:false'
       );
     }
 
+
+    /*
+     Validate selectedMarket.
+    */
+
     if (
       !data.selectedMarket ||
       typeof data.selectedMarket !== 'object'
     ) {
+
       throw new Error(
-        'Backend response has no selectedMarket'
+        'Backend response does not contain selectedMarket'
       );
     }
 
+
     /*
-     Store complete backend response for debugging.
+     Save complete response.
     */
 
-    currentResponse = data;
+    currentResponse =
+      data;
+
 
     try {
-      window.__POAI_LAST_RESPONSE = data;
+
+      window.__POAI_LAST_RESPONSE =
+        data;
+
     } catch (error) {
       /*
-       Ignore storage/debug assignment failure.
+       Ignore debug-storage problems.
       */
+
+
     }
 
+
     /*
-     THE ONLY MARKET OBJECT USED BY THE FRONTEND.
+     THIS IS THE ONLY MARKET OBJECT
+     USED BY THE FRONTEND.
     */
 
     const selectedMarket =
       data.selectedMarket;
 
+
     /*
-     Render exactly what backend selected.
+     Render backend decision.
     */
 
     renderMarket(
@@ -1432,73 +1484,69 @@ async function analyzeMarket() {
       data
     );
 
-    /*
-     Successful connection.
-    */
-
-    setBackendStatus(true);
 
     /*
-     Additional status information.
+     Backend connected successfully.
     */
 
-    const signal =
-      String(
-        selectedMarket.signal || 'NO TRADE'
-      ).toUpperCase();
-
-    const pair =
-      selectedMarket.pair || '—';
-
-    const timeframe =
-      selectedMarket.timeframe !== undefined
-        ? `${selectedMarket.timeframe}M`
-        : '';
-
-    setText(
-      '#analysisStatus',
-      `${pair} • ${timeframe} • ${signal}`
+    setBackendStatus(
+      'LIVE'
     );
+
 
     return data;
 
   } catch (error) {
+
     console.error(
       '[POAI] Analyze error:',
       error
     );
 
+
     /*
-     VERY IMPORTANT:
+     Do NOT create fake signal.
 
-     Do not replace a valid previous signal with
-     fake values simply because the network failed.
-
-     Keep currentMarket visible.
+     If previous valid market exists,
+     keep displaying it.
     */
 
     if (currentMarket) {
-      setStatus(
-        'LIVE CONNECTION TEMPORARILY UNAVAILABLE — SHOWING LAST VALID SIGNAL.',
-        'warning'
+
+      setBackendStatus(
+        'LIVE'
+      );
+
+      showError(
+        'Temporary connection issue. Showing last valid market.'
       );
 
       updateCountdown();
 
     } else {
-      setStatus(
-        `LIVE DATA ERROR: ${error.message}`,
-        'error'
+
+      setBackendStatus(
+        'ERROR'
+      );
+
+      showError(
+        `LIVE DATA ERROR: ${error.message}`
       );
     }
+
 
     return null;
 
   } finally {
-    requestInProgress = false;
+
+    requestInProgress =
+      false;
+
 
     if (button) {
-      button.disabled = false;
+
+      button.disabled =
+        false;
 
       button.textContent =
         button.dataset.originalText ||
@@ -1513,14 +1561,21 @@ async function analyzeMarket() {
 ========================================================== */
 
 function startAutoRefresh() {
+
   if (refreshTimer) {
-    clearInterval(refreshTimer);
+
+    clearInterval(
+      refreshTimer
+    );
   }
+
 
   refreshTimer =
     setInterval(
       () => {
+
         analyzeMarket();
+
       },
       REFRESH_MS
     );
@@ -1532,14 +1587,21 @@ function startAutoRefresh() {
 ========================================================== */
 
 function startCountdown() {
+
   if (countdownTimer) {
-    clearInterval(countdownTimer);
+
+    clearInterval(
+      countdownTimer
+    );
   }
+
 
   countdownTimer =
     setInterval(
       () => {
+
         updateCountdown();
+
       },
       1000
     );
@@ -1547,119 +1609,110 @@ function startCountdown() {
 
 
 /* ==========================================================
-   BUTTON BINDING
-========================================================== */
-
-function bindAnalyzeButton() {
-  const button =
-    $('#analyzeButton') ||
-    $('#analyzeBtn') ||
-    $('button[data-action="analyze"]');
-
-  if (!button) {
-    console.warn(
-      '[POAI] Analyze button not found.'
-    );
-
-    return;
-  }
-
-  button.addEventListener(
-    'click',
-    () => {
-      analyzeMarket();
-    }
-  );
-}
-
-
-/* ==========================================================
-   SELECT / INPUT COMPATIBILITY
-========================================================== */
-
-function preserveExistingControls() {
-  /*
-   V9 backend automatically selects the strongest market.
-
-   Therefore frontend does not use pair/timeframe controls
-   to generate a separate prediction.
-
-   Existing dropdowns can remain in the HTML without
-   affecting backend selectedMarket.
-  */
-
-  const pairSelect =
-    $('#pairSelect') ||
-    $('#currencyPair') ||
-    $('#pair');
-
-  const timeframeSelect =
-    $('#timeframeSelect') ||
-    $('#expirySelect') ||
-    $('#timeframe');
-
-  /*
-   These controls are intentionally NOT used to calculate
-   signal/pair/confidence.
-
-   They remain compatible with the existing UI.
-  */
-
-  if (pairSelect) {
-    pairSelect.dataset.backendControlled = 'true';
-  }
-
-  if (timeframeSelect) {
-    timeframeSelect.dataset.backendControlled = 'true';
-  }
-}
-
-
-/* ==========================================================
-   INITIAL UI STATE
+   INITIAL UI
 ========================================================== */
 
 function initializeUI() {
-  setStatus(
-    'CONNECTING TO LIVE DATA...',
-    'warning'
+
+  setBackendStatus(
+    'CONNECTING'
   );
 
-  /*
-   Do not fabricate:
-   - CALL
-   - PUT
-   - confidence
-   - pair
-   - timeframe
 
-   until backend returns selectedMarket.
-  */
+  setText(
+    '#selectedPair',
+    'Waiting for live data…'
+  );
+
+
+  setText(
+    '#signalBadge',
+    'NO TRADE'
+  );
+
+
+  setText(
+    '#trendBadge',
+    '—'
+  );
+
+
+  setText(
+    '#confidence',
+    '—'
+  );
+
+
+  setText(
+    '#timeframe',
+    '—'
+  );
+
 
   setText(
     '#countdown',
     '—'
   );
 
+
   setText(
-    '#entryCountdown',
+    '#entryTime',
     '—'
   );
 
+
   setText(
-    '#confidence',
+    '#expiryTime',
+    '—'
+  );
+
+
+  setText(
+    '#entryPrice',
     '—'
   );
 }
 
 
 /* ==========================================================
-   INITIAL LOAD
+   BUTTON
+========================================================== */
+
+function bindAnalyzeButton() {
+
+  const button =
+    $('#analyzeBtn');
+
+
+  if (!button) {
+
+    console.error(
+      '[POAI] #analyzeBtn was not found.'
+    );
+
+    return;
+  }
+
+
+  button.addEventListener(
+    'click',
+    () => {
+
+      analyzeMarket();
+
+    }
+  );
+}
+
+
+/* ==========================================================
+   INIT
 ========================================================== */
 
 async function init() {
+
   console.log(
-    '[POAI] PO AI Predictor V9.0.1 FINAL starting...'
+    '[POAI] PO AI Predictor V9.0.2 FINAL'
   );
 
   console.log(
@@ -1667,29 +1720,32 @@ async function init() {
     API_BASE
   );
 
+
   initializeUI();
 
-  preserveExistingControls();
 
   bindAnalyzeButton();
 
+
   startCountdown();
 
+
   /*
-   First live analysis.
+   FIRST LIVE ANALYSIS
   */
 
   await analyzeMarket();
 
+
   /*
-   Informational health check.
-   It does not create or modify the signal.
+   Health is informational.
   */
 
   checkBackend();
 
+
   /*
-   Continue refreshing the ONE /api/best response.
+   Automatic refresh every 15 seconds.
   */
 
   startAutoRefresh();
@@ -1701,7 +1757,9 @@ async function init() {
 ========================================================== */
 
 window.POAI = {
-  version: 'V9.0.1 FINAL',
+
+  version:
+    'V9.0.2 FINAL',
 
   analyzeMarket,
 
@@ -1709,11 +1767,11 @@ window.POAI = {
 
   renderMarket,
 
-  getCurrentMarket: () =>
-    currentMarket,
+  getCurrentMarket:
+    () => currentMarket,
 
-  getLastResponse: () =>
-    currentResponse
+  getLastResponse:
+    () => currentResponse
 };
 
 
@@ -1724,15 +1782,18 @@ window.POAI = {
 if (
   document.readyState === 'loading'
 ) {
+
   document.addEventListener(
     'DOMContentLoaded',
     init
   );
+
 } else {
+
   init();
 }
 
 
 /* ============================================================
- END OF PO AI PREDICTOR FRONTEND V9.0.1 FINAL
+ END OF PO AI PREDICTOR FRONTEND V9.0.2 FINAL
 ============================================================ */
