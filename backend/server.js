@@ -3,52 +3,36 @@
 /*
 ============================================================
  PO AI PREDICTOR
- V9.1.1 • SYNCHRONIZED LIVE ENGINE
-              QUOTA-SAFE SCANNER FIX
+ BACKEND V9.2
+ LIVE ONLY - TWELVE DATA
 
- SOURCE:
- Twelve Data LIVE
+ SERVER-ONLY FIX FOR V9.1.1
 
- IMPORTANT:
- - Backend is the ONLY signal engine.
- - Frontend never calculates signals.
- - One API response contract is used everywhere.
- - LIVE forex only.
- - No OTC.
- - No MACD.
- - No CCI.
-
- INDICATORS:
- EMA 9 / EMA 21
- RSI 14
- ADX 14
- Stochastic 14
- ATR 14
- Bollinger Bands
- Support / Resistance
- Candlestick Price Action
- Market Psychology
-
- SAFETY:
- - Provider hard limit: 7 requests/minute
- - Safe operating limit: 6 requests/minute
- - Daily total limit: 768
- - Daily safety reserve: 32
- - Maximum usable daily requests: 736
- - ONE serialized provider queue
- - Queue itself controls minute quota
- - No pre-queue quota race
- - Duplicate scan protection
- - Fresh/stale/hard-stale protection
-
- V9.1.1 FIX:
- - Removed quota race between providerCanRequest()
-   and reserveProviderRequest().
- - Provider slot is now acquired INSIDE the queue.
- - If 6 requests/minute are already used, the queue
-   waits for the oldest request to leave the rolling window.
- - Scanner no longer fails simply because several queued
-   requests passed the quota check at the same time.
+ FIXES:
+ - dailyCreditsRemaining scope bug fixed
+ - Provider quota reservation is atomic
+ - No false "failed pair" when provider quota is full
+ - Rolling 60-second provider limit
+ - Safe provider limit = 6 requests/minute
+ - Hard provider limit = 7
+ - Daily usable limit = 736
+ - Scanner does not duplicate
+ - Scanner pauses when quota slot is unavailable
+ - Pair cache + result cache preserved
+ - 1m / 2m / 3m supported
+ - 2m / 3m candles aggregated locally
+ - EMA9 / EMA21
+ - RSI14
+ - ADX14
+ - Stochastic14
+ - ATR14
+ - Bollinger Bands
+ - Support / Resistance
+ - Candlestick price action
+ - Market psychology from price action
+ - NO MACD
+ - NO CCI
+ - Existing frontend response contract preserved
 ============================================================
 */
 
@@ -64,19 +48,58 @@ app.use(express.json());
    CONFIG
 ========================================================= */
 
-const VERSION = 'V9.1.1';
+const VERSION = 'V9.2';
 const SOURCE = 'Twelve Data LIVE';
 const TIMEZONE = 'UTC';
 
-const PORT = Number(process.env.PORT || 10000);
+const PORT = process.env.PORT || 10000;
 
-const API_KEY =
-  process.env.TWELVE_DATA_API_KEY ||
-  process.env.TWELVEDATA_API_KEY ||
-  '';
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || '';
 
-const TWELVE_DATA_URL =
-  'https://api.twelvedata.com/time_series';
+const SOURCE_INTERVAL = '1min';
+
+const MAX_CANDLES = 180;
+const MIN_CANDLES = 60;
+
+/* Provider protection */
+const PROVIDER_HARD_LIMIT = 7;
+const PROVIDER_SAFE_LIMIT = 6;
+const PROVIDER_WINDOW_MS = 60 * 1000;
+const PROVIDER_DELAY_MS = 1500;
+
+/* Daily protection */
+const DAILY_REQUEST_LIMIT = 768;
+const DAILY_SAFETY_RESERVE = 32;
+const DAILY_MAX_USABLE =
+  DAILY_REQUEST_LIMIT - DAILY_SAFETY_RESERVE;
+
+/* Cache */
+const PAIR_CACHE_TTL_MS = 15 * 60 * 1000;
+const RESULT_CACHE_TTL_MS = 30 * 1000;
+
+/* Freshness */
+const FRESHNESS_RULES = {
+  1: 90,
+  2: 150,
+  3: 210
+};
+
+const HARD_STALE_SECONDS = 300;
+
+/* Entry */
+const ENTRY_BUFFER_SECONDS = 30;
+const MIN_ENTRY_SECONDS = 30;
+
+/* Scanner */
+const SCAN_BATCH_SIZE = 6;
+const SCAN_EVERY_MS = 60 * 1000;
+
+/* Network */
+const REQUEST_TIMEOUT_MS = 18000;
+
+/* =========================================================
+   PAIRS
+========================================================= */
 
 const PAIRS = [
   'EUR/USD',
@@ -107,86 +130,6 @@ const PAIRS = [
 
 const TIMEFRAMES = [1, 2, 3];
 
-const SOURCE_INTERVAL = '1min';
-
-const MAX_CANDLES = 180;
-const MIN_CANDLES = 60;
-
-/* =========================================================
-   PROVIDER SAFETY
-========================================================= */
-
-const PROVIDER_HARD_LIMIT = 7;
-const PROVIDER_SAFE_LIMIT = 6;
-const PROVIDER_WINDOW_MS = 60 * 1000;
-
-/*
- Delay between actual provider requests.
- This prevents burst traffic.
-*/
-const PROVIDER_DELAY_MS = 1500;
-
-/*
- Maximum time a queued request may wait for a provider
- minute slot.
-
- We normally expect the queue to free a slot naturally.
-*/
-const PROVIDER_MAX_WAIT_MS = 65 * 1000;
-
-/* =========================================================
-   DAILY SAFETY
-========================================================= */
-
-const DAILY_REQUEST_LIMIT = 768;
-const DAILY_SAFETY_RESERVE = 32;
-
-const DAILY_MAX_USABLE =
-  DAILY_REQUEST_LIMIT -
-  DAILY_SAFETY_RESERVE;
-
-/* =========================================================
-   CACHE
-========================================================= */
-
-const PAIR_CACHE_TTL_MS =
-  15 * 60 * 1000;
-
-const RESULT_CACHE_TTL_MS =
-  30 * 1000;
-
-/* =========================================================
-   FRESHNESS
-========================================================= */
-
-const MAX_DATA_AGE_SECONDS = {
-  1: 90,
-  2: 150,
-  3: 210
-};
-
-const HARD_STALE_SECONDS = 300;
-
-/* =========================================================
-   ENTRY
-========================================================= */
-
-const ENTRY_BUFFER_SECONDS = 30;
-const MIN_ENTRY_SECONDS = 30;
-
-/* =========================================================
-   SCANNER
-========================================================= */
-
-const SCAN_BATCH_SIZE = 6;
-const SCAN_EVERY_MS = 60 * 1000;
-
-/* =========================================================
-   NETWORK
-========================================================= */
-
-const REQUEST_TIMEOUT_MS = 18000;
-
 /* =========================================================
    STATE
 ========================================================= */
@@ -208,52 +151,214 @@ let totalApiRequests = 0;
 let providerRequestTimes = [];
 
 let dailyCreditsUsed = 0;
-let dailyCounterDate = null;
+let dailyCounterDate = getUtcDateKey();
 
-/*
- ONE provider queue.
-
- Every Twelve Data request must enter this queue.
-*/
 let providerQueue = Promise.resolve();
 
+let nextScanTimer = null;
+
 /* =========================================================
-   BASIC HELPERS
+   TIME HELPERS
 ========================================================= */
 
 function nowMs() {
   return Date.now();
 }
 
-function utcDateKey() {
-  return new Date().toISOString().slice(0, 10);
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function getUtcDateKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
 }
 
 function resetDailyCounterIfNeeded() {
-  const today = utcDateKey();
+  const today = getUtcDateKey();
 
-  if (dailyCounterDate !== today) {
+  if (today !== dailyCounterDate) {
     dailyCounterDate = today;
     dailyCreditsUsed = 0;
   }
 }
 
-function iso(value) {
-  if (!value) {
-    return null;
-  }
+function getDailyCreditsRemaining() {
+  resetDailyCounterIfNeeded();
 
-  const d = new Date(value);
-
-  if (Number.isNaN(d.getTime())) {
-    return null;
-  }
-
-  return d.toISOString();
+  return Math.max(
+    0,
+    DAILY_MAX_USABLE - dailyCreditsUsed
+  );
 }
 
+function cleanProviderRequestTimes() {
+  const cutoff = nowMs() - PROVIDER_WINDOW_MS;
+
+  providerRequestTimes =
+    providerRequestTimes.filter(
+      (timestamp) => timestamp > cutoff
+    );
+}
+
+function getProviderRequestsLastMinute() {
+  cleanProviderRequestTimes();
+  return providerRequestTimes.length;
+}
+
+/* =========================================================
+   PROVIDER QUOTA
+========================================================= */
+
+/*
+ IMPORTANT:
+
+ We do NOT reserve provider quota outside the queue.
+
+ This prevents multiple scanner operations from all seeing
+ "6 slots available" and then racing into the same quota.
+*/
+
+function getProviderWaitMs() {
+  cleanProviderRequestTimes();
+
+  if (
+    dailyCreditsUsed >= DAILY_MAX_USABLE
+  ) {
+    return Infinity;
+  }
+
+  if (
+    providerRequestTimes.length <
+    PROVIDER_SAFE_LIMIT
+  ) {
+    return 0;
+  }
+
+  const oldest =
+    Math.min(...providerRequestTimes);
+
+  const wait =
+    oldest +
+    PROVIDER_WINDOW_MS -
+    nowMs();
+
+  return Math.max(0, wait);
+}
+
+function reserveProviderRequest() {
+  resetDailyCounterIfNeeded();
+  cleanProviderRequestTimes();
+
+  if (!TWELVE_DATA_API_KEY) {
+    throw new Error(
+      'TWELVE_DATA_API_KEY is not configured'
+    );
+  }
+
+  if (
+    dailyCreditsUsed >=
+    DAILY_MAX_USABLE
+  ) {
+    throw new ProviderQuotaError(
+      'Daily provider safety limit reached',
+      Infinity
+    );
+  }
+
+  if (
+    providerRequestTimes.length >=
+    PROVIDER_SAFE_LIMIT
+  ) {
+    const oldest =
+      Math.min(...providerRequestTimes);
+
+    const waitMs = Math.max(
+      0,
+      oldest +
+        PROVIDER_WINDOW_MS -
+        nowMs()
+    );
+
+    throw new ProviderQuotaError(
+      'Provider safe minute limit reached',
+      waitMs
+    );
+  }
+
+  if (
+    providerRequestTimes.length >=
+    PROVIDER_HARD_LIMIT
+  ) {
+    throw new ProviderQuotaError(
+      'Provider hard minute limit reached',
+      0
+    );
+  }
+
+  providerRequestTimes.push(nowMs());
+
+  dailyCreditsUsed += 1;
+  totalApiRequests += 1;
+}
+
+class ProviderQuotaError extends Error {
+  constructor(message, waitMs = 0) {
+    super(message);
+    this.name = 'ProviderQuotaError';
+    this.waitMs = waitMs;
+    this.isQuotaWait = true;
+  }
+}
+
+/*
+ Queue is used for actual network operations.
+
+ There is only one provider queue.
+*/
+function enqueueProviderRequest(task) {
+  const run = providerQueue.then(
+    async () => {
+      await sleep(PROVIDER_DELAY_MS);
+      return task();
+    }
+  );
+
+  providerQueue = run.catch(() => {});
+
+  return run;
+}
+
+/*
+ This function DOES NOT wait one minute.
+
+ It checks the current rolling quota atomically when
+ the queued task reaches execution.
+*/
+function requestTwelveData(pair) {
+  return enqueueProviderRequest(async () => {
+    const waitMs = getProviderWaitMs();
+
+    if (waitMs !== 0) {
+      throw new ProviderQuotaError(
+        'Provider safe minute limit reached',
+        waitMs
+      );
+    }
+
+    reserveProviderRequest();
+
+    return fetchTwelveData(pair);
+  });
+}
+
+/* =========================================================
+   GENERIC HELPERS
+========================================================= */
+
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) =>
+    setTimeout(resolve, ms)
+  );
 }
 
 function clamp(value, min, max) {
@@ -263,306 +368,86 @@ function clamp(value, min, max) {
   );
 }
 
-function safeNumber(value, fallback = null) {
-  const n = Number(value);
-
-  return Number.isFinite(n)
-    ? n
-    : fallback;
-}
-
-function secondsFromNow(time) {
-  const t =
-    new Date(time).getTime();
-
-  if (!Number.isFinite(t)) {
+function round(value, decimals = 6) {
+  if (!Number.isFinite(value)) {
     return null;
   }
 
-  return Math.max(
-    0,
-    Math.floor(
-      (t - nowMs()) / 1000
-    )
+  const factor =
+    Math.pow(10, decimals);
+
+  return (
+    Math.round(value * factor) /
+    factor
   );
 }
 
-/* =========================================================
-   PROVIDER QUOTA
-========================================================= */
-
-function cleanProviderRequestTimes() {
-  const cutoff =
-    nowMs() -
-    PROVIDER_WINDOW_MS;
-
-  providerRequestTimes =
-    providerRequestTimes.filter(
-      t => t >= cutoff
-    );
-}
-
-function providerRequestsThisMinute() {
-  cleanProviderRequestTimes();
-
-  return providerRequestTimes.length;
-}
-
-function dailyRequestsRemaining() {
-  resetDailyCounterIfNeeded();
-
-  return Math.max(
-    0,
-    DAILY_MAX_USABLE -
-      dailyCreditsUsed
+function isFiniteNumber(value) {
+  return Number.isFinite(
+    Number(value)
   );
 }
 
-/*
- This function is informational only.
+function safeNumber(value) {
+  const number = Number(value);
 
- IMPORTANT:
- It is NOT used as the final gate before enqueueing.
-
- The real quota gate is inside the serialized queue.
-*/
-function providerCanRequest() {
-  if (!API_KEY) {
-    return {
-      ok: false,
-      reason:
-        'Twelve Data API key is not configured'
-    };
-  }
-
-  if (
-    providerRequestsThisMinute() >=
-    PROVIDER_SAFE_LIMIT
-  ) {
-    return {
-      ok: false,
-      reason:
-        'Provider safe minute limit reached'
-    };
-  }
-
-  if (
-    dailyRequestsRemaining() <= 0
-  ) {
-    return {
-      ok: false,
-      reason:
-        'Daily provider safety limit reached'
-    };
-  }
-
-  return {
-    ok: true,
-    reason: null
-  };
-}
-
-/*
- Wait until a safe provider slot exists.
-
- THIS is the important V9.1.1 fix.
-
- No request is rejected merely because another request
- consumed the slot while this request was waiting.
-*/
-async function waitForProviderSlot() {
-  resetDailyCounterIfNeeded();
-
-  const startedAt = nowMs();
-
-  while (true) {
-    if (!API_KEY) {
-      throw new Error(
-        'Twelve Data API key is not configured'
-      );
-    }
-
-    if (
-      dailyCreditsRemaining() <= 0
-    ) {
-      throw new Error(
-        'Daily provider safety limit reached'
-      );
-    }
-
-    cleanProviderRequestTimes();
-
-    if (
-      providerRequestTimes.length <
-      PROVIDER_SAFE_LIMIT
-    ) {
-      return;
-    }
-
-    const oldest =
-      providerRequestTimes[0];
-
-    const waitMs = Math.max(
-      250,
-      (
-        oldest +
-        PROVIDER_WINDOW_MS
-      ) - nowMs() + 100
-    );
-
-    const elapsed =
-      nowMs() - startedAt;
-
-    if (
-      elapsed + waitMs >
-      PROVIDER_MAX_WAIT_MS
-    ) {
-      throw new Error(
-        'Provider queue wait timeout'
-      );
-    }
-
-    await sleep(
-      Math.min(
-        waitMs,
-        5000
-      )
-    );
-  }
-}
-
-/*
- Reserve the provider request ONLY after the queue has
- acquired a valid slot.
-*/
-async function reserveProviderRequest() {
-  resetDailyCounterIfNeeded();
-
-  await waitForProviderSlot();
-
-  cleanProviderRequestTimes();
-
-  if (
-    providerRequestTimes.length >=
-    PROVIDER_SAFE_LIMIT
-  ) {
-    /*
-     Defensive re-check.
-     This should normally never happen because
-     waitForProviderSlot() owns the gate.
-    */
-    throw new Error(
-      'Provider safe minute limit reached'
-    );
-  }
-
-  if (
-    providerRequestTimes.length >=
-    PROVIDER_HARD_LIMIT
-  ) {
-    throw new Error(
-      'Provider hard minute limit reached'
-    );
-  }
-
-  if (
-    dailyCreditsUsed >=
-    DAILY_MAX_USABLE
-  ) {
-    throw new Error(
-      'Daily provider safety limit reached'
-    );
-  }
-
-  providerRequestTimes.push(
-    nowMs()
-  );
-
-  dailyCreditsUsed += 1;
-  totalApiRequests += 1;
-}
-
-/*
- Serialize ALL provider requests.
-
- The quota decision happens INSIDE this queue.
-*/
-function enqueueProviderRequest(task) {
-  const run =
-    providerQueue.then(
-      async () => {
-        /*
-         Keep requests separated even when the rolling
-         minute window has space.
-        */
-        await sleep(
-          PROVIDER_DELAY_MS
-        );
-
-        await reserveProviderRequest();
-
-        return task();
-      }
-    );
-
-  providerQueue =
-    run.catch(() => {});
-
-  return run;
+  return Number.isFinite(number)
+    ? number
+    : null;
 }
 
 /* =========================================================
    HTTP FETCH
 ========================================================= */
 
-async function fetchJson(url) {
+async function fetchJson(
+  url,
+  timeoutMs = REQUEST_TIMEOUT_MS
+) {
   const controller =
     new AbortController();
 
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      REQUEST_TIMEOUT_MS
-    );
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
 
   try {
-    const response =
-      await fetch(url, {
+    const response = await fetch(
+      url,
+      {
         method: 'GET',
         signal: controller.signal,
         headers: {
-          Accept:
-            'application/json'
+          Accept: 'application/json'
         }
-      });
+      }
+    );
 
     const text =
       await response.text();
 
-    let data = null;
+    let data;
 
     try {
       data = JSON.parse(text);
     } catch {
       throw new Error(
-        `Provider returned invalid JSON (HTTP ${response.status})`
+        `Provider returned invalid JSON (${response.status})`
       );
     }
 
     if (!response.ok) {
-      const message =
-        data?.message ||
-        data?.code ||
-        `HTTP ${response.status}`;
-
       throw new Error(
-        `Twelve Data HTTP error: ${message}`
+        data?.message ||
+          data?.code ||
+          `Provider HTTP ${response.status}`
       );
     }
 
     return data;
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timer);
   }
 }
 
@@ -570,154 +455,115 @@ async function fetchJson(url) {
    TWELVE DATA
 ========================================================= */
 
-function normalizeCandles(values) {
-  if (!Array.isArray(values)) {
-    return [];
-  }
+async function fetchTwelveData(pair) {
+  const url =
+    'https://api.twelvedata.com/time_series' +
+    `?symbol=${encodeURIComponent(pair)}` +
+    `&interval=${SOURCE_INTERVAL}` +
+    `&outputsize=${MAX_CANDLES}` +
+    `&timezone=UTC` +
+    `&apikey=${encodeURIComponent(
+      TWELVE_DATA_API_KEY
+    )}`;
 
-  const map = new Map();
+  const data =
+    await fetchJson(url);
 
-  for (const row of values) {
-    const time =
-      iso(row?.datetime);
-
-    const open =
-      safeNumber(row?.open);
-
-    const high =
-      safeNumber(row?.high);
-
-    const low =
-      safeNumber(row?.low);
-
-    const close =
-      safeNumber(row?.close);
-
-    if (
-      !time ||
-      open === null ||
-      high === null ||
-      low === null ||
-      close === null
-    ) {
-      continue;
-    }
-
-    map.set(
-      time,
-      {
-        time,
-        open,
-        high,
-        low,
-        close
-      }
-    );
-  }
-
-  return [...map.values()]
-    .sort(
-      (a, b) =>
-        new Date(a.time).getTime() -
-        new Date(b.time).getTime()
-    )
-    .slice(-MAX_CANDLES);
-}
-
-async function requestTwelveData(pair) {
-  if (!API_KEY) {
+  if (
+    data &&
+    data.status === 'error'
+  ) {
     throw new Error(
-      'Twelve Data API key is not configured'
+      data.message ||
+        'Twelve Data provider error'
     );
   }
 
-  /*
-   IMPORTANT:
-   No providerCanRequest() call here.
-
-   The request enters the serialized queue first.
-   The queue then waits for a safe slot.
-  */
-  return enqueueProviderRequest(
-    async () => {
-      const params =
-        new URLSearchParams({
-          symbol: pair,
-          interval:
-            SOURCE_INTERVAL,
-          outputsize:
-            String(MAX_CANDLES),
-          timezone: TIMEZONE,
-          apikey: API_KEY
-        });
-
-      const url =
-        `${TWELVE_DATA_URL}?${params.toString()}`;
-
-      const data =
-        await fetchJson(url);
-
-      if (
-        data?.status === 'error'
-      ) {
-        throw new Error(
-          data?.message ||
-          'Twelve Data returned an error'
-        );
-      }
-
-      const candles =
-        normalizeCandles(
-          data?.values
-        );
-
-      if (
-        candles.length <
-        MIN_CANDLES
-      ) {
-        throw new Error(
-          `${pair}: insufficient candle data (${candles.length})`
-        );
-      }
-
-      return candles;
-    }
-  );
-}
-
-/* =========================================================
-   CANDLE COMPLETION
-========================================================= */
-
-function completedOneMinuteCandles(
-  candles
-) {
-  if (!candles.length) {
-    return [];
+  if (
+    !data ||
+    !Array.isArray(data.values)
+  ) {
+    throw new Error(
+      `${pair}: Twelve Data returned no candles`
+    );
   }
 
-  const currentMinute =
-    Math.floor(
-      nowMs() / 60000
-    ) * 60000;
-
-  return candles.filter(
-    candle => {
-      const t =
-        new Date(
-          candle.time
-        ).getTime();
-
-      return (
-        Number.isFinite(t) &&
-        t < currentMinute
+  const candles =
+    data.values
+      .map((row) => ({
+        time: parseProviderTime(
+          row.datetime
+        ),
+        open: Number(row.open),
+        high: Number(row.high),
+        low: Number(row.low),
+        close: Number(row.close)
+      }))
+      .filter(
+        (candle) =>
+          Number.isFinite(
+            candle.time
+          ) &&
+          Number.isFinite(
+            candle.open
+          ) &&
+          Number.isFinite(
+            candle.high
+          ) &&
+          Number.isFinite(
+            candle.low
+          ) &&
+          Number.isFinite(
+            candle.close
+          )
+      )
+      .sort(
+        (a, b) =>
+          a.time - b.time
       );
-    }
+
+  if (
+    candles.length <
+    MIN_CANDLES
+  ) {
+    throw new Error(
+      `${pair}: insufficient candles (${candles.length})`
+    );
+  }
+
+  return {
+    pair,
+    candles: candles.slice(
+      -MAX_CANDLES
+    ),
+    fetchedAt: nowMs()
+  };
+}
+
+function parseProviderTime(value) {
+  if (!value) {
+    return NaN;
+  }
+
+  const normalized =
+    String(value).includes('T')
+      ? String(value)
+      : String(value).replace(
+          ' ',
+          'T'
+        );
+
+  const timestamp = Date.parse(
+    normalized.endsWith('Z')
+      ? normalized
+      : `${normalized}Z`
   );
+
+  return timestamp;
 }
 
 /* =========================================================
-   AGGREGATION
+   LOCAL TIMEFRAME AGGREGATION
 ========================================================= */
 
 function aggregateCandles(
@@ -736,18 +582,9 @@ function aggregateCandles(
   const groups = new Map();
 
   for (const candle of candles) {
-    const time =
-      new Date(
-        candle.time
-      ).getTime();
-
-    if (!Number.isFinite(time)) {
-      continue;
-    }
-
     const bucket =
       Math.floor(
-        time / bucketMs
+        candle.time / bucketMs
       ) * bucketMs;
 
     if (!groups.has(bucket)) {
@@ -763,278 +600,82 @@ function aggregateCandles(
 
   for (
     const [bucket, rows]
-    of groups
+    of groups.entries()
   ) {
-    rows.sort(
-      (a, b) =>
-        new Date(a.time).getTime() -
-        new Date(b.time).getTime()
-    );
-
-    if (
-      rows.length <
-      timeframe
-    ) {
+    if (!rows.length) {
       continue;
     }
 
-    const first =
-      rows[0];
-
+    const first = rows[0];
     const last =
       rows[rows.length - 1];
 
     result.push({
-      time:
-        new Date(
-          bucket
-        ).toISOString(),
-
-      open:
-        first.open,
-
-      high:
-        Math.max(
-          ...rows.map(
-            x => x.high
-          )
-        ),
-
-      low:
-        Math.min(
-          ...rows.map(
-            x => x.low
-          )
-        ),
-
-      close:
-        last.close
+      time: bucket,
+      open: first.open,
+      high: Math.max(
+        ...rows.map(
+          (x) => x.high
+        )
+      ),
+      low: Math.min(
+        ...rows.map(
+          (x) => x.low
+        )
+      ),
+      close: last.close
     });
   }
 
-  return result
-    .sort(
-      (a, b) =>
-        new Date(a.time).getTime() -
-        new Date(b.time).getTime()
-    )
-    .slice(-MAX_CANDLES);
-}
-
-/* =========================================================
-   FRESHNESS
-========================================================= */
-
-function getLastCandle(
-  candles
-) {
-  return candles?.length
-    ? candles[candles.length - 1]
-    : null;
-}
-
-function getDataAgeSeconds(
-  candles
-) {
-  const last =
-    getLastCandle(candles);
-
-  if (!last) {
-    return null;
-  }
-
-  const t =
-    new Date(
-      last.time
-    ).getTime();
-
-  if (!Number.isFinite(t)) {
-    return null;
-  }
-
-  return Math.max(
-    0,
-    Math.floor(
-      (
-        nowMs() - t
-      ) / 1000
-    )
+  return result.sort(
+    (a, b) =>
+      a.time - b.time
   );
-}
-
-function getFreshness(
-  timeframe,
-  dataAgeSeconds
-) {
-  if (
-    dataAgeSeconds === null
-  ) {
-    return 'NO_DATA';
-  }
-
-  if (
-    dataAgeSeconds <=
-    MAX_DATA_AGE_SECONDS[
-      timeframe
-    ]
-  ) {
-    return 'FRESH';
-  }
-
-  if (
-    dataAgeSeconds <=
-    HARD_STALE_SECONDS
-  ) {
-    return 'STALE';
-  }
-
-  return 'HARD_STALE';
-}
-
-function isFreshEnough(
-  timeframe,
-  candles
-) {
-  if (
-    !candles ||
-    candles.length <
-      MIN_CANDLES
-  ) {
-    return false;
-  }
-
-  const age =
-    getDataAgeSeconds(
-      candles
-    );
-
-  return (
-    age !== null &&
-    age <=
-      MAX_DATA_AGE_SECONDS[
-        timeframe
-      ]
-  );
-}
-
-/* =========================================================
-   PAIR CACHE
-========================================================= */
-
-function setPairCache(
-  pair,
-  candles
-) {
-  pairCache.set(
-    pair,
-    {
-      pair,
-      candles,
-      fetchedAt:
-        nowMs()
-    }
-  );
-}
-
-function getPairCache(pair) {
-  return (
-    pairCache.get(pair) ||
-    null
-  );
-}
-
-function pairCacheTransportValid(
-  entry
-) {
-  if (
-    !entry?.candles?.length
-  ) {
-    return false;
-  }
-
-  return (
-    nowMs() -
-      entry.fetchedAt <
-    PAIR_CACHE_TTL_MS
-  );
-}
-
-function pairHasFreshTimeframe(
-  entry
-) {
-  if (
-    !entry?.candles?.length
-  ) {
-    return false;
-  }
-
-  return TIMEFRAMES.some(
-    tf =>
-      isFreshEnough(
-        tf,
-        aggregateCandles(
-          entry.candles,
-          tf
-        )
-      )
-  );
-}
-
-async function loadPair(
-  pair,
-  forceRefresh = false
-) {
-  const cached =
-    getPairCache(pair);
-
-  if (
-    !forceRefresh &&
-    cached &&
-    pairCacheTransportValid(
-      cached
-    ) &&
-    pairHasFreshTimeframe(
-      cached
-    )
-  ) {
-    return cached.candles;
-  }
-
-  const candles =
-    await requestTwelveData(
-      pair
-    );
-
-  const completed =
-    completedOneMinuteCandles(
-      candles
-    );
-
-  if (
-    completed.length <
-    MIN_CANDLES
-  ) {
-    throw new Error(
-      `${pair}: not enough completed candles`
-    );
-  }
-
-  setPairCache(
-    pair,
-    completed
-  );
-
-  return completed;
 }
 
 /* =========================================================
    INDICATORS
 ========================================================= */
 
-function sma(
-  values,
-  period
-) {
+function ema(values, period) {
+  if (
+    values.length <
+    period
+  ) {
+    return null;
+  }
+
+  const multiplier =
+    2 / (period + 1);
+
+  let previous = 0;
+
+  for (
+    let i = 0;
+    i < period;
+    i++
+  ) {
+    previous += values[i];
+  }
+
+  previous /= period;
+
+  for (
+    let i = period;
+    i < values.length;
+    i++
+  ) {
+    previous =
+      (values[i] -
+        previous) *
+        multiplier +
+      previous;
+  }
+
+  return previous;
+}
+
+function sma(values, period) {
   if (
     values.length <
     period
@@ -1054,56 +695,12 @@ function sma(
   );
 }
 
-function ema(
-  values,
-  period
-) {
-  if (
-    values.length <
-    period
-  ) {
-    return null;
-  }
-
-  let value =
-    sma(
-      values.slice(
-        0,
-        period
-      ),
-      period
-    );
-
-  if (value === null) {
-    return null;
-  }
-
-  const multiplier =
-    2 / (period + 1);
-
-  for (
-    let i = period;
-    i < values.length;
-    i++
-  ) {
-    value =
-      (
-        values[i] - value
-      ) *
-        multiplier +
-      value;
-  }
-
-  return value;
-}
-
-function rsi(
-  values,
+function calculateRSI(
+  closes,
   period = 14
 ) {
   if (
-    values.length <
-    period + 1
+    closes.length <= period
   ) {
     return null;
   }
@@ -1116,15 +713,14 @@ function rsi(
     i <= period;
     i++
   ) {
-    const diff =
-      values[i] -
-      values[i - 1];
+    const change =
+      closes[i] -
+      closes[i - 1];
 
-    if (diff >= 0) {
-      gains += diff;
+    if (change >= 0) {
+      gains += change;
     } else {
-      losses +=
-        Math.abs(diff);
+      losses -= change;
     }
   }
 
@@ -1136,41 +732,33 @@ function rsi(
 
   for (
     let i = period + 1;
-    i < values.length;
+    i < closes.length;
     i++
   ) {
-    const diff =
-      values[i] -
-      values[i - 1];
+    const change =
+      closes[i] -
+      closes[i - 1];
 
     const gain =
-      diff > 0
-        ? diff
-        : 0;
+      Math.max(change, 0);
 
     const loss =
-      diff < 0
-        ? Math.abs(diff)
-        : 0;
+      Math.max(-change, 0);
 
     avgGain =
-      (
-        avgGain *
-          (period - 1) +
-        gain
-      ) / period;
+      (avgGain *
+        (period - 1) +
+        gain) /
+      period;
 
     avgLoss =
-      (
-        avgLoss *
-          (period - 1) +
-        loss
-      ) / period;
+      (avgLoss *
+        (period - 1) +
+        loss) /
+      period;
   }
 
-  if (
-    avgLoss === 0
-  ) {
+  if (avgLoss === 0) {
     return 100;
   }
 
@@ -1179,15 +767,12 @@ function rsi(
 
   return (
     100 -
-    100 /
-      (1 + rs)
+    100 / (1 + rs)
   );
 }
 
-function trueRanges(
-  candles
-) {
-  const result = [];
+function calculateTR(candles) {
+  const tr = [];
 
   for (
     let i = 0;
@@ -1198,9 +783,9 @@ function trueRanges(
       candles[i];
 
     if (i === 0) {
-      result.push(
+      tr.push(
         current.high -
-        current.low
+          current.low
       );
       continue;
     }
@@ -1208,16 +793,14 @@ function trueRanges(
     const previous =
       candles[i - 1];
 
-    result.push(
+    tr.push(
       Math.max(
         current.high -
           current.low,
-
         Math.abs(
           current.high -
             previous.close
         ),
-
         Math.abs(
           current.low -
             previous.close
@@ -1226,29 +809,33 @@ function trueRanges(
     );
   }
 
-  return result;
+  return tr;
 }
 
-function atr(
+function calculateATR(
   candles,
   period = 14
 ) {
   const tr =
-    trueRanges(candles);
+    calculateTR(candles);
 
-  return ema(
-    tr,
+  if (
+    tr.length <
     period
-  );
+  ) {
+    return null;
+  }
+
+  return sma(tr, period);
 }
 
-function adx(
+function calculateADX(
   candles,
   period = 14
 ) {
   if (
     candles.length <
-    period * 2 + 1
+    period * 2
   ) {
     return null;
   }
@@ -1276,145 +863,116 @@ function adx(
       previous.low -
       current.low;
 
+    const trueRange =
+      Math.max(
+        current.high -
+          current.low,
+        Math.abs(
+          current.high -
+            previous.close
+        ),
+        Math.abs(
+          current.low -
+            previous.close
+        )
+      );
+
+    trs.push(trueRange);
+
     plusDM.push(
-      upMove >
-        downMove &&
+      upMove > downMove &&
       upMove > 0
         ? upMove
         : 0
     );
 
     minusDM.push(
-      downMove >
-        upMove &&
+      downMove > upMove &&
       downMove > 0
         ? downMove
         : 0
     );
+  }
 
-    trs.push(
-      Math.max(
-        current.high -
-          current.low,
+  const dx = [];
 
-        Math.abs(
-          current.high -
-            previous.close
-        ),
+  for (
+    let i = period;
+    i <= trs.length;
+    i++
+  ) {
+    const trSlice =
+      trs.slice(
+        i - period,
+        i
+      );
 
-        Math.abs(
-          current.low -
-            previous.close
-        )
-      )
-    );
+    const plusSlice =
+      plusDM.slice(
+        i - period,
+        i
+      );
+
+    const minusSlice =
+      minusDM.slice(
+        i - period,
+        i
+      );
+
+    const atrValue =
+      trSlice.reduce(
+        (a, b) =>
+          a + b,
+        0
+      ) / period;
+
+    if (atrValue === 0) {
+      dx.push(0);
+      continue;
+    }
+
+    const plus =
+      plusSlice.reduce(
+        (a, b) =>
+          a + b,
+        0
+      ) / atrValue *
+      100;
+
+    const minus =
+      minusSlice.reduce(
+        (a, b) =>
+          a + b,
+        0
+      ) / atrValue *
+      100;
+
+    const denominator =
+      plus + minus;
+
+    const currentDx =
+      denominator === 0
+        ? 0
+        : Math.abs(
+            plus - minus
+          ) /
+            denominator *
+            100;
+
+    dx.push(currentDx);
   }
 
   if (
-    trs.length <
+    dx.length <
     period
   ) {
     return null;
   }
 
-  let trAvg =
-    sma(
-      trs.slice(
-        0,
-        period
-      ),
-      period
-    );
-
-  let plusAvg =
-    sma(
-      plusDM.slice(
-        0,
-        period
-      ),
-      period
-    );
-
-  let minusAvg =
-    sma(
-      minusDM.slice(
-        0,
-        period
-      ),
-      period
-    );
-
-  const dxValues = [];
-
-  for (
-    let i = period;
-    i < trs.length;
-    i++
-  ) {
-    if (i > period) {
-      trAvg =
-        (
-          trAvg *
-            (period - 1) +
-          trs[i]
-        ) / period;
-
-      plusAvg =
-        (
-          plusAvg *
-            (period - 1) +
-          plusDM[i]
-        ) / period;
-
-      minusAvg =
-        (
-          minusAvg *
-            (period - 1) +
-          minusDM[i]
-        ) / period;
-    }
-
-    if (!trAvg) {
-      continue;
-    }
-
-    const plusDI =
-      100 *
-      plusAvg /
-      trAvg;
-
-    const minusDI =
-      100 *
-      minusAvg /
-      trAvg;
-
-    const denominator =
-      plusDI +
-      minusDI;
-
-    if (
-      denominator === 0
-    ) {
-      continue;
-    }
-
-    dxValues.push(
-      100 *
-      Math.abs(
-        plusDI -
-          minusDI
-      ) /
-      denominator
-    );
-  }
-
-  return ema(
-    dxValues,
-    period
-  );
+  return sma(dx, period);
 }
 
-function stochastic(
+function calculateStochastic(
   candles,
   period = 14
 ) {
@@ -1425,28 +983,26 @@ function stochastic(
     return null;
   }
 
-  const recent =
-    candles.slice(
-      -period
-    );
+  const slice =
+    candles.slice(-period);
 
   const highest =
     Math.max(
-      ...recent.map(
-        x => x.high
+      ...slice.map(
+        (c) => c.high
       )
     );
 
   const lowest =
     Math.min(
-      ...recent.map(
-        x => x.low
+      ...slice.map(
+        (c) => c.low
       )
     );
 
   const close =
-    recent[
-      recent.length - 1
+    slice[
+      slice.length - 1
     ].close;
 
   if (
@@ -1456,70 +1012,86 @@ function stochastic(
   }
 
   return (
-    (
-      (close - lowest) /
-      (highest - lowest)
-    ) * 100
+    (close - lowest) /
+      (highest - lowest) *
+    100
   );
 }
 
-function bollinger(
-  candles,
-  period = 20
+function calculateBollinger(
+  closes,
+  period = 20,
+  multiplier = 2
 ) {
   if (
-    candles.length <
+    closes.length <
     period
   ) {
     return null;
   }
 
-  const closes =
-    candles
-      .slice(-period)
-      .map(
-        x => x.close
-      );
+  const slice =
+    closes.slice(-period);
 
   const middle =
-    sma(
-      closes,
-      period
-    );
-
-  if (
-    middle === null
-  ) {
-    return null;
-  }
+    slice.reduce(
+      (a, b) =>
+        a + b,
+      0
+    ) / period;
 
   const variance =
-    closes.reduce(
+    slice.reduce(
       (sum, value) =>
         sum +
         Math.pow(
-          value -
-            middle,
+          value - middle,
           2
         ),
       0
     ) / period;
 
   const deviation =
-    Math.sqrt(
-      variance
-    );
+    Math.sqrt(variance);
 
   return {
     upper:
       middle +
-      deviation * 2,
-
+      multiplier *
+        deviation,
     middle,
-
     lower:
       middle -
-      deviation * 2
+      multiplier *
+        deviation
+  };
+}
+
+function calculateSupportResistance(
+  candles,
+  lookback = 30
+) {
+  const slice =
+    candles.slice(-lookback);
+
+  if (!slice.length) {
+    return {
+      support: null,
+      resistance: null
+    };
+  }
+
+  return {
+    support: Math.min(
+      ...slice.map(
+        (c) => c.low
+      )
+    ),
+    resistance: Math.max(
+      ...slice.map(
+        (c) => c.high
+      )
+    )
   };
 }
 
@@ -1527,18 +1099,17 @@ function bollinger(
    PRICE ACTION
 ========================================================= */
 
-function candlePattern(
+function getCandlePattern(
   candles
 ) {
   if (
-    candles.length < 3
+    candles.length <
+    3
   ) {
     return {
-      label:
-        'INSUFFICIENT DATA',
-      bias:
-        'NEUTRAL',
-      strength: 0
+      pattern: 'NO VALID SIGNAL',
+      bullish: false,
+      bearish: false
     };
   }
 
@@ -1547,23 +1118,26 @@ function candlePattern(
       candles.length - 1
     ];
 
-  const p =
+  const previous =
     candles[
       candles.length - 2
     ];
 
   const body =
     Math.abs(
-      c.close -
-        c.open
+      c.close - c.open
     );
 
   const range =
-    Math.max(
-      c.high -
-        c.low,
-      Number.EPSILON
-    );
+    c.high - c.low;
+
+  if (range <= 0) {
+    return {
+      pattern: 'NEUTRAL CANDLE',
+      bullish: false,
+      bearish: false
+    };
+  }
 
   const upperWick =
     c.high -
@@ -1576,147 +1150,101 @@ function candlePattern(
     Math.min(
       c.open,
       c.close
-    ) -
-    c.low;
+    ) - c.low;
 
   const bullish =
-    c.close >
-    c.open;
+    c.close > c.open;
 
   const bearish =
-    c.close <
-    c.open;
+    c.close < c.open;
+
+  const strongBody =
+    body / range >= 0.65;
 
   if (
     bullish &&
-    body / range >=
-      0.65
+    strongBody
   ) {
     return {
-      label:
+      pattern:
         'STRONG BULLISH CANDLE',
-      bias:
-        'BULLISH',
-      strength: 4
+      bullish: true,
+      bearish: false
     };
   }
 
   if (
     bearish &&
-    body / range >=
-      0.65
+    strongBody
   ) {
     return {
-      label:
+      pattern:
         'STRONG BEARISH CANDLE',
-      bias:
-        'BEARISH',
-      strength: 4
-    };
-  }
-
-  if (
-    lowerWick >
-      body * 1.8 &&
-    c.close >
-      c.open
-  ) {
-    return {
-      label:
-        'BULLISH REJECTION',
-      bias:
-        'BULLISH',
-      strength: 3
-    };
-  }
-
-  if (
-    upperWick >
-      body * 1.8 &&
-    c.close <
-      c.open
-  ) {
-    return {
-      label:
-        'BEARISH REJECTION',
-      bias:
-        'BEARISH',
-      strength: 3
+      bullish: false,
+      bearish: true
     };
   }
 
   if (
     bullish &&
-    p.close <
-      p.open &&
-    c.close >
-      p.open
+    lowerWick >
+      body * 1.5
   ) {
     return {
-      label:
-        'BULLISH REVERSAL',
-      bias:
-        'BULLISH',
-      strength: 3
+      pattern:
+        'BULLISH REJECTION',
+      bullish: true,
+      bearish: false
     };
   }
 
   if (
     bearish &&
-    p.close >
-      p.open &&
-    c.close <
-      p.open
+    upperWick >
+      body * 1.5
   ) {
     return {
-      label:
-        'BEARISH REVERSAL',
-      bias:
-        'BEARISH',
-      strength: 3
+      pattern:
+        'BEARISH REJECTION',
+      bullish: false,
+      bearish: true
     };
   }
 
-  return {
-    label:
-      'MIXED PRICE ACTION',
-    bias:
-      'NEUTRAL',
-    strength: 0
-  };
-}
-
-/* =========================================================
-   SUPPORT / RESISTANCE
-========================================================= */
-
-function supportResistance(
-  candles
-) {
-  const recent =
-    candles.slice(-30);
-
-  if (!recent.length) {
+  if (
+    previous.close <
+      previous.open &&
+    bullish &&
+    c.close >
+      previous.open
+  ) {
     return {
-      support: null,
-      resistance: null
+      pattern:
+        'BULLISH ENGULFING',
+      bullish: true,
+      bearish: false
+    };
+  }
+
+  if (
+    previous.close >
+      previous.open &&
+    bearish &&
+    c.close <
+      previous.open
+  ) {
+    return {
+      pattern:
+        'BEARISH ENGULFING',
+      bullish: false,
+      bearish: true
     };
   }
 
   return {
-    support:
-      Math.min(
-        ...recent.map(
-          x => x.low
-        )
-      ),
-
-    resistance:
-      Math.max(
-        ...recent.map(
-          x => x.high
-        )
-      )
+    pattern: 'NEUTRAL PRICE ACTION',
+    bullish: false,
+    bearish: false
   };
 }
 
@@ -1724,99 +1252,141 @@ function supportResistance(
    MARKET PSYCHOLOGY
 ========================================================= */
 
-function marketPsychology(
-  close,
-  ema9Value,
-  ema21Value,
-  rsiValue
+function getMarketPsychology(
+  candles,
+  ema9,
+  ema21,
+  rsi,
+  adx,
+  pattern
 ) {
   if (
-    ema9Value === null ||
-    ema21Value === null ||
-    rsiValue === null
+    !Number.isFinite(ema9) ||
+    !Number.isFinite(ema21)
   ) {
-    return {
-      label:
-        'INSUFFICIENT DATA',
-      bias:
-        'NEUTRAL',
-      strength: 0
-    };
+    return 'INSUFFICIENT DATA';
   }
 
   if (
-    ema9Value >
-      ema21Value &&
-    close >
-      ema9Value &&
-    rsiValue >= 55
+    ema9 > ema21 &&
+    pattern.bullish &&
+    Number.isFinite(adx) &&
+    adx >= 20
   ) {
-    return {
-      label:
-        'BULLISH MOMENTUM',
-      bias:
-        'BULLISH',
-      strength: 8
-    };
+    return 'BULLISH MOMENTUM';
   }
 
   if (
-    ema9Value <
-      ema21Value &&
-    close <
-      ema9Value &&
-    rsiValue <= 45
+    ema9 < ema21 &&
+    pattern.bearish &&
+    Number.isFinite(adx) &&
+    adx >= 20
   ) {
-    return {
-      label:
-        'BEARISH MOMENTUM',
-      bias:
-        'BEARISH',
-      strength: 8
-    };
+    return 'BEARISH MOMENTUM';
   }
 
   if (
-    ema9Value >
-      ema21Value &&
-    close >
-      ema21Value
+    Number.isFinite(rsi) &&
+    rsi >= 70
   ) {
-    return {
-      label:
-        'MILD BULLISH BIAS',
-      bias:
-        'BULLISH',
-      strength: 4
-    };
+    return 'OVERBOUGHT PRESSURE';
   }
 
   if (
-    ema9Value <
-      ema21Value &&
-    close <
-      ema21Value
+    Number.isFinite(rsi) &&
+    rsi <= 30
   ) {
-    return {
-      label:
-        'MILD BEARISH BIAS',
-      bias:
-        'BEARISH',
-      strength: 4
-    };
+    return 'OVERSOLD PRESSURE';
   }
 
-  return {
-    label:
-      'NEUTRAL / MIXED',
-    bias:
-      'NEUTRAL',
-    strength: 0
-  };
+  return 'MIXED MARKET PRESSURE';
 }
 
 /* =========================================================
-   ANALYSIS ENGINE
+   FRESHNESS
+========================================================= */
+
+function getDataAgeSeconds(
+  lastCandle
+) {
+  if (
+    !Number.isFinite(
+      lastCandle
+    )
+  ) {
+    return null;
+  }
+
+  return Math.max(
+    0,
+    Math.floor(
+      (nowMs() -
+        lastCandle) /
+        1000
+    )
+  );
+}
+
+function getFreshness(
+  timeframe,
+  ageSeconds
+) {
+  if (
+    !Number.isFinite(
+      ageSeconds
+    )
+  ) {
+    return 'NO_DATA';
+  }
+
+  if (
+    ageSeconds <=
+    FRESHNESS_RULES[
+      timeframe
+    ]
+  ) {
+    return 'FRESH';
+  }
+
+  if (
+    ageSeconds <=
+    HARD_STALE_SECONDS
+  ) {
+    return 'STALE';
+  }
+
+  return 'HARD_STALE';
+}
+
+/* =========================================================
+   ENTRY
+========================================================= */
+
+function getNextEntryTime(
+  timeframe
+) {
+  const now =
+    nowMs();
+
+  const intervalMs =
+    timeframe *
+    60 *
+    1000;
+
+  /*
+   Entry is the next timeframe boundary.
+  */
+  return (
+    Math.floor(
+      now / intervalMs
+    ) *
+      intervalMs +
+    intervalMs
+  );
+}
+
+/* =========================================================
+   ANALYZE CANDLES
 ========================================================= */
 
 function analyzeCandles(
@@ -1825,110 +1395,103 @@ function analyzeCandles(
   candles
 ) {
   if (
-    !candles ||
     candles.length <
-      MIN_CANDLES
+    MIN_CANDLES
   ) {
-    return null;
+    throw new Error(
+      `${pair}: insufficient ${timeframe}m candles`
+    );
   }
 
   const closes =
     candles.map(
-      x => x.close
+      (c) => c.close
     );
 
-  const current =
-    candles[
-      candles.length - 1
-    ];
+  const ema9 =
+    ema(closes, 9);
 
-  const currentPrice =
-    current.close;
+  const ema21 =
+    ema(closes, 21);
 
-  const ema9Value =
-    ema(
-      closes,
-      9
-    );
-
-  const ema21Value =
-    ema(
-      closes,
-      21
-    );
-
-  const rsiValue =
-    rsi(
+  const rsi14 =
+    calculateRSI(
       closes,
       14
     );
 
-  const atrValue =
-    atr(
+  const adx14 =
+    calculateADX(
       candles,
       14
     );
 
-  const adxValue =
-    adx(
+  const stochastic14 =
+    calculateStochastic(
       candles,
       14
     );
 
-  const stochasticValue =
-    stochastic(
+  const atr14 =
+    calculateATR(
       candles,
       14
     );
 
-  const bb =
-    bollinger(
+  const bollinger =
+    calculateBollinger(
+      closes,
+      20,
+      2
+    );
+
+  const supportResistance =
+    calculateSupportResistance(
       candles,
-      20
+      30
     );
 
   const pattern =
-    candlePattern(
-      candles
-    );
-
-  const sr =
-    supportResistance(
+    getCandlePattern(
       candles
     );
 
   const psychology =
-    marketPsychology(
-      currentPrice,
-      ema9Value,
-      ema21Value,
-      rsiValue
+    getMarketPsychology(
+      candles,
+      ema9,
+      ema21,
+      rsi14,
+      adx14,
+      pattern
     );
+
+  const currentPrice =
+    candles[
+      candles.length - 1
+    ].close;
 
   let callScore = 0;
   let putScore = 0;
 
-  const reasons = [];
+  const reasonsCall = [];
+  const reasonsPut = [];
 
   /* EMA */
   if (
-    ema9Value !== null &&
-    ema21Value !== null
+    Number.isFinite(ema9) &&
+    Number.isFinite(ema21)
   ) {
-    if (
-      ema9Value >
-      ema21Value
-    ) {
-      callScore += 18;
-      reasons.push(
+    if (ema9 > ema21) {
+      callScore += 20;
+      reasonsCall.push(
         'EMA bullish'
       );
     } else if (
-      ema9Value <
-      ema21Value
+      ema9 < ema21
     ) {
-      putScore += 18;
-      reasons.push(
+      putScore += 20;
+      reasonsPut.push(
         'EMA bearish'
       );
     }
@@ -1936,60 +1499,44 @@ function analyzeCandles(
 
   /* RSI */
   if (
-    rsiValue !== null
+    Number.isFinite(rsi14)
   ) {
     if (
-      rsiValue >= 55 &&
-      rsiValue < 75
+      rsi14 >= 52 &&
+      rsi14 < 70
     ) {
-      callScore += 12;
-      reasons.push(
+      callScore += 15;
+      reasonsCall.push(
         'RSI supports CALL'
       );
     } else if (
-      rsiValue <= 45 &&
-      rsiValue > 25
+      rsi14 <= 48 &&
+      rsi14 > 30
     ) {
-      putScore += 12;
-      reasons.push(
+      putScore += 15;
+      reasonsPut.push(
         'RSI supports PUT'
-      );
-    } else if (
-      rsiValue >= 75
-    ) {
-      putScore += 5;
-      reasons.push(
-        'RSI overbought caution'
-      );
-    } else if (
-      rsiValue <= 25
-    ) {
-      callScore += 5;
-      reasons.push(
-        'RSI oversold rebound'
       );
     }
   }
 
   /* ADX */
   if (
-    adxValue !== null &&
-    adxValue >= 20
+    Number.isFinite(adx14) &&
+    adx14 >= 20
   ) {
     if (
-      ema9Value >
-      ema21Value
+      ema9 > ema21
     ) {
-      callScore += 10;
-      reasons.push(
+      callScore += 15;
+      reasonsCall.push(
         'ADX confirms trend'
       );
     } else if (
-      ema9Value <
-      ema21Value
+      ema9 < ema21
     ) {
-      putScore += 10;
-      reasons.push(
+      putScore += 15;
+      reasonsPut.push(
         'ADX confirms trend'
       );
     }
@@ -1997,234 +1544,154 @@ function analyzeCandles(
 
   /* Stochastic */
   if (
-    stochasticValue !== null &&
-    ema9Value !== null &&
-    ema21Value !== null
+    Number.isFinite(
+      stochastic14
+    )
   ) {
     if (
-      stochasticValue >= 50 &&
-      stochasticValue <= 85 &&
-      ema9Value >
-        ema21Value
+      stochastic14 >= 50 &&
+      stochastic14 < 85
     ) {
-      callScore += 8;
-      reasons.push(
-        'Stochastic bullish'
+      callScore += 10;
+      reasonsCall.push(
+        'Stochastic supports CALL'
       );
-    }
-
-    if (
-      stochasticValue <= 50 &&
-      stochasticValue >= 15 &&
-      ema9Value <
-        ema21Value
+    } else if (
+      stochastic14 <= 50 &&
+      stochastic14 > 15
     ) {
-      putScore += 8;
-      reasons.push(
-        'Stochastic bearish'
+      putScore += 10;
+      reasonsPut.push(
+        'Stochastic supports PUT'
       );
     }
   }
 
   /* Price action */
   if (
-    pattern.bias ===
-    'BULLISH'
+    pattern.bullish
   ) {
-    callScore +=
-      pattern.strength;
-
-    reasons.push(
-      pattern.label
+    callScore += 15;
+    reasonsCall.push(
+      pattern.pattern
     );
   }
 
   if (
-    pattern.bias ===
-    'BEARISH'
+    pattern.bearish
   ) {
-    putScore +=
-      pattern.strength;
-
-    reasons.push(
-      pattern.label
-    );
-  }
-
-  /* Psychology */
-  if (
-    psychology.bias ===
-    'BULLISH'
-  ) {
-    callScore +=
-      psychology.strength;
-
-    reasons.push(
-      psychology.label
-    );
-  }
-
-  if (
-    psychology.bias ===
-    'BEARISH'
-  ) {
-    putScore +=
-      psychology.strength;
-
-    reasons.push(
-      psychology.label
+    putScore += 15;
+    reasonsPut.push(
+      pattern.pattern
     );
   }
 
   /* Bollinger */
-  if (bb) {
-    if (
-      currentPrice >
-        bb.middle &&
-      currentPrice <
-        bb.upper &&
-      ema9Value >
-        ema21Value
-    ) {
-      callScore += 3;
-    }
-
-    if (
-      currentPrice <
-        bb.middle &&
-      currentPrice >
-        bb.lower &&
-      ema9Value <
-        ema21Value
-    ) {
-      putScore += 3;
-    }
-  }
-
-  /* Support / resistance */
   if (
-    sr.support !== null &&
-    sr.resistance !== null
+    bollinger
   ) {
-    const range =
-      sr.resistance -
-      sr.support;
+    if (
+      currentPrice >
+      bollinger.middle &&
+      currentPrice <
+      bollinger.upper
+    ) {
+      callScore += 5;
+    }
 
     if (
-      range > 0
+      currentPrice <
+      bollinger.middle &&
+      currentPrice >
+      bollinger.lower
     ) {
-      const location =
-        (
-          currentPrice -
-          sr.support
-        ) / range;
-
-      if (
-        location <= 0.20 &&
-        ema9Value >
-          ema21Value
-      ) {
-        callScore += 3;
-        reasons.push(
-          'Near support'
-        );
-      }
-
-      if (
-        location >= 0.80 &&
-        ema9Value <
-          ema21Value
-      ) {
-        putScore += 3;
-        reasons.push(
-          'Near resistance'
-        );
-      }
+      putScore += 5;
     }
   }
 
-  callScore =
-    Math.round(
-      clamp(
-        callScore,
-        0,
-        100
-      )
+  /* Market psychology */
+  if (
+    psychology ===
+    'BULLISH MOMENTUM'
+  ) {
+    callScore += 10;
+    reasonsCall.push(
+      'BULLISH MOMENTUM'
     );
+  }
 
-  putScore =
-    Math.round(
-      clamp(
-        putScore,
-        0,
-        100
-      )
+  if (
+    psychology ===
+    'BEARISH MOMENTUM'
+  ) {
+    putScore += 10;
+    reasonsPut.push(
+      'BEARISH MOMENTUM'
     );
+  }
 
-  const winningScore =
-    Math.max(
-      callScore,
-      putScore
-    );
+  callScore = clamp(
+    Math.round(callScore),
+    0,
+    100
+  );
 
-  const losingScore =
-    Math.min(
-      callScore,
-      putScore
-    );
+  putScore = clamp(
+    Math.round(putScore),
+    0,
+    100
+  );
 
   const gap =
-    winningScore -
-    losingScore;
+    Math.abs(
+      callScore -
+        putScore
+    );
 
   let signal =
     'NO TRADE';
 
-  if (
-    winningScore >= 55 &&
-    gap >= 12
-  ) {
-    signal =
-      callScore >
-      putScore
-        ? 'CALL'
-        : 'PUT';
-  }
-
   let confidence = 40;
+  let reasons = [
+    'No sufficiently fresh valid signal available'
+  ];
 
   if (
-    signal !==
-    'NO TRADE'
+    callScore >= 65 &&
+    callScore > putScore &&
+    gap >= 15
   ) {
-    confidence =
-      Math.round(
-        clamp(
-          50 +
-            winningScore *
-              0.40 +
-            gap *
-              0.45,
-          55,
-          94
-        )
-      );
-  } else {
-    confidence =
-      Math.round(
-        clamp(
-          35 +
-            winningScore *
-              0.25,
-          40,
-          59
-        )
-      );
+    signal = 'CALL';
+    confidence = clamp(
+      callScore,
+      0,
+      100
+    );
+    reasons =
+      reasonsCall;
+  } else if (
+    putScore >= 65 &&
+    putScore > callScore &&
+    gap >= 15
+  ) {
+    signal = 'PUT';
+    confidence = clamp(
+      putScore,
+      0,
+      100
+    );
+    reasons =
+      reasonsPut;
   }
+
+  const lastCandle =
+    candles[
+      candles.length - 1
+    ].time;
 
   const dataAgeSeconds =
     getDataAgeSeconds(
-      candles
+      lastCandle
     );
 
   const freshness =
@@ -2233,72 +1700,115 @@ function analyzeCandles(
       dataAgeSeconds
     );
 
+  const entryTime =
+    getNextEntryTime(
+      timeframe
+    );
+
+  const entryInSeconds =
+    Math.max(
+      0,
+      Math.floor(
+        (entryTime -
+          nowMs()) /
+          1000
+      )
+    );
+
+  /*
+   A signal is invalid if data is not fresh
+   or if the next entry is too close.
+  */
+  if (
+    freshness !==
+      'FRESH' ||
+    entryInSeconds <
+      MIN_ENTRY_SECONDS
+  ) {
+    signal = 'NO TRADE';
+    confidence = 40;
+
+    if (
+      freshness !==
+      'FRESH'
+    ) {
+      reasons = [
+        'No sufficiently fresh valid signal available'
+      ];
+    } else {
+      reasons = [
+        'Entry window too close'
+      ];
+    }
+  }
+
+  const expiryTime =
+    entryTime +
+    timeframe *
+      60 *
+      1000;
+
   let volatility =
-    'NORMAL';
+    'LOW';
 
   if (
-    atrValue !== null &&
+    Number.isFinite(
+      atr14
+    ) &&
     currentPrice > 0
   ) {
     const atrPercent =
-      (
-        atrValue /
-        currentPrice
-      ) * 100;
+      (atr14 /
+        currentPrice) *
+      100;
 
     if (
-      atrPercent >=
-      0.15
+      atrPercent >= 0.08
     ) {
       volatility =
         'HIGH';
     } else if (
-      atrPercent <=
-      0.03
+      atrPercent >= 0.03
     ) {
       volatility =
-        'LOW';
+        'MEDIUM';
     }
   }
-
-  const entryTime =
-    new Date(
-      Math.ceil(
-        nowMs() / 60000
-      ) * 60000
-    );
-
-  const expiryTime =
-    new Date(
-      entryTime.getTime() +
-        timeframe *
-          60000
-    );
-
-  const entryInSeconds =
-    secondsFromNow(
-      entryTime
-    );
 
   return {
     pair,
     timeframe,
     signal,
     confidence,
-    currentPrice,
+
+    currentPrice:
+      round(
+        currentPrice,
+        6
+      ),
+
     entryPrice:
-      currentPrice,
+      round(
+        currentPrice,
+        6
+      ),
 
     entryTime:
-      entryTime.toISOString(),
+      new Date(
+        entryTime
+      ).toISOString(),
 
     expiryTime:
-      expiryTime.toISOString(),
+      new Date(
+        expiryTime
+      ).toISOString(),
 
     entryInSeconds,
 
     lastCandle:
-      current.time,
+      new Date(
+        lastCandle
+      ).toISOString(),
 
     dataAgeSeconds,
 
@@ -2307,429 +1817,389 @@ function analyzeCandles(
     callScore,
     putScore,
     gap,
+
     volatility,
 
     indicators: {
       ema9:
-        ema9Value,
-
+        round(
+          ema9,
+          8
+        ),
       ema21:
-        ema21Value,
-
+        round(
+          ema21,
+          8
+        ),
       rsi14:
-        rsiValue,
-
+        round(
+          rsi14,
+          2
+        ),
       adx14:
-        adxValue,
-
+        round(
+          adx14,
+          2
+        ),
       stochastic14:
-        stochasticValue,
-
+        round(
+          stochastic14,
+          2
+        ),
       atr14:
-        atrValue,
-
+        round(
+          atr14,
+          8
+        ),
       bollinger:
-        bb
+        bollinger
+          ? {
+              upper:
+                round(
+                  bollinger.upper,
+                  8
+                ),
+              middle:
+                round(
+                  bollinger.middle,
+                  8
+                ),
+              lower:
+                round(
+                  bollinger.lower,
+                  8
+                )
+            }
+          : null
     },
 
-    supportResistance:
-      sr,
+    supportResistance: {
+      support:
+        round(
+          supportResistance.support,
+          6
+        ),
+      resistance:
+        round(
+          supportResistance.resistance,
+          6
+        )
+    },
 
     priceAction:
-      pattern.label,
+      pattern.pattern,
 
     marketPsychology:
-      psychology.label,
+      psychology,
 
-    reasons: [
-      ...new Set(
-        reasons
-      )
-    ].slice(0, 8)
+    reasons:
+      reasons.length
+        ? reasons
+        : [
+            'No sufficiently fresh valid signal available'
+          ]
   };
 }
 
 /* =========================================================
-   MARKET RESULT
+   PAIR CACHE
 ========================================================= */
 
-function buildMarketResult(
-  pair,
-  timeframe,
-  candles
-) {
-  const analysis =
-    analyzeCandles(
-      pair,
-      timeframe,
-      candles
-    );
+function getCachedPair(pair) {
+  const cached =
+    pairCache.get(pair);
 
-  if (!analysis) {
+  if (!cached) {
     return null;
   }
 
   if (
-    analysis.freshness !==
-    'FRESH'
+    nowMs() -
+      cached.fetchedAt >
+    PAIR_CACHE_TTL_MS
   ) {
-    analysis.signal =
-      'NO TRADE';
-
-    analysis.confidence =
-      40;
-  }
-
-  if (
-    analysis.signal !==
-      'NO TRADE' &&
-    analysis.entryInSeconds <
-      MIN_ENTRY_SECONDS
-  ) {
-    analysis.signal =
-      'NO TRADE';
-
-    analysis.confidence =
-      40;
-
-    analysis.reasons = [
-      'Entry window is too close'
-    ];
-  }
-
-  return analysis;
-}
-
-/* =========================================================
-   PAIR ANALYSIS
-========================================================= */
-
-function diagnosticRank(
-  market
-) {
-  if (!market) {
-    return 99;
-  }
-
-  const order = {
-    FRESH: 0,
-    STALE: 1,
-    HARD_STALE: 2,
-    NO_DATA: 3
-  };
-
-  return (
-    order[
-      market.freshness
-    ] ?? 99
-  );
-}
-
-function compareMarkets(
-  a,
-  b
-) {
-  const signalA =
-    a.signal === 'CALL' ||
-    a.signal === 'PUT';
-
-  const signalB =
-    b.signal === 'CALL' ||
-    b.signal === 'PUT';
-
-  if (
-    signalA !==
-    signalB
-  ) {
-    return signalA
-      ? -1
-      : 1;
-  }
-
-  if (
-    a.freshness !==
-    b.freshness
-  ) {
-    return (
-      diagnosticRank(a) -
-      diagnosticRank(b)
-    );
-  }
-
-  if (
-    a.confidence !==
-    b.confidence
-  ) {
-    return (
-      b.confidence -
-      a.confidence
-    );
-  }
-
-  if (
-    a.gap !==
-    b.gap
-  ) {
-    return (
-      b.gap -
-      a.gap
-    );
-  }
-
-  return (
-    (
-      a.dataAgeSeconds ??
-      999999
-    ) -
-    (
-      b.dataAgeSeconds ??
-      999999
-    )
-  );
-}
-
-async function analyzePair(
-  pair,
-  forceRefresh = false
-) {
-  const candles =
-    await loadPair(
-      pair,
-      forceRefresh
-    );
-
-  const markets =
-    TIMEFRAMES
-      .map(tf => {
-        const tfCandles =
-          aggregateCandles(
-            candles,
-            tf
-          );
-
-        return buildMarketResult(
-          pair,
-          tf,
-          tfCandles
-        );
-      })
-      .filter(Boolean);
-
-  if (
-    !markets.length
-  ) {
+    pairCache.delete(pair);
     return null;
   }
 
-  markets.sort(
-    compareMarkets
+  return cached;
+}
+
+async function loadPair(pair) {
+  const cached =
+    getCachedPair(pair);
+
+  if (cached) {
+    return cached;
+  }
+
+  const fresh =
+    await requestTwelveData(
+      pair
+    );
+
+  pairCache.set(
+    pair,
+    fresh
   );
 
-  return markets[0];
+  return fresh;
 }
 
 /* =========================================================
    RESULT CACHE
 ========================================================= */
 
-function setResultCache(
-  market
+function resultCacheKey(
+  pair,
+  timeframe
 ) {
-  if (
-    !market?.pair
-  ) {
-    return;
-  }
+  return `${pair}|${timeframe}`;
+}
 
-  const key =
-    `${market.pair}|${market.timeframe}`;
-
+function setResultCache(
+  result
+) {
   resultCache.set(
-    key,
+    resultCacheKey(
+      result.pair,
+      result.timeframe
+    ),
     {
-      market,
-      storedAt:
-        nowMs()
+      storedAt: nowMs(),
+      result
     }
   );
 }
 
+function getResultCache(
+  pair,
+  timeframe
+) {
+  const cached =
+    resultCache.get(
+      resultCacheKey(
+        pair,
+        timeframe
+      )
+    );
+
+  if (!cached) {
+    return null;
+  }
+
+  if (
+    nowMs() -
+      cached.storedAt >
+    RESULT_CACHE_TTL_MS
+  ) {
+    resultCache.delete(
+      resultCacheKey(
+        pair,
+        timeframe
+      )
+    );
+
+    return null;
+  }
+
+  return cached.result;
+}
+
 function getValidResultCache() {
-  const markets = [];
+  const candidates = [];
 
   for (
-    const [
-      key,
-      entry
-    ]
+    const [key, cached]
     of resultCache.entries()
   ) {
     if (
       nowMs() -
-        entry.storedAt >
+        cached.storedAt >
       RESULT_CACHE_TTL_MS
     ) {
-      resultCache.delete(
-        key
-      );
-
+      resultCache.delete(key);
       continue;
     }
 
-    const market =
-      entry.market;
+    const result =
+      cached.result;
 
     if (
-      market.freshness ===
-        'FRESH' &&
-      (
-        market.signal ===
-          'CALL' ||
-        market.signal ===
-          'PUT'
-      ) &&
-      market.entryInSeconds >=
+      result.signal !==
+        'CALL' &&
+      result.signal !==
+        'PUT'
+    ) {
+      continue;
+    }
+
+    if (
+      result.freshness !==
+      'FRESH'
+    ) {
+      continue;
+    }
+
+    if (
+      !Number.isFinite(
+        result.entryInSeconds
+      ) ||
+      result.entryInSeconds <
         MIN_ENTRY_SECONDS
     ) {
-      markets.push(
-        market
-      );
+      continue;
     }
+
+    candidates.push(
+      result
+    );
   }
 
-  markets.sort(
-    compareMarkets
-  );
-
-  return markets;
+  return candidates;
 }
 
 /* =========================================================
-   CACHE DIAGNOSTICS
+   ANALYZE PAIR
 ========================================================= */
 
-function cachedDiagnosticMarkets() {
-  const markets = [];
+async function analyzePair(
+  pair
+) {
+  const pairData =
+    await loadPair(pair);
+
+  const results = [];
 
   for (
-    const pair of PAIRS
+    const timeframe
+    of TIMEFRAMES
   ) {
-    const entry =
-      getPairCache(pair);
+    const candles =
+      aggregateCandles(
+        pairData.candles,
+        timeframe
+      );
 
     if (
-      !entry?.candles?.length
+      candles.length <
+      MIN_CANDLES
     ) {
       continue;
     }
 
-    for (
-      const tf of TIMEFRAMES
-    ) {
-      const tfCandles =
-        aggregateCandles(
-          entry.candles,
-          tf
-        );
+    const result =
+      analyzeCandles(
+        pair,
+        timeframe,
+        candles
+      );
 
-      const market =
-        buildMarketResult(
-          pair,
-          tf,
-          tfCandles
-        );
+    setResultCache(result);
 
-      if (market) {
-        markets.push(
-          market
-        );
-      }
-    }
+    results.push(result);
   }
 
-  markets.sort(
-    (a, b) => {
-      const rank =
-        diagnosticRank(a) -
-        diagnosticRank(b);
-
-      if (rank !== 0) {
-        return rank;
-      }
-
-      return (
-        (
-          a.dataAgeSeconds ??
-          999999
-        ) -
-        (
-          b.dataAgeSeconds ??
-          999999
-        )
-      );
-    }
-  );
-
-  return markets;
+  return results;
 }
 
 /* =========================================================
-   NO TRADE MARKET
+   RANKING
 ========================================================= */
 
-function noTradeMarket(
-  diagnostic = null
+function candidateRank(
+  result
 ) {
-  if (diagnostic) {
-    return {
-      ...diagnostic,
-
-      signal:
-        'NO TRADE',
-
-      confidence:
-        40,
-
-      entryPrice:
-        diagnostic.currentPrice ??
-        null,
-
-      reasons:
-        diagnostic.reasons?.length
-          ? diagnostic.reasons
-          : [
-              'No sufficiently fresh valid signal available'
-            ]
-    };
+  if (
+    !result ||
+    (result.signal !==
+      'CALL' &&
+      result.signal !==
+        'PUT')
+  ) {
+    return -Infinity;
   }
 
+  let score =
+    result.confidence * 2;
+
+  score +=
+    result.gap;
+
+  if (
+    result.freshness ===
+    'FRESH'
+  ) {
+    score += 30;
+  }
+
+  if (
+    result.entryInSeconds >=
+    45
+  ) {
+    score += 10;
+  }
+
+  if (
+    result.timeframe === 1
+  ) {
+    score += 4;
+  }
+
+  if (
+    result.timeframe === 2
+  ) {
+    score += 6;
+  }
+
+  if (
+    result.timeframe === 3
+  ) {
+    score += 5;
+  }
+
+  return score;
+}
+
+function rankCandidates(
+  candidates
+) {
+  return candidates
+    .filter(
+      (candidate) =>
+        candidate &&
+        candidate.signal !==
+          'NO TRADE'
+    )
+    .sort(
+      (a, b) =>
+        candidateRank(b) -
+        candidateRank(a)
+    );
+}
+
+/* =========================================================
+   DIAGNOSTIC MARKET
+========================================================= */
+
+function buildNoDataMarket() {
   return {
     pair: null,
     timeframe: null,
-    signal:
-      'NO TRADE',
-
+    signal: 'NO TRADE',
     confidence: 40,
-
     currentPrice: null,
     entryPrice: null,
-
     entryTime: null,
     expiryTime: null,
     entryInSeconds: null,
-
     lastCandle: null,
     dataAgeSeconds: null,
-
-    freshness:
-      'NO_DATA',
-
+    freshness: 'NO_DATA',
     callScore: 0,
     putScore: 0,
     gap: 0,
-
-    volatility:
-      'UNKNOWN',
+    volatility: 'UNKNOWN',
 
     indicators: {
       ema9: null,
@@ -2758,42 +2228,79 @@ function noTradeMarket(
   };
 }
 
-/* =========================================================
-   BEST MARKET
-========================================================= */
+function cachedDiagnosticMarkets() {
+  const markets = [];
 
-function bestMarket() {
-  const cached =
-    getValidResultCache();
-
-  if (
-    cached.length
+  for (
+    const pair of PAIRS
   ) {
-    return cached[0];
+    const pairData =
+      getCachedPair(pair);
+
+    if (!pairData) {
+      continue;
+    }
+
+    for (
+      const timeframe
+      of TIMEFRAMES
+    ) {
+      try {
+        const candles =
+          aggregateCandles(
+            pairData.candles,
+            timeframe
+          );
+
+        if (
+          candles.length <
+          MIN_CANDLES
+        ) {
+          continue;
+        }
+
+        markets.push(
+          analyzeCandles(
+            pair,
+            timeframe,
+            candles
+          )
+        );
+      } catch {
+        /* diagnostic only */
+      }
+    }
   }
 
-  const diagnostics =
-    cachedDiagnosticMarkets();
-
-  if (
-    diagnostics.length
-  ) {
-    return noTradeMarket(
-      diagnostics[0]
-    );
-  }
-
-  return noTradeMarket();
+  return markets;
 }
 
 /* =========================================================
    SCANNER
 ========================================================= */
 
-async function scanBatch() {
+function quotaWaitMessage(
+  waitMs
+) {
   if (
-    scanRunning
+    waitMs === Infinity
   ) {
+    return 'Daily provider safety limit reached';
+  }
+
+  const seconds =
+    Math.max(
+      1,
+      Math.ceil(
+        waitMs / 1000
+      )
+    );
+
+  return `Provider quota slot unavailable; retry in ${seconds}s`;
+}
+
+async function scanBatch() {
+  if (scanRunning) {
     return scanPromise;
   }
 
@@ -2801,29 +2308,21 @@ async function scanBatch() {
 
   scanPromise =
     (async () => {
-      let batchError =
-        null;
+      let scannedThisBatch = 0;
+      let failedThisBatch = 0;
+
+      let lastError = null;
 
       try {
         const batch = [];
 
         for (
           let i = 0;
-          i <
-            SCAN_BATCH_SIZE;
+          i < SCAN_BATCH_SIZE;
           i++
         ) {
-          if (
-            !PAIRS.length
-          ) {
-            break;
-          }
-
           const index =
-            (
-              scanCursor +
-              i
-            ) %
+            (scanCursor + i) %
             PAIRS.length;
 
           batch.push(
@@ -2834,118 +2333,110 @@ async function scanBatch() {
         for (
           const pair of batch
         ) {
+          /*
+           Before starting a new pair, check quota.
+           If no slot exists, PAUSE the scanner.
+           This is NOT a pair failure.
+          */
+          const waitMs =
+            getProviderWaitMs();
+
+          if (
+            waitMs !== 0
+          ) {
+            lastError =
+              quotaWaitMessage(
+                waitMs
+              );
+
+            break;
+          }
+
           try {
-            const cached =
-              getPairCache(
-                pair
-              );
-
-            const needsRefresh =
-              !cached ||
-              !pairCacheTransportValid(
-                cached
-              ) ||
-              !pairHasFreshTimeframe(
-                cached
-              );
-
-            const market =
-              await analyzePair(
-                pair,
-                needsRefresh
-              );
+            await analyzePair(
+              pair
+            );
 
             totalScanned += 1;
+            scannedThisBatch += 1;
 
+            scanCursor =
+              (
+                scanCursor +
+                1
+              ) %
+              PAIRS.length;
+          } catch (error) {
             if (
-              market
+              error instanceof
+              ProviderQuotaError
             ) {
-              const entry =
-                getPairCache(
-                  pair
+              /*
+               Quota wait is not a pair failure.
+              */
+              lastError =
+                quotaWaitMessage(
+                  error.waitMs
                 );
 
-              if (
-                entry?.candles?.length
-              ) {
-                for (
-                  const tf of
-                    TIMEFRAMES
-                ) {
-                  const tfCandles =
-                    aggregateCandles(
-                      entry.candles,
-                      tf
-                    );
-
-                  const tfMarket =
-                    buildMarketResult(
-                      pair,
-                      tf,
-                      tfCandles
-                    );
-
-                  if (
-                    tfMarket &&
-                    tfMarket.freshness ===
-                      'FRESH'
-                  ) {
-                    setResultCache(
-                      tfMarket
-                    );
-                  }
-                }
-              }
+              break;
             }
-          } catch (error) {
+
             totalFailed += 1;
+            failedThisBatch += 1;
 
-            batchError =
-              `${pair}: ${error.message}`;
-
-            lastScanError =
-              batchError;
+            lastError =
+              `${pair}: ${
+                error.message ||
+                'Unknown scanner error'
+              }`;
 
             /*
-             IMPORTANT:
-             A single provider failure must not
-             stop the rest of the batch.
+             The pair failed for a real reason,
+             so move cursor forward.
             */
-            continue;
+            scanCursor =
+              (
+                scanCursor +
+                1
+              ) %
+              PAIRS.length;
           }
         }
 
+        lastScanAt =
+          nowIso();
+
         /*
-         If the batch completed without a new error,
-         preserve the last diagnostic rather than
-         creating false success text.
+         Only record real errors.
+         A quota pause is informational.
         */
         if (
-          batchError === null
+          lastError &&
+          lastError.startsWith(
+            'Provider quota slot unavailable'
+          )
         ) {
-          /*
-           Do not erase a useful previous error here.
-          */
+          lastScanError =
+            lastError;
+        } else if (
+          lastError
+        ) {
+          lastScanError =
+            lastError;
+        } else {
+          lastScanError =
+            null;
         }
 
-        scanCursor =
-          (
-            scanCursor +
-            batch.length
-          ) %
-          PAIRS.length;
-
-        lastScanAt =
-          new Date()
-            .toISOString();
-
-        return true;
+        return {
+          scannedThisBatch,
+          failedThisBatch,
+          lastError
+        };
       } finally {
-        scanRunning =
-          false;
-
-        scanPromise =
-          null;
+        scanRunning = false;
+        scanPromise = null;
       }
     })();
 
@@ -2953,111 +2444,141 @@ async function scanBatch() {
 }
 
 /* =========================================================
-   WAIT FOR USEFUL MARKET
+   SCHEDULE NEXT SCAN
 ========================================================= */
 
-async function ensureUsefulMarket() {
-  const existing =
-    getValidResultCache();
-
-  if (
-    existing.length
-  ) {
-    return existing[0];
+function scheduleNextScan(
+  delay = SCAN_EVERY_MS
+) {
+  if (nextScanTimer) {
+    clearTimeout(
+      nextScanTimer
+    );
   }
 
-  try {
-    await scanBatch();
-  } catch (error) {
-    lastScanError =
-      error.message;
-  }
+  nextScanTimer =
+    setTimeout(
+      async () => {
+        nextScanTimer = null;
 
-  const afterScan =
-    getValidResultCache();
+        try {
+          await scanBatch();
+        } catch (error) {
+          lastScanError =
+            error.message ||
+            'Scanner error';
+        }
 
-  if (
-    afterScan.length
-  ) {
-    return afterScan[0];
-  }
-
-  return bestMarket();
+        scheduleNextScan(
+          SCAN_EVERY_MS
+        );
+      },
+      delay
+    );
 }
 
 /* =========================================================
-   RESPONSE CONTRACT
+   BEST MARKET
+========================================================= */
+
+async function ensureUsefulMarket() {
+  /*
+   First use valid fresh result cache.
+  */
+  let candidates =
+    getValidResultCache();
+
+  if (candidates.length) {
+    return rankCandidates(
+      candidates
+    );
+  }
+
+  /*
+   If scanner is already running, wait for it.
+  */
+  if (scanRunning) {
+    try {
+      await scanPromise;
+    } catch {
+      /* handled below */
+    }
+
+    candidates =
+      getValidResultCache();
+
+    if (candidates.length) {
+      return rankCandidates(
+        candidates
+      );
+    }
+  }
+
+  /*
+   Run one batch immediately when there is
+   a provider slot available.
+  */
+  const waitMs =
+    getProviderWaitMs();
+
+  if (
+    waitMs === 0
+  ) {
+    try {
+      await scanBatch();
+    } catch (error) {
+      lastScanError =
+        error.message ||
+        'Scanner error';
+    }
+  } else {
+    /*
+     Do not wait 60+ seconds inside /api/best.
+     Scanner will retry on its normal schedule.
+    */
+    lastScanError =
+      quotaWaitMessage(
+        waitMs
+      );
+  }
+
+  candidates =
+    getValidResultCache();
+
+  return rankCandidates(
+    candidates
+  );
+}
+
+/* =========================================================
+   RESPONSE
 ========================================================= */
 
 function makeResponse(
-  selectedMarket
+  selectedMarket,
+  rankedCandidates
 ) {
+  const selected =
+    selectedMarket ||
+    buildNoDataMarket();
+
   resetDailyCounterIfNeeded();
-
-  const rankedCandidates =
-    getValidResultCache()
-      .slice(0, 10)
-      .map(
-        (
-          market,
-          index
-        ) => ({
-          rank:
-            index + 1,
-
-          pair:
-            market.pair,
-
-          timeframe:
-            market.timeframe,
-
-          signal:
-            market.signal,
-
-          confidence:
-            market.confidence,
-
-          currentPrice:
-            market.currentPrice,
-
-          entryTime:
-            market.entryTime,
-
-          expiryTime:
-            market.expiryTime,
-
-          entryInSeconds:
-            market.entryInSeconds,
-
-          freshness:
-            market.freshness,
-
-          gap:
-            market.gap
-        })
-      );
 
   return {
     ok: true,
 
-    version:
-      VERSION,
+    version: VERSION,
 
-    source:
-      SOURCE,
+    source: SOURCE,
 
-    timezone:
-      TIMEZONE,
+    timezone: TIMEZONE,
 
-    selectedMarket:
-      selectedMarket ||
-      noTradeMarket(),
+    selectedMarket: selected,
 
     supportedTimeframes:
       TIMEFRAMES,
 
-    pairs:
-      PAIRS,
+    pairs: PAIRS,
 
     metadata: {
       provider:
@@ -3067,7 +2588,7 @@ function makeResponse(
         SOURCE_INTERVAL,
 
       providerRequests:
-        providerRequestsThisMinute(),
+        getProviderRequestsLastMinute(),
 
       providerMinuteSafeLimit:
         PROVIDER_SAFE_LIMIT,
@@ -3075,10 +2596,11 @@ function makeResponse(
       providerMinuteHardLimit:
         PROVIDER_HARD_LIMIT,
 
-      dailyCreditsUsed,
+      dailyCreditsUsed:
+        dailyCreditsUsed,
 
       dailyCreditsRemaining:
-        dailyRequestsRemaining(),
+        getDailyCreditsRemaining(),
 
       cachedPairs:
         pairCache.size,
@@ -3087,22 +2609,18 @@ function makeResponse(
         resultCache.size,
 
       resultCacheTtlSeconds:
-        Math.floor(
-          RESULT_CACHE_TTL_MS /
-          1000
-        ),
+        RESULT_CACHE_TTL_MS /
+        1000,
 
       pairCacheTtlMinutes:
-        Math.floor(
-          PAIR_CACHE_TTL_MS /
-          60000
-        ),
+        PAIR_CACHE_TTL_MS /
+        60000,
 
       entryBufferSeconds:
         ENTRY_BUFFER_SECONDS,
 
       freshnessRules:
-        MAX_DATA_AGE_SECONDS,
+        FRESHNESS_RULES,
 
       hardStaleSeconds:
         HARD_STALE_SECONDS
@@ -3119,23 +2637,27 @@ function makeResponse(
         SCAN_BATCH_SIZE,
 
       intervalSeconds:
-        Math.floor(
-          SCAN_EVERY_MS /
-          1000
-        ),
+        SCAN_EVERY_MS /
+        1000,
 
-      lastScanAt,
+      lastScanAt:
+        lastScanAt,
 
-      lastScanError,
+      lastScanError:
+        lastScanError,
 
-      totalScanned,
+      totalScanned:
+        totalScanned,
 
-      totalFailed,
+      totalFailed:
+        totalFailed,
 
-      totalApiRequests
+      totalApiRequests:
+        totalApiRequests
     },
 
-    rankedCandidates
+    rankedCandidates:
+      rankedCandidates || []
   };
 }
 
@@ -3148,252 +2670,225 @@ app.get(
   (req, res) => {
     res.json({
       ok: true,
-
       service:
         'PO AI Predictor API',
-
-      version:
-        VERSION,
-
-      source:
-        SOURCE,
-
-      timezone:
-        TIMEZONE,
-
-      endpoint:
-        '/api/best'
+      version: VERSION,
+      source: SOURCE,
+      timezone: TIMEZONE
     });
   }
 );
 
+/* ---------------------------------------------------------
+   HEALTH
+--------------------------------------------------------- */
+
 app.get(
   '/api/health',
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const market =
-        await ensureUsefulMarket();
+  (req, res) => {
+    resetDailyCounterIfNeeded();
 
-      res.json(
-        makeResponse(
-          market
-        )
-      );
-    } catch (error) {
-      lastScanError =
-        error.message;
-
-      res.status(200).json(
-        makeResponse(
-          bestMarket()
-        )
-      );
-    }
+    res.json(
+      makeResponse(
+        null,
+        []
+      )
+    );
   }
 );
+
+/* ---------------------------------------------------------
+   BEST
+--------------------------------------------------------- */
 
 app.get(
   '/api/best',
-  async (
-    req,
-    res
-  ) => {
+  async (req, res) => {
     try {
-      const market =
+      const candidates =
         await ensureUsefulMarket();
 
-      res.status(200).json(
+      let selected =
+        candidates.length
+          ? candidates[0]
+          : null;
+
+      /*
+       If there is no valid CALL/PUT candidate,
+       try cached diagnostic data so frontend still
+       receives useful market state.
+      */
+      if (!selected) {
+        const diagnostics =
+          cachedDiagnosticMarkets();
+
+        if (
+          diagnostics.length
+        ) {
+          diagnostics.sort(
+            (a, b) =>
+              (
+                (b.freshness ===
+                'FRESH'
+                  ? 1
+                  : 0) -
+                (a.freshness ===
+                'FRESH'
+                  ? 1
+                  : 0)
+              ) ||
+              (
+                b.confidence -
+                a.confidence
+              )
+          );
+
+          selected =
+            diagnostics[0];
+        }
+      }
+
+      res.json(
         makeResponse(
-          market
+          selected,
+          candidates
         )
       );
     } catch (error) {
       lastScanError =
-        error.message;
+        error.message ||
+        'Best-market error';
 
-      res.status(200).json(
+      res.json(
         makeResponse(
-          bestMarket()
+          null,
+          []
         )
       );
     }
   }
 );
 
+/* ---------------------------------------------------------
+   ANALYZE
+--------------------------------------------------------- */
+
 app.get(
   '/api/analyze',
-  async (
-    req,
-    res
-  ) => {
+  async (req, res) => {
     const pair =
       String(
         req.query.pair ||
           ''
-      )
-        .trim()
-        .toUpperCase();
-
-    if (!pair) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          version:
-            VERSION,
-          error:
-            'pair query parameter is required'
-        });
-    }
+      ).trim();
 
     if (
-      !PAIRS.includes(
-        pair
-      )
+      !PAIRS.includes(pair)
     ) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          version:
-            VERSION,
-          error:
-            'Unsupported currency pair',
-          supportedPairs:
-            PAIRS
-        });
+      return res.status(400).json({
+        ok: false,
+        error:
+          'Unsupported currency pair',
+        supportedPairs:
+          PAIRS
+      });
     }
 
     try {
-      const market =
-        await analyzePair(
-          pair,
-          true
-        );
+      const cachedResults =
+        TIMEFRAMES.map(
+          (timeframe) =>
+            getResultCache(
+              pair,
+              timeframe
+            )
+        ).filter(Boolean);
 
       if (
-        market
+        cachedResults.length ===
+        TIMEFRAMES.length
       ) {
-        for (
-          const tf of
-            TIMEFRAMES
-        ) {
-          const entry =
-            getPairCache(
-              pair
-            );
-
-          if (
-            !entry
-          ) {
-            continue;
-          }
-
-          const tfCandles =
-            aggregateCandles(
-              entry.candles,
-              tf
-            );
-
-          const tfMarket =
-            buildMarketResult(
-              pair,
-              tf,
-              tfCandles
-            );
-
-          if (
-            tfMarket &&
-            tfMarket.freshness ===
-              'FRESH'
-          ) {
-            setResultCache(
-              tfMarket
-            );
-          }
-        }
+        return res.json({
+          ok: true,
+          version: VERSION,
+          source: SOURCE,
+          timezone: TIMEZONE,
+          pair,
+          results:
+            cachedResults
+        });
       }
 
-      res.status(200).json(
-        makeResponse(
-          market ||
-          noTradeMarket()
-        )
-      );
-    } catch (error) {
-      lastScanError =
-        `${pair}: ${error.message}`;
-
-      res.status(200).json(
-        makeResponse(
-          bestMarket()
-        )
-      );
-    }
-  }
-);
-
-app.get(
-  '/api/pairs',
-  (req, res) => {
-    res.json({
-      ok: true,
-
-      version:
-        VERSION,
-
-      source:
-        SOURCE,
-
-      pairs:
-        PAIRS,
-
-      supportedTimeframes:
-        TIMEFRAMES
-    });
-  }
-);
-
-/* =========================================================
-   BACKGROUND SCANNER
-========================================================= */
-
-setTimeout(
-  () => {
-    scanBatch()
-      .catch(
-        error => {
-          lastScanError =
-            error.message;
-        }
-      );
-  },
-  5000
-);
-
-setInterval(
-  () => {
-    if (
-      !scanRunning
-    ) {
-      scanBatch()
-        .catch(
-          error => {
-            lastScanError =
-              error.message;
-          }
+      const results =
+        await analyzePair(
+          pair
         );
+
+      res.json({
+        ok: true,
+        version: VERSION,
+        source: SOURCE,
+        timezone: TIMEZONE,
+        pair,
+        results
+      });
+    } catch (error) {
+      if (
+        error instanceof
+        ProviderQuotaError
+      ) {
+        return res.status(429).json({
+          ok: false,
+          error:
+            quotaWaitMessage(
+              error.waitMs
+            ),
+          retryAfterSeconds:
+            error.waitMs === Infinity
+              ? null
+              : Math.ceil(
+                  error.waitMs /
+                    1000
+                )
+        });
+      }
+
+      res.status(500).json({
+        ok: false,
+        error:
+          error.message ||
+          'Analyze failed'
+      });
     }
-  },
-  SCAN_EVERY_MS
+  }
 );
 
 /* =========================================================
-   START SERVER
+   STARTUP
 ========================================================= */
+
+function startBackgroundScanner() {
+  /*
+   Small startup delay gives Render time to start
+   before first provider request.
+  */
+  setTimeout(
+    async () => {
+      try {
+        await scanBatch();
+      } catch (error) {
+        lastScanError =
+          error.message ||
+          'Initial scanner error';
+      }
+
+      scheduleNextScan(
+        SCAN_EVERY_MS
+      );
+    },
+    5000
+  );
+}
 
 app.listen(
   PORT,
@@ -3411,29 +2906,43 @@ app.listen(
     );
 
     console.log(
-      `Timeframes: ${TIMEFRAMES.join(', ')}m`
+      `Timeframes: ${TIMEFRAMES.join(
+        ', '
+      )}`
     );
 
     console.log(
-      `Provider safe limit: ${PROVIDER_SAFE_LIMIT}/min`
-    );
-
-    console.log(
-      `Provider hard limit: ${PROVIDER_HARD_LIMIT}/min`
+      `Provider safe limit: ${PROVIDER_SAFE_LIMIT}/minute`
     );
 
     console.log(
       `Daily usable limit: ${DAILY_MAX_USABLE}`
     );
 
-    console.log(
-      'Provider queue: SERIALIZED + QUOTA-AWARE'
-    );
+    startBackgroundScanner();
+  }
+);
 
-    if (!API_KEY) {
-      console.warn(
-        'WARNING: Twelve Data API key is not configured.'
-      );
-    }
+/* =========================================================
+   PROCESS SAFETY
+========================================================= */
+
+process.on(
+  'unhandledRejection',
+  (error) => {
+    console.error(
+      'Unhandled rejection:',
+      error
+    );
+  }
+);
+
+process.on(
+  'uncaughtException',
+  (error) => {
+    console.error(
+      'Uncaught exception:',
+      error
+    );
   }
 );
