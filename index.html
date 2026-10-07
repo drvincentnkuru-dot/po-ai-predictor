@@ -2,46 +2,84 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <title>PO AI Predictor V9.0</title>
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
 
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <title>PO AI Predictor V9.1</title>
+
+  <link
+    rel="preconnect"
+    href="https://fonts.googleapis.com"
+  >
+
+  <link
+    rel="preconnect"
+    href="https://fonts.gstatic.com"
+    crossorigin
+  >
 
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
     rel="stylesheet"
   >
 
-  <link rel="stylesheet" href="style.css" />
+  <link
+    rel="stylesheet"
+    href="style.css"
+  />
 </head>
 
 <body>
 
 <div class="app-shell">
 
+  <!-- =====================================================
+       HEADER
+  ====================================================== -->
+
   <header class="topbar">
 
     <div class="brand">
 
-      <div class="brand-mark">⚡</div>
+      <div class="brand-mark">
+        ⚡
+      </div>
 
       <div>
-        <h1>PO AI PREDICTOR</h1>
-        <p>V9.0 • SMART LIVE SCANNER</p>
+
+        <h1>
+          PO AI PREDICTOR
+        </h1>
+
+        <p>
+          V9.1 • SMART LIVE SCANNER
+        </p>
+
       </div>
 
     </div>
 
     <div class="status-pill">
+
       <span class="dot"></span>
-      <span id="backendStatus">CONNECTING</span>
+
+      <span id="backendStatus">
+        CONNECTING
+      </span>
+
     </div>
 
   </header>
 
+
   <main>
+
+    <!-- ===================================================
+         HERO
+    ==================================================== -->
 
     <section class="hero">
 
@@ -56,24 +94,43 @@
         </h2>
 
         <p>
-          Scans supported live forex pairs and selects the strongest
-          available live setup using EMA, RSI, ADX, Stochastic,
-          Bollinger Bands, Support/Resistance and price action.
+          Scans supported live forex pairs and selects
+          the strongest available live setup using EMA,
+          RSI, ADX, Stochastic, Bollinger Bands,
+          Support/Resistance and price action.
         </p>
 
       </div>
 
-      <button id="analyzeBtn" class="analyze-btn">
+      <button
+        id="analyzeBtn"
+        class="analyze-btn"
+        type="button"
+      >
         ANALYZE MARKET
       </button>
 
     </section>
 
 
-    <section id="errorBox" class="error-box hidden"></section>
+    <!-- ===================================================
+         ERROR
+    ==================================================== -->
+
+    <section
+      id="errorBox"
+      class="error-box hidden"
+    ></section>
 
 
-    <section class="signal-card" id="signalCard">
+    <!-- ===================================================
+         SIGNAL CARD
+    ==================================================== -->
+
+    <section
+      class="signal-card"
+      id="signalCard"
+    >
 
       <div class="signal-head">
 
@@ -87,16 +144,29 @@
             Waiting for live data…
           </h3>
 
+          <span
+            id="marketStatus"
+            class="market-status"
+          >
+            WAITING
+          </span>
+
         </div>
 
-        <span id="trendBadge" class="trend-badge">
+        <span
+          id="trendBadge"
+          class="trend-badge"
+        >
           —
         </span>
 
       </div>
 
 
-      <div id="signalBadge" class="signal-badge no-trade">
+      <div
+        id="signalBadge"
+        class="signal-badge no-trade"
+      >
         NO TRADE
       </div>
 
@@ -104,6 +174,7 @@
       <div class="confidence-row">
 
         <div>
+
           <span class="muted">
             AI CONFIDENCE
           </span>
@@ -111,9 +182,12 @@
           <strong id="confidence">
             —
           </strong>
+
         </div>
 
+
         <div>
+
           <span class="muted">
             TIMEFRAME
           </span>
@@ -121,9 +195,12 @@
           <strong id="timeframe">
             —
           </strong>
+
         </div>
 
+
         <div>
+
           <span class="muted">
             ENTRY IN
           </span>
@@ -131,10 +208,15 @@
           <strong id="countdown">
             —
           </strong>
+
         </div>
 
       </div>
 
+
+      <!-- =================================================
+           TIME / PRICE
+      ================================================== -->
 
       <div class="time-grid">
 
@@ -150,6 +232,7 @@
 
         </div>
 
+
         <div class="time-box">
 
           <span>
@@ -161,6 +244,7 @@
           </strong>
 
         </div>
+
 
         <div class="time-box">
 
@@ -177,6 +261,10 @@
       </div>
 
 
+      <!-- =================================================
+           SCORES
+      ================================================== -->
+
       <div class="score-grid">
 
         <div>
@@ -191,6 +279,7 @@
 
         </div>
 
+
         <div>
 
           <span>
@@ -202,6 +291,7 @@
           </b>
 
         </div>
+
 
         <div>
 
@@ -215,6 +305,7 @@
 
         </div>
 
+
         <div>
 
           <span>
@@ -227,10 +318,40 @@
 
         </div>
 
+
+        <div>
+
+          <span>
+            SCORE GAP
+          </span>
+
+          <b id="gap">
+            —
+          </b>
+
+        </div>
+
+
+        <div>
+
+          <span>
+            VOLATILITY
+          </span>
+
+          <b id="volatility">
+            —
+          </b>
+
+        </div>
+
       </div>
 
     </section>
 
+
+    <!-- ===================================================
+         TECHNICAL CONFIRMATION
+    ==================================================== -->
 
     <section class="panel">
 
@@ -241,13 +362,39 @@
         </h3>
 
         <span id="dataAge">
-          —
+          DATA AGE —
         </span>
 
       </div>
 
 
       <div class="indicator-grid">
+
+        <div class="indicator">
+
+          <span>
+            CURRENT PRICE
+          </span>
+
+          <strong id="currentPrice">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator">
+
+          <span>
+            FRESHNESS
+          </span>
+
+          <strong id="freshness">
+            —
+          </strong>
+
+        </div>
+
 
         <div class="indicator">
 
@@ -261,6 +408,7 @@
 
         </div>
 
+
         <div class="indicator">
 
           <span>
@@ -272,6 +420,7 @@
           </strong>
 
         </div>
+
 
         <div class="indicator">
 
@@ -285,6 +434,7 @@
 
         </div>
 
+
         <div class="indicator">
 
           <span>
@@ -296,6 +446,7 @@
           </strong>
 
         </div>
+
 
         <div class="indicator">
 
@@ -309,6 +460,7 @@
 
         </div>
 
+
         <div class="indicator">
 
           <span>
@@ -320,6 +472,46 @@
           </strong>
 
         </div>
+
+
+        <div class="indicator wide">
+
+          <span>
+            BOLLINGER UPPER
+          </span>
+
+          <strong id="bollingerUpper">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator wide">
+
+          <span>
+            BOLLINGER MIDDLE
+          </span>
+
+          <strong id="bollingerMiddle">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator wide">
+
+          <span>
+            BOLLINGER LOWER
+          </span>
+
+          <strong id="bollingerLower">
+            —
+          </strong>
+
+        </div>
+
 
         <div class="indicator wide">
 
@@ -333,6 +525,7 @@
 
         </div>
 
+
         <div class="indicator wide">
 
           <span>
@@ -344,6 +537,7 @@
           </strong>
 
         </div>
+
 
         <div class="indicator wide">
 
@@ -357,10 +551,27 @@
 
         </div>
 
+
+        <div class="indicator wide">
+
+          <span>
+            LAST COMPLETED CANDLE
+          </span>
+
+          <strong id="lastCandle">
+            —
+          </strong>
+
+        </div>
+
       </div>
 
     </section>
 
+
+    <!-- ===================================================
+         SCANNER
+    ==================================================== -->
 
     <section class="panel">
 
@@ -376,22 +587,162 @@
 
       </div>
 
-      <div id="scanner" class="scanner"></div>
+
+      <div
+        id="scanner"
+        class="scanner"
+      ></div>
 
     </section>
 
+
+    <!-- ===================================================
+         SYSTEM INFORMATION
+    ==================================================== -->
+
+    <section class="panel">
+
+      <div class="panel-title">
+
+        <h3>
+          SYSTEM STATUS
+        </h3>
+
+      </div>
+
+
+      <div class="indicator-grid">
+
+        <div class="indicator wide">
+
+          <span>
+            DATA PROVIDER
+          </span>
+
+          <strong id="provider">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator">
+
+          <span>
+            PROVIDER REQUESTS / MIN
+          </span>
+
+          <strong id="providerRequests">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator">
+
+          <span>
+            DAILY CREDITS USED
+          </span>
+
+          <strong id="dailyCreditsUsed">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator">
+
+          <span>
+            DAILY CREDITS REMAINING
+          </span>
+
+          <strong id="dailyCreditsRemaining">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator">
+
+          <span>
+            CACHED PAIRS
+          </span>
+
+          <strong id="cachedPairs">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator">
+
+          <span>
+            ACTIVE CANDIDATES
+          </span>
+
+          <strong id="candidateCount">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator">
+
+          <span>
+            SCANNER
+          </span>
+
+          <strong id="scannerStatus">
+            —
+          </strong>
+
+        </div>
+
+
+        <div class="indicator wide">
+
+          <span>
+            LAST SCAN
+          </span>
+
+          <strong id="lastScanAt">
+            —
+          </strong>
+
+        </div>
+
+      </div>
+
+    </section>
+
+
+    <!-- ===================================================
+         FOOTER
+    ==================================================== -->
 
     <section class="footer-note">
 
       Data source:
       <b>Twelve Data LIVE</b>
 
-      • V9.0 uses EMA 9/21, RSI 14, ADX 14,
-      Stochastic, Bollinger Bands,
-      Support/Resistance and price action.
+      • PO AI Predictor V9.1 uses EMA 9/21,
+      RSI 14, ADX 14, Stochastic,
+      Bollinger Bands, Support/Resistance
+      and price action.
 
-      AI confidence is a setup score,
+      • Backend is the single signal engine.
+
+      • AI confidence is a setup score,
       not a guaranteed win probability.
+
+      • A CALL or PUT is only displayed when
+      the backend has sufficiently fresh data
+      and a valid setup.
 
     </section>
 
@@ -399,7 +750,10 @@
 
 </div>
 
-<script src="script.js"></script>
+
+<script
+  src="script.js"
+></script>
 
 </body>
 </html>
