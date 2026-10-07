@@ -3,15 +3,15 @@
 /*
 ============================================================
  PO AI PREDICTOR
- FRONTEND V9.0.5
- LIVE ONLY
+ V9.1 • SYNCHRONIZED FRONTEND
 
  Backend:
  https://po-ai-predictor-api.onrender.com
 
  IMPORTANT:
- Frontend does NOT calculate signals.
- Backend response is the single source of truth.
+ - Frontend does NOT calculate signals.
+ - Backend is the single signal engine.
+ - All displayed values come from ONE API response.
 ============================================================
 */
 
@@ -21,14 +21,19 @@ const API_BASE =
 const BEST_ENDPOINT =
   `${API_BASE}/api/best`;
 
+const HEALTH_ENDPOINT =
+  `${API_BASE}/api/health`;
+
 const REFRESH_MS = 15000;
+const REQUEST_TIMEOUT_MS = 25000;
 
 let requestRunning = false;
 let lastResponse = null;
 let countdownTimer = null;
+let refreshTimer = null;
 
 /* =========================================================
-   DOM HELPERS
+   DOM
 ========================================================= */
 
 function findElement(...ids) {
@@ -45,196 +50,148 @@ function findElement(...ids) {
 }
 
 function setText(
-  element,
-  value
+  ids,
+  value = '—'
 ) {
-  if (!element) return;
+  const list =
+    Array.isArray(ids)
+      ? ids
+      : [ids];
 
-  element.textContent =
-    value == null
-      ? '--'
-      : String(value);
+  const element =
+    findElement(...list);
+
+  if (element) {
+    element.textContent =
+      value === null ||
+      value === undefined ||
+      value === ''
+        ? '—'
+        : String(value);
+  }
 }
 
 function formatNumber(
   value,
-  digits = 5
+  decimals = 5
 ) {
-  if (
-    value == null ||
-    !Number.isFinite(
-      Number(value)
-    )
-  ) {
-    return '--';
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return '—';
   }
 
-  return Number(value).toFixed(
-    digits
-  );
+  return n.toFixed(decimals);
 }
 
-function formatPercent(
-  value
-) {
-  if (
-    value == null ||
-    !Number.isFinite(
-      Number(value)
-    )
-  ) {
-    return '--';
+function formatPercent(value) {
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return '—';
   }
 
-  return `${Number(value)}%`;
+  return `${Math.round(n)}%`;
 }
 
-function formatDate(
-  value
-) {
-  if (!value) return '--';
+function formatDate(value) {
+  if (!value) {
+    return '—';
+  }
 
   const date =
     new Date(value);
 
-  if (
-    Number.isNaN(
-      date.getTime()
-    )
-  ) {
-    return '--';
+  if (Number.isNaN(date.getTime())) {
+    return '—';
   }
 
-  return date
-    .toISOString()
+  return date.toISOString()
     .replace('T', ' ')
     .replace('.000Z', ' UTC');
 }
 
-/* =========================================================
-   SIGNAL COLOR
-========================================================= */
+function formatAge(seconds) {
+  const n = Number(seconds);
 
-function applySignalClass(
-  element,
-  signal
-) {
-  if (!element) return;
-
-  element.classList.remove(
-    'call',
-    'put',
-    'no-trade',
-    'CALL',
-    'PUT',
-    'NO-TRADE'
-  );
-
-  if (signal === 'CALL') {
-    element.classList.add(
-      'call',
-      'CALL'
-    );
-  } else if (
-    signal === 'PUT'
-  ) {
-    element.classList.add(
-      'put',
-      'PUT'
-    );
-  } else {
-    element.classList.add(
-      'no-trade',
-      'NO-TRADE'
-    );
+  if (!Number.isFinite(n)) {
+    return '—';
   }
+
+  if (n < 60) {
+    return `${Math.max(0, Math.floor(n))}s`;
+  }
+
+  const minutes =
+    Math.floor(n / 60);
+
+  const remainder =
+    Math.floor(n % 60);
+
+  return `${minutes}m ${remainder}s`;
+}
+
+function formatTimeframe(value) {
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return '—';
+  }
+
+  return `${n} MIN`;
 }
 
 /* =========================================================
-   FETCH
+   SIGNAL STYLING
 ========================================================= */
 
-async function fetchBest() {
-  if (requestRunning) {
-    return;
+function applySignalClass(signal) {
+  const badge =
+    findElement(
+      'signalBadge'
+    );
+
+  const card =
+    findElement(
+      'signalCard'
+    );
+
+  if (badge) {
+    badge.classList.remove(
+      'call',
+      'put',
+      'no-trade'
+    );
+
+    if (signal === 'CALL') {
+      badge.classList.add('call');
+    } else if (signal === 'PUT') {
+      badge.classList.add('put');
+    } else {
+      badge.classList.add('no-trade');
+    }
   }
 
-  requestRunning = true;
-
-  try {
-    const controller =
-      new AbortController();
-
-    const timeout =
-      setTimeout(
-        () =>
-          controller.abort(),
-        20000
-      );
-
-    const response =
-      await fetch(
-        `${BEST_ENDPOINT}?_=${Date.now()}`,
-        {
-          method: 'GET',
-          cache: 'no-store',
-          signal: controller.signal,
-          headers: {
-            Accept:
-              'application/json'
-          }
-        }
-      );
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}`
-      );
-    }
-
-    const data =
-      await response.json();
-
-    if (
-      !data ||
-      data.ok !== true
-    ) {
-      throw new Error(
-        'Invalid backend response'
-      );
-    }
-
-    if (
-      !data.selectedMarket
-    ) {
-      throw new Error(
-        'selectedMarket missing'
-      );
-    }
-
-    lastResponse = data;
-
-    /*
-     Single source of truth.
-    */
-    window.__POAI_LAST_RESPONSE =
-      data;
-
-    renderResponse(data);
-
-  } catch (error) {
-    console.error(
-      'PO AI Predictor:',
-      error
+  if (card) {
+    card.classList.remove(
+      'signal-call',
+      'signal-put',
+      'signal-no-trade'
     );
 
-    showStatus(
-      'Backend temporarily unavailable — keeping last valid result'
-    );
-  } finally {
-    requestRunning = false;
+    if (signal === 'CALL') {
+      card.classList.add(
+        'signal-call'
+      );
+    } else if (signal === 'PUT') {
+      card.classList.add(
+        'signal-put'
+      );
+    } else {
+      card.classList.add(
+        'signal-no-trade'
+      );
+    }
   }
 }
 
@@ -242,36 +199,181 @@ async function fetchBest() {
    STATUS
 ========================================================= */
 
-function showStatus(
-  message
+function setBackendStatus(
+  text,
+  connected = false
 ) {
+  setText(
+    'backendStatus',
+    text
+  );
+
   const status =
-    findElement(
-      'status',
-      'statusText',
-      'connectionStatus',
-      'marketStatus'
+    document.querySelector(
+      '.status-pill'
     );
 
-  setText(
-    status,
-    message
+  if (status) {
+    status.classList.toggle(
+      'connected',
+      connected
+    );
+  }
+}
+
+function showError(message) {
+  const box =
+    findElement(
+      'errorBox'
+    );
+
+  if (!box) {
+    return;
+  }
+
+  box.textContent =
+    message || 'Unknown error';
+
+  box.classList.remove(
+    'hidden'
   );
 }
 
+function hideError() {
+  const box =
+    findElement(
+      'errorBox'
+    );
+
+  if (box) {
+    box.textContent = '';
+    box.classList.add(
+      'hidden'
+    );
+  }
+}
+
 /* =========================================================
-   RENDER
+   API REQUEST
 ========================================================= */
 
-function renderResponse(
-  data
+async function fetchJson(
+  url,
+  timeoutMs = REQUEST_TIMEOUT_MS
 ) {
-  const market =
-    data.selectedMarket;
+  const controller =
+    new AbortController();
 
-  if (!market) {
-    return;
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      timeoutMs
+    );
+
+  try {
+    const response =
+      await fetch(
+        `${url}${url.includes('?') ? '&' : '?'}_=${Date.now()}`,
+        {
+          method: 'GET',
+          cache: 'no-store',
+          signal: controller.signal,
+          headers: {
+            Accept: 'application/json'
+          }
+        }
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        `Backend HTTP ${response.status}`
+      );
+    }
+
+    const data =
+      await response.json();
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+/* =========================================================
+   MAIN REQUEST
+========================================================= */
+
+async function fetchBest() {
+  if (requestRunning) {
+    return lastResponse;
+  }
+
+  requestRunning = true;
+
+  try {
+    setBackendStatus(
+      'ANALYZING',
+      false
+    );
+
+    const data =
+      await fetchJson(
+        BEST_ENDPOINT
+      );
+
+    if (
+      !data ||
+      data.ok !== true ||
+      !data.selectedMarket
+    ) {
+      throw new Error(
+        'Invalid backend response'
+      );
+    }
+
+    lastResponse = data;
+
+    window.__POAI_LAST_RESPONSE =
+      data;
+
+    hideError();
+
+    renderResponse(data);
+
+    setBackendStatus(
+      'LIVE CONNECTED',
+      true
+    );
+
+    return data;
+  } catch (error) {
+    console.error(
+      'PO AI request error:',
+      error
+    );
+
+    setBackendStatus(
+      'BACKEND ERROR',
+      false
+    );
+
+    showError(
+      'Backend temporarily unavailable. Keeping the last valid market result.'
+    );
+
+    return lastResponse;
+  } finally {
+    requestRunning = false;
+  }
+}
+
+/* =========================================================
+   RESPONSE RENDER
+========================================================= */
+
+function renderResponse(data) {
+  const market =
+    data.selectedMarket || {};
 
   renderMarket(
     market
@@ -290,25 +392,12 @@ function renderResponse(
   );
 
   renderCandidates(
-    data.rankedCandidates
+    data.rankedCandidates || []
   );
 
-  if (
-    market.signal ===
-    'NO TRADE'
-  ) {
-    showStatus(
-      market.freshness &&
-      market.freshness.status !==
-        'FRESH'
-        ? `LIVE DATA — ${market.freshness.status}`
-        : 'LIVE DATA CONNECTED'
-    );
-  } else {
-    showStatus(
-      'LIVE DATA CONNECTED'
-    );
-  }
+  updateSignalStatus(
+    market
+  );
 
   startCountdown(
     market
@@ -319,103 +408,76 @@ function renderResponse(
    MARKET
 ========================================================= */
 
-function renderMarket(
-  market
-) {
-  const pair =
-    findElement(
-      'pair',
-      'currencyPair',
-      'selectedPair',
-      'pairValue'
-    );
-
-  const timeframe =
-    findElement(
-      'timeframe',
-      'selectedTimeframe',
-      'expiry',
-      'timeframeValue'
-    );
-
+function renderMarket(market) {
   const signal =
-    findElement(
-      'signal',
-      'signalValue',
-      'prediction',
-      'tradeSignal'
-    );
+    market.signal || 'NO TRADE';
 
-  const confidence =
-    findElement(
-      'confidence',
-      'confidenceValue'
-    );
-
-  const currentPrice =
-    findElement(
-      'currentPrice',
-      'price',
-      'currentPriceValue'
-    );
-
-  const entryPrice =
-    findElement(
-      'entryPrice',
-      'entryPriceValue'
-    );
-
-  const entryTime =
-    findElement(
-      'entryTime',
-      'entryTimeValue'
-    );
-
-  const expiryTime =
-    findElement(
-      'expiryTime',
-      'expiryTimeValue'
-    );
-
-  const freshness =
-    findElement(
-      'freshness',
-      'freshnessValue'
-    );
-
-  const age =
-    findElement(
-      'dataAge',
-      'dataAgeValue',
-      'dataAgeSeconds'
-    );
+  const pair =
+    market.pair || 'NO MARKET';
 
   setText(
-    pair,
-    market.pair || '--'
+    'selectedPair',
+    pair
+  );
+
+  const badge =
+    findElement(
+      'signalBadge'
+    );
+
+  if (badge) {
+    badge.textContent =
+      signal;
+  }
+
+  setText(
+    'trendBadge',
+    signal === 'CALL'
+      ? 'BULLISH'
+      : signal === 'PUT'
+        ? 'BEARISH'
+        : 'WAIT'
   );
 
   setText(
-    timeframe,
-    market.timeframe
-      ? `${market.timeframe} MIN`
-      : '--'
-  );
-
-  setText(
-    signal,
-    market.signal || 'NO TRADE'
-  );
-
-  setText(
-    confidence,
+    'confidence',
     formatPercent(
       market.confidence
     )
   );
 
   setText(
-    currentPrice,
+    'timeframe',
+    formatTimeframe(
+      market.timeframe
+    )
+  );
+
+  setText(
+    'entryTime',
+    formatDate(
+      market.entryTime
+    )
+  );
+
+  setText(
+    'expiryTime',
+    formatDate(
+      market.expiryTime
+    )
+  );
+
+  setText(
+    'entryPrice',
+    formatNumber(
+      market.entryPrice ??
+      market.currentPrice,
+      5
+    )
+  );
+
+  setText(
+    'currentPrice',
     formatNumber(
       market.currentPrice,
       5
@@ -423,45 +485,21 @@ function renderMarket(
   );
 
   setText(
-    entryPrice,
-    formatNumber(
-      market.entryPrice,
-      5
-    )
+    'freshness',
+    market.freshness ||
+      '—'
   );
 
   setText(
-    entryTime,
-    formatDate(
-      market.entryTime
-    )
-  );
-
-  setText(
-    expiryTime,
-    formatDate(
-      market.expiryTime
-    )
-  );
-
-  setText(
-    freshness,
-    market.freshness
-      ? market.freshness.status
-      : '--'
-  );
-
-  setText(
-    age,
-    market.dataAgeSeconds ==
-      null
-      ? '--'
-      : `${market.dataAgeSeconds}s`
+    'dataAge',
+    market.dataAgeSeconds !== null &&
+    market.dataAgeSeconds !== undefined
+      ? `DATA AGE ${formatAge(market.dataAgeSeconds)}`
+      : 'DATA AGE —'
   );
 
   applySignalClass(
-    signal,
-    market.signal
+    signal
   );
 }
 
@@ -469,118 +507,104 @@ function renderMarket(
    INDICATORS
 ========================================================= */
 
-function renderIndicators(
-  market
-) {
-  const i =
-    market.indicators ||
-    {};
+function renderIndicators(market) {
+  const indicators =
+    market.indicators || {};
 
   setText(
-    findElement(
-      'ema9',
-      'ema9Value'
-    ),
+    'ema9',
     formatNumber(
-      i.ema9,
-      6
+      indicators.ema9,
+      5
     )
   );
 
   setText(
-    findElement(
-      'ema21',
-      'ema21Value'
-    ),
+    'ema21',
     formatNumber(
-      i.ema21,
-      6
+      indicators.ema21,
+      5
     )
   );
 
   setText(
-    findElement(
-      'rsi14',
-      'rsiValue',
-      'rsi14Value'
-    ),
+    'rsi',
     formatNumber(
-      i.rsi14,
+      indicators.rsi14,
       2
     )
   );
 
   setText(
-    findElement(
-      'adx14',
-      'adxValue',
-      'adx14Value'
-    ),
+    'adx',
     formatNumber(
-      i.adx14,
+      indicators.adx14,
       2
     )
   );
 
   setText(
-    findElement(
-      'stochastic14',
-      'stochasticValue',
-      'stochValue'
-    ),
+    'stochastic',
     formatNumber(
-      i.stochastic14,
+      indicators.stochastic14,
       2
     )
   );
 
   setText(
-    findElement(
-      'atr14',
-      'atrValue',
-      'atr14Value'
-    ),
+    'atr',
     formatNumber(
-      i.atr14,
-      6
+      indicators.atr14,
+      5
     )
   );
 
   const bb =
-    i.bollinger ||
-    {};
+    indicators.bollinger;
 
   setText(
-    findElement(
-      'bollingerUpper',
-      'bbUpper'
-    ),
+    'bollingerUpper',
     formatNumber(
-      bb.upper,
-      6
+      bb?.upper,
+      5
     )
   );
 
   setText(
-    findElement(
-      'bollingerMiddle',
-      'bbMiddle'
-    ),
+    'bollingerMiddle',
     formatNumber(
-      bb.middle,
-      6
+      bb?.middle,
+      5
     )
   );
 
   setText(
-    findElement(
-      'bollingerLower',
-      'bbLower'
-    ),
+    'bollingerLower',
     formatNumber(
-      bb.lower,
-      6
+      bb?.lower,
+      5
     )
+  );
+
+  setText(
+    'psychology',
+    market.marketPsychology ||
+      '—'
+  );
+
+  setText(
+    'priceAction',
+    market.priceAction ||
+      '—'
+  );
+
+  setText(
+    'reasons',
+    Array.isArray(
+      market.reasons
+    )
+      ? market.reasons.join(' • ')
+      : market.reasons || '—'
   );
 }
 
@@ -588,104 +612,44 @@ function renderIndicators(
    SCORES
 ========================================================= */
 
-function renderScores(
-  market
-) {
+function renderScores(market) {
   setText(
-    findElement(
-      'callScore',
-      'callScoreValue'
-    ),
-    market.callScore
-  );
-
-  setText(
-    findElement(
-      'putScore',
-      'putScoreValue'
-    ),
-    market.putScore
-  );
-
-  setText(
-    findElement(
-      'gap',
-      'gapValue'
-    ),
-    market.gap
-  );
-
-  setText(
-    findElement(
-      'volatility',
-      'volatilityValue'
-    ),
-    market.volatility
-  );
-
-  setText(
-    findElement(
-      'lastCandle',
-      'lastCandleValue'
-    ),
-    formatDate(
-      market.lastCandle
+    'callScore',
+    Number.isFinite(
+      Number(market.callScore)
     )
+      ? Math.round(
+          Number(market.callScore)
+        )
+      : '—'
   );
 
-  const reasons =
-    findElement(
-      'reasons',
-      'reasonList',
-      'signalReasons'
-    );
-
-  if (reasons) {
-    reasons.innerHTML = '';
-
-    const list =
-      Array.isArray(
-        market.reasons
-      )
-        ? market.reasons
-        : [];
-
-    for (const reason of list) {
-      const item =
-        document.createElement(
-          'div'
-        );
-
-      item.textContent =
-        `• ${reason}`;
-
-      reasons.appendChild(
-        item
-      );
-    }
-  }
-
-  const pattern =
-    market.priceAction || {};
-
   setText(
-    findElement(
-      'priceAction',
-      'priceActionValue'
-    ),
-    pattern.pattern
+    'putScore',
+    Number.isFinite(
+      Number(market.putScore)
+    )
+      ? Math.round(
+          Number(market.putScore)
+        )
+      : '—'
   );
 
-  const psychology =
-    market.marketPsychology ||
-    {};
+  setText(
+    'gap',
+    Number.isFinite(
+      Number(market.gap)
+    )
+      ? Math.round(
+          Number(market.gap)
+        )
+      : '—'
+  );
 
   setText(
-    findElement(
-      'marketPsychology',
-      'psychologyValue'
-    ),
-    psychology.label
+    'volatility',
+    market.volatility ||
+      '—'
   );
 
   const sr =
@@ -693,24 +657,25 @@ function renderScores(
     {};
 
   setText(
-    findElement(
-      'support',
-      'supportValue'
-    ),
+    'support',
     formatNumber(
       sr.support,
-      6
+      5
     )
   );
 
   setText(
-    findElement(
-      'resistance',
-      'resistanceValue'
-    ),
+    'resistance',
     formatNumber(
       sr.resistance,
-      6
+      5
+    )
+  );
+
+  setText(
+    'lastCandle',
+    formatDate(
+      market.lastCandle
     )
   );
 }
@@ -719,88 +684,77 @@ function renderScores(
    METADATA
 ========================================================= */
 
-function renderMeta(
-  data
-) {
+function renderMeta(data) {
   const metadata =
-    data.metadata ||
-    {};
+    data.metadata || {};
 
   const scanner =
-    data.scanner ||
-    {};
+    data.scanner || {};
 
   setText(
-    findElement(
-      'provider',
-      'providerValue'
-    ),
-    metadata.provider
+    'provider',
+    metadata.provider ||
+      data.source ||
+      '—'
   );
 
   setText(
-    findElement(
-      'providerRequests',
-      'providerRequestsValue'
-    ),
-    metadata.providerRequestsThisMinute
+    'providerRequests',
+    metadata.providerRequests ??
+      '—'
   );
 
   setText(
-    findElement(
-      'dailyCreditsUsed',
-      'dailyCreditsUsedValue'
-    ),
-    metadata.dailyCreditsUsed
+    'dailyCreditsUsed',
+    metadata.dailyCreditsUsed ??
+      '—'
   );
 
   setText(
-    findElement(
-      'dailyCreditsRemaining',
-      'dailyCreditsRemainingValue'
-    ),
-    metadata.dailyCreditsRemaining
+    'dailyCreditsRemaining',
+    metadata.dailyCreditsRemaining ??
+      '—'
   );
 
   setText(
-    findElement(
-      'cachedPairs',
-      'cachedPairsValue'
-    ),
-    scanner.cachedPairs
+    'cachedPairs',
+    metadata.cachedPairs ??
+      '—'
   );
 
   setText(
-    findElement(
-      'candidateCount',
-      'candidateCountValue'
-    ),
-    scanner.candidateCount
+    'candidateCount',
+    Array.isArray(
+      data.rankedCandidates
+    )
+      ? data.rankedCandidates.length
+      : 0
   );
 
   setText(
-    findElement(
-      'scannerStatus',
-      'scannerStatusValue'
-    ),
-    scanner.scanRunning
-      ? 'SCANNING'
-      : 'IDLE'
+    'scannerStatus',
+    scanner.running
+      ? 'RUNNING'
+      : 'READY'
   );
 
   setText(
-    findElement(
-      'lastScanAt',
-      'lastScanAtValue'
-    ),
+    'lastScanAt',
     formatDate(
       scanner.lastScanAt
     )
   );
+
+  setText(
+    'scanInfo',
+    scanner.running
+      ? `SCANNING • ${scanner.totalScanned || 0} PAIRS`
+      : `READY • ${scanner.totalScanned || 0} SCANNED`
+  );
 }
 
 /* =========================================================
-   RANKED CANDIDATES
+   CANDIDATES
 ========================================================= */
 
 function renderCandidates(
@@ -808,9 +762,7 @@ function renderCandidates(
 ) {
   const container =
     findElement(
-      'rankedCandidates',
-      'candidateList',
-      'signalsList'
+      'scanner'
     );
 
   if (!container) {
@@ -819,19 +771,17 @@ function renderCandidates(
 
   container.innerHTML = '';
 
-  if (
-    !Array.isArray(
-      candidates
-    ) ||
-    candidates.length === 0
-  ) {
+  if (!candidates.length) {
     const empty =
       document.createElement(
         'div'
       );
 
+    empty.className =
+      'scanner-empty';
+
     empty.textContent =
-      'No sufficiently fresh signal available';
+      'No fresh executable signal currently available.';
 
     container.appendChild(
       empty
@@ -840,107 +790,164 @@ function renderCandidates(
     return;
   }
 
-  for (
-    const candidate
-    of candidates
-  ) {
-    const row =
-      document.createElement(
-        'div'
+  candidates.forEach(
+    candidate => {
+      const row =
+        document.createElement(
+          'div'
+        );
+
+      row.className =
+        'scanner-row';
+
+      const signal =
+        candidate.signal ||
+        'NO TRADE';
+
+      row.innerHTML = `
+        <span class="rank">
+          #${candidate.rank ?? '—'}
+        </span>
+
+        <span class="pair">
+          ${candidate.pair || '—'}
+        </span>
+
+        <span class="tf">
+          ${candidate.timeframe ?? '—'}m
+        </span>
+
+        <span class="candidate-signal ${signal.toLowerCase()}">
+          ${signal}
+        </span>
+
+        <span class="candidate-confidence">
+          ${formatPercent(candidate.confidence)}
+        </span>
+      `;
+
+      container.appendChild(
+        row
       );
+    }
+  );
+}
 
-    row.className =
-      'candidate-row';
+/* =========================================================
+   SIGNAL STATUS
+========================================================= */
 
-    row.textContent =
-      `#${candidate.rank} ` +
-      `${candidate.pair} ` +
-      `${candidate.timeframe}m ` +
-      `${candidate.signal} ` +
-      `${candidate.confidence}%`;
+function updateSignalStatus(
+  market
+) {
+  const signal =
+    market.signal || 'NO TRADE';
 
-    container.appendChild(
-      row
+  if (signal === 'CALL') {
+    setText(
+      'marketStatus',
+      'LIVE CALL SETUP'
     );
+    return;
   }
+
+  if (signal === 'PUT') {
+    setText(
+      'marketStatus',
+      'LIVE PUT SETUP'
+    );
+    return;
+  }
+
+  setText(
+    'marketStatus',
+    market.freshness === 'FRESH'
+      ? 'LIVE DATA — NO TRADE'
+      : `WAITING — ${market.freshness || 'NO DATA'}`
+  );
 }
 
 /* =========================================================
    COUNTDOWN
 ========================================================= */
 
-function startCountdown(
-  market
-) {
+function stopCountdown() {
   if (countdownTimer) {
     clearInterval(
       countdownTimer
     );
+
+    countdownTimer = null;
   }
+}
+
+function startCountdown(market) {
+  stopCountdown();
 
   const countdown =
     findElement(
-      'countdown',
-      'entryCountdown',
-      'countdownValue'
+      'countdown'
     );
 
   if (!countdown) {
     return;
   }
 
-  function update() {
-    if (
-      !market.entryTime
-    ) {
-      setText(
-        countdown,
-        '--'
-      );
-      return;
-    }
+  if (
+    market.signal !== 'CALL' &&
+    market.signal !== 'PUT'
+  ) {
+    countdown.textContent =
+      '—';
 
+    return;
+  }
+
+  if (!market.entryTime) {
+    countdown.textContent =
+      '—';
+
+    return;
+  }
+
+  function update() {
     const entry =
       new Date(
         market.entryTime
       ).getTime();
 
-    const remaining =
-      Math.max(
-        0,
-        Math.floor(
-          (
-            entry -
-            Date.now()
-          ) / 1000
-        )
-      );
+    if (!Number.isFinite(entry)) {
+      countdown.textContent =
+        '—';
 
-    if (
-      market.signal ===
-      'NO TRADE'
-    ) {
-      setText(
-        countdown,
-        '--'
-      );
       return;
     }
 
-    setText(
-      countdown,
-      `${remaining}s`
-    );
+    const seconds =
+      Math.max(
+        0,
+        Math.ceil(
+          (entry - Date.now()) /
+          1000
+        )
+      );
 
-    /*
-     Automatically refresh when entry
-     moment has passed.
-    */
-    if (
-      remaining <= 0
-    ) {
-      fetchBest();
+    if (seconds <= 0) {
+      countdown.textContent =
+        'ENTERING';
+
+      stopCountdown();
+
+      setTimeout(
+        () => fetchBest(),
+        1000
+      );
+
+      return;
     }
+
+    countdown.textContent =
+      `${seconds}s`;
   }
 
   update();
@@ -957,12 +964,7 @@ function startCountdown(
 ========================================================= */
 
 async function analyzeMarket() {
-  /*
-   IMPORTANT:
-   No local signal calculation.
-   Just request the single backend response.
-  */
-  await fetchBest();
+  return fetchBest();
 }
 
 /* =========================================================
@@ -971,25 +973,32 @@ async function analyzeMarket() {
 
 async function checkHealth() {
   try {
-    const response =
-      await fetch(
-        `${API_BASE}/api/health?_=${Date.now()}`,
-        {
-          cache: 'no-store'
-        }
+    const data =
+      await fetchJson(
+        HEALTH_ENDPOINT
       );
 
-    const data =
-      await response.json();
+    if (data?.ok) {
+      setBackendStatus(
+        'LIVE CONNECTED',
+        true
+      );
 
-    window.__POAI_HEALTH =
-      data;
+      return data;
+    }
 
-    return data;
+    throw new Error(
+      'Health response invalid'
+    );
   } catch (error) {
     console.error(
-      'Health check failed:',
+      'Health error:',
       error
+    );
+
+    setBackendStatus(
+      'BACKEND ERROR',
+      false
     );
 
     return null;
@@ -1004,15 +1013,12 @@ window.POAI = {
   analyzeMarket,
   fetchBest,
   checkHealth,
-
-  getLastResponse:
-    () =>
-      window.__POAI_LAST_RESPONSE ||
-      null
+  getLastResponse: () =>
+    lastResponse
 };
 
 /* =========================================================
-   START
+   INITIALIZATION
 ========================================================= */
 
 document.addEventListener(
@@ -1034,18 +1040,18 @@ document.addEventListener(
     }
 
     /*
-     Initial request
+     Initial request.
+     Backend now waits for a useful batch on cold start,
+     instead of immediately returning an empty "--" market.
     */
     fetchBest();
 
-    /*
-     Refresh every 15 seconds.
-    */
-    setInterval(
-      () => {
-        fetchBest();
-      },
-      REFRESH_MS
-    );
+    refreshTimer =
+      setInterval(
+        () => {
+          fetchBest();
+        },
+        REFRESH_MS
+      );
   }
 );
