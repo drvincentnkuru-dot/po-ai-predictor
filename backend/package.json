@@ -1,7 +1,8 @@
+
 {
   "name": "po-ai-predictor-backend",
-  "version": "9.2.1",
-  "description": "PO AI Predictor backend - LIVE Twelve Data smart price-action scanner",
+  "version": "9.3.0",
+  "description": "PO AI Predictor V9.3.0 - Live Twelve Data forex scanner with evidence-gated signals",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
