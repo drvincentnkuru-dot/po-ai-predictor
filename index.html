@@ -1,759 +1,374 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
-  />
-
-  <title>PO AI Predictor V9.1</title>
-
-  <link
-    rel="preconnect"
-    href="https://fonts.googleapis.com"
-  >
-
-  <link
-    rel="preconnect"
-    href="https://fonts.gstatic.com"
-    crossorigin
-  >
-
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
-    rel="stylesheet"
-  >
-
-  <link
-    rel="stylesheet"
-    href="style.css"
-  />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#101827">
+  <meta name="description" content="PO AI Predictor V9.3.0 — live forex market analysis and evidence-gated research signals.">
+  <title>PO AI Predictor V9.3.0</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
 </head>
-
 <body>
-
-<div class="app-shell">
-
-  <!-- =====================================================
-       HEADER
-  ====================================================== -->
-
-  <header class="topbar">
-
-    <div class="brand">
-
-      <div class="brand-mark">
-        ⚡
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">PO</div>
+        <div>
+          <h1>PO AI PREDICTOR</h1>
+          <p class="version">V9.3.0 · LIVE MARKET RESEARCH</p>
+        </div>
       </div>
 
-      <div>
+      <div class="header-status">
+        <span id="backendStatus" class="status-badge status-unknown">Checking API…</span>
+        <span id="marketStatus" class="status-badge status-unknown">Market status: checking</span>
+      </div>
+    </header>
 
-        <h1>
-          PO AI PREDICTOR
-        </h1>
-
+    <main>
+      <section class="notice-panel" aria-label="Research disclaimer">
+        <strong>Research and analysis tool</strong>
         <p>
-          V9.1 • SMART LIVE SCANNER
+          Evidence score, not win probability. No guaranteed outcomes.
+          Signals can be wrong. Use NO TRADE when data is stale, incomplete,
+          insufficient, or conflicting.
         </p>
+      </section>
 
-      </div>
+      <section class="control-panel panel">
+        <div class="section-heading">
+          <div>
+            <h2>Market scanner</h2>
+            <p>Select a forex pair and analysis timeframe.</p>
+          </div>
+          <button id="analyzeBtn" type="button">Analyze market</button>
+        </div>
 
-    </div>
+        <div class="control-grid">
+          <div class="field">
+            <label for="selectedPair">Currency pair</label>
+            <select id="selectedPair">
+              <option value="EUR/USD">EUR/USD</option>
+              <option value="GBP/USD">GBP/USD</option>
+              <option value="USD/JPY">USD/JPY</option>
+              <option value="USD/CHF">USD/CHF</option>
+              <option value="AUD/USD">AUD/USD</option>
+              <option value="USD/CAD">USD/CAD</option>
+              <option value="NZD/USD">NZD/USD</option>
+              <option value="EUR/GBP">EUR/GBP</option>
+              <option value="EUR/JPY">EUR/JPY</option>
+              <option value="GBP/JPY">GBP/JPY</option>
+              <option value="AUD/JPY">AUD/JPY</option>
+              <option value="CAD/JPY">CAD/JPY</option>
+              <option value="CHF/JPY">CHF/JPY</option>
+              <option value="EUR/AUD">EUR/AUD</option>
+              <option value="EUR/CAD">EUR/CAD</option>
+              <option value="EUR/CHF">EUR/CHF</option>
+              <option value="GBP/AUD">GBP/AUD</option>
+              <option value="GBP/CAD">GBP/CAD</option>
+              <option value="GBP/CHF">GBP/CHF</option>
+              <option value="NZD/JPY">NZD/JPY</option>
+              <option value="NZD/CAD">NZD/CAD</option>
+              <option value="AUD/CAD">AUD/CAD</option>
+              <option value="AUD/CHF">AUD/CHF</option>
+              <option value="CAD/CHF">CAD/CHF</option>
+            </select>
+          </div>
 
-    <div class="status-pill">
+          <div class="field">
+            <label for="timeframe">Analysis timeframe</label>
+            <select id="timeframe">
+              <option value="1">1 minute</option>
+              <option value="2">2 minutes</option>
+              <option value="3">3 minutes</option>
+            </select>
+          </div>
+        </div>
 
-      <span class="dot"></span>
+        <div id="errorBox" class="error-box" role="alert" hidden></div>
+        <p id="scanInfo" class="muted-text">Waiting for market data…</p>
+      </section>
 
-      <span id="backendStatus">
-        CONNECTING
-      </span>
+      <section class="signal-panel panel" aria-label="Current analysis">
+        <div class="section-heading">
+          <div>
+            <h2>Current evidence review</h2>
+            <p id="provider">Provider: Twelve Data LIVE</p>
+          </div>
+          <span id="signalBadge" class="signal-badge signal-wait">NO TRADE</span>
+        </div>
 
-    </div>
+        <div class="signal-summary">
+          <div class="score-card">
+            <span class="metric-label">Evidence score</span>
+            <div class="score-value">
+              <span id="confidence">0</span><span class="score-out-of">/100</span>
+            </div>
+            <p>Not a probability of winning</p>
+          </div>
 
-  </header>
+          <div class="summary-card">
+            <span class="metric-label">Selected pair</span>
+            <strong id="summaryPair">EUR/USD</strong>
+            <span id="trendBadge" class="trend-badge">Trend: UNKNOWN</span>
+          </div>
 
+          <div class="summary-card">
+            <span class="metric-label">Data freshness</span>
+            <strong id="freshness">Checking…</strong>
+            <span id="dataAge">Age: unavailable</span>
+          </div>
+        </div>
 
-  <main>
+        <div class="decision-details">
+          <div class="detail-item">
+            <span class="metric-label">Entry time</span>
+            <strong id="entryTime">—</strong>
+          </div>
+          <div class="detail-item">
+            <span class="metric-label">Expiry time</span>
+            <strong id="expiryTime">—</strong>
+          </div>
+          <div class="detail-item">
+            <span class="metric-label">Current price</span>
+            <strong id="currentPrice">—</strong>
+          </div>
+          <div class="detail-item">
+            <span class="metric-label">Entry reference</span>
+            <strong id="entryPrice">—</strong>
+          </div>
+        </div>
 
-    <!-- ===================================================
-         HERO
-    ==================================================== -->
+        <div class="score-comparison">
+          <div class="direction-score">
+            <span>CALL evidence</span>
+            <strong id="callScore">0</strong>
+          </div>
+          <div class="direction-score">
+            <span>PUT evidence</span>
+            <strong id="putScore">0</strong>
+          </div>
+          <div class="direction-score">
+            <span>Evidence gap</span>
+            <strong id="gap">0</strong>
+          </div>
+        </div>
 
-    <section class="hero">
-
-      <div>
-
-        <span class="eyebrow">
-          LIVE MARKET ANALYSIS
-        </span>
-
-        <h2>
-          AI selects the strongest live setup
-        </h2>
-
-        <p>
-          Scans supported live forex pairs and selects
-          the strongest available live setup using EMA,
-          RSI, ADX, Stochastic, Bollinger Bands,
-          Support/Resistance and price action.
+        <p id="signalReason" class="signal-reason">
+          Waiting for sufficient, fresh and consistent evidence.
         </p>
+      </section>
 
-      </div>
-
-      <button
-        id="analyzeBtn"
-        class="analyze-btn"
-        type="button"
-      >
-        ANALYZE MARKET
-      </button>
-
-    </section>
-
-
-    <!-- ===================================================
-         ERROR
-    ==================================================== -->
-
-    <section
-      id="errorBox"
-      class="error-box hidden"
-    ></section>
-
-
-    <!-- ===================================================
-         SIGNAL CARD
-    ==================================================== -->
-
-    <section
-      class="signal-card"
-      id="signalCard"
-    >
-
-      <div class="signal-head">
-
-        <div>
-
-          <span class="eyebrow">
-            AI SELECTED MARKET
-          </span>
-
-          <h3 id="selectedPair">
-            Waiting for live data…
-          </h3>
-
-          <span
-            id="marketStatus"
-            class="market-status"
-          >
-            WAITING
-          </span>
-
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>Technical indicators</h2>
+            <p>Calculated from completed candles where available.</p>
+          </div>
         </div>
 
-        <span
-          id="trendBadge"
-          class="trend-badge"
-        >
-          —
-        </span>
+        <div class="metrics-grid">
+          <article class="metric-card">
+            <span class="metric-label">EMA 9</span>
+            <strong id="ema9">—</strong>
+            <small id="emaCross">Crossover: —</small>
+          </article>
 
-      </div>
+          <article class="metric-card">
+            <span class="metric-label">EMA 21</span>
+            <strong id="ema21">—</strong>
+            <small id="trend5m">5m trend: —</small>
+          </article>
 
+          <article class="metric-card">
+            <span class="metric-label">RSI 9</span>
+            <strong id="rsi">—</strong>
+            <small id="rsiCross">RSI cross: —</small>
+          </article>
 
-      <div
-        id="signalBadge"
-        class="signal-badge no-trade"
-      >
-        NO TRADE
-      </div>
+          <article class="metric-card">
+            <span class="metric-label">ADX 14</span>
+            <strong id="adx">—</strong>
+            <small>Wilder smoothing</small>
+          </article>
 
+          <article class="metric-card">
+            <span class="metric-label">MACD line</span>
+            <strong id="macdLine">—</strong>
+            <small id="macdCross">MACD cross: —</small>
+          </article>
 
-      <div class="confidence-row">
+          <article class="metric-card">
+            <span class="metric-label">MACD signal</span>
+            <strong id="macdSignal">—</strong>
+            <small id="macdHistogram">Histogram: —</small>
+          </article>
 
-        <div>
+          <article class="metric-card">
+            <span class="metric-label">Stochastic %K</span>
+            <strong id="stochK">—</strong>
+            <small id="stochasticCross">Stochastic cross: —</small>
+          </article>
 
-          <span class="muted">
-            AI CONFIDENCE
-          </span>
+          <article class="metric-card">
+            <span class="metric-label">Stochastic %D</span>
+            <strong id="stochD">—</strong>
+            <small>Signal line</small>
+          </article>
 
-          <strong id="confidence">
-            —
-          </strong>
+          <article class="metric-card">
+            <span class="metric-label">ATR 14</span>
+            <strong id="atr">—</strong>
+            <small>Volatility measure</small>
+          </article>
 
+          <article class="metric-card">
+            <span class="metric-label">Bollinger upper</span>
+            <strong id="bollingerUpper">—</strong>
+            <small>Upper band</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Bollinger middle</span>
+            <strong id="bollingerMiddle">—</strong>
+            <small>Middle band</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Bollinger lower</span>
+            <strong id="bollingerLower">—</strong>
+            <small>Lower band</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">EMA 21 · 5m</span>
+            <strong id="ema21_5m">—</strong>
+            <small>Higher-timeframe filter</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Support</span>
+            <strong id="support">—</strong>
+            <small>Prior completed candles</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Resistance</span>
+            <strong id="resistance">—</strong>
+            <small>Prior completed candles</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Market volatility</span>
+            <strong id="volatility">—</strong>
+            <small>ATR-based assessment</small>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <h2>Price action and market psychology</h2>
+            <p>Interpretations of observable price behaviour, not certainty about market participants.</p>
+          </div>
         </div>
 
+        <div class="analysis-grid">
+          <article class="analysis-card">
+            <h3>Candle pattern</h3>
+            <strong id="candlePattern">—</strong>
+            <p id="lastCandle">Latest completed candle: —</p>
+          </article>
 
-        <div>
+          <article class="analysis-card">
+            <h3>Price action</h3>
+            <p id="priceAction">Waiting for completed-candle analysis.</p>
+          </article>
 
-          <span class="muted">
-            TIMEFRAME
-          </span>
-
-          <strong id="timeframe">
-            —
-          </strong>
-
+          <article class="analysis-card">
+            <h3>Market psychology</h3>
+            <p id="psychology">Waiting for observable price behaviour.</p>
+          </article>
         </div>
 
+        <div class="reasons-panel">
+          <h3>Evidence and decision reasons</h3>
+          <ul id="reasons">
+            <li>Waiting for analysis.</li>
+          </ul>
+        </div>
+      </section>
 
-        <div>
-
-          <span class="muted">
-            ENTRY IN
-          </span>
-
-          <strong id="countdown">
-            —
-          </strong>
-
+      <section class="panel scanner-panel">
+        <div class="section-heading">
+          <div>
+            <h2>24-pair scanner</h2>
+            <p>Only fresh and sufficiently supported candidates should be considered.</p>
+          </div>
+          <span id="scannerStatus" class="status-badge status-unknown">Waiting</span>
         </div>
 
-      </div>
-
-
-      <!-- =================================================
-           TIME / PRICE
-      ================================================== -->
-
-      <div class="time-grid">
-
-        <div class="time-box">
-
-          <span>
-            ENTRY TIME
-          </span>
-
-          <strong id="entryTime">
-            —
-          </strong>
-
+        <div class="scanner-stats">
+          <div class="mini-stat">
+            <span>Pairs cached</span>
+            <strong id="cachedPairs">0</strong>
+          </div>
+          <div class="mini-stat">
+            <span>Candidates</span>
+            <strong id="candidateCount">0</strong>
+          </div>
+          <div class="mini-stat">
+            <span>Last scan</span>
+            <strong id="lastScanAt">—</strong>
+          </div>
         </div>
 
+        <div id="scanner" class="scanner" aria-live="polite">
+          <p class="muted-text">Scanner results will appear when available.</p>
+        </div>
+      </section>
 
-        <div class="time-box">
-
-          <span>
-            EXPIRY TIME
-          </span>
-
-          <strong id="expiryTime">
-            —
-          </strong>
-
+      <section class="panel provider-panel">
+        <div class="section-heading">
+          <div>
+            <h2>Provider and API usage</h2>
+            <p>Usage information reported by the backend.</p>
+          </div>
         </div>
 
-
-        <div class="time-box">
-
-          <span>
-            ENTRY PRICE
-          </span>
-
-          <strong id="entryPrice">
-            —
-          </strong>
-
+        <div class="provider-grid">
+          <div class="detail-item">
+            <span class="metric-label">Provider</span>
+            <strong id="providerName">Twelve Data</strong>
+          </div>
+          <div class="detail-item">
+            <span class="metric-label">Requests used</span>
+            <strong id="providerRequests">—</strong>
+          </div>
+          <div class="detail-item">
+            <span class="metric-label">Daily credits used</span>
+            <strong id="dailyCreditsUsed">—</strong>
+          </div>
+          <div class="detail-item">
+            <span class="metric-label">Daily credits remaining</span>
+            <strong id="dailyCreditsRemaining">—</strong>
+          </div>
         </div>
 
-      </div>
-
-
-      <!-- =================================================
-           SCORES
-      ================================================== -->
-
-      <div class="score-grid">
-
-        <div>
-
-          <span>
-            CALL SCORE
-          </span>
-
-          <b id="callScore">
-            —
-          </b>
-
-        </div>
-
-
-        <div>
-
-          <span>
-            PUT SCORE
-          </span>
-
-          <b id="putScore">
-            —
-          </b>
-
-        </div>
-
-
-        <div>
-
-          <span>
-            SUPPORT
-          </span>
-
-          <b id="support">
-            —
-          </b>
-
-        </div>
-
-
-        <div>
-
-          <span>
-            RESISTANCE
-          </span>
-
-          <b id="resistance">
-            —
-          </b>
-
-        </div>
-
-
-        <div>
-
-          <span>
-            SCORE GAP
-          </span>
-
-          <b id="gap">
-            —
-          </b>
-
-        </div>
-
-
-        <div>
-
-          <span>
-            VOLATILITY
-          </span>
-
-          <b id="volatility">
-            —
-          </b>
-
-        </div>
-
-      </div>
-
-    </section>
-
-
-    <!-- ===================================================
-         TECHNICAL CONFIRMATION
-    ==================================================== -->
-
-    <section class="panel">
-
-      <div class="panel-title">
-
-        <h3>
-          TECHNICAL CONFIRMATION
-        </h3>
-
-        <span id="dataAge">
-          DATA AGE —
-        </span>
-
-      </div>
-
-
-      <div class="indicator-grid">
-
-        <div class="indicator">
-
-          <span>
-            CURRENT PRICE
-          </span>
-
-          <strong id="currentPrice">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            FRESHNESS
-          </span>
-
-          <strong id="freshness">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            EMA 9
-          </span>
-
-          <strong id="ema9">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            EMA 21
-          </span>
-
-          <strong id="ema21">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            RSI 14
-          </span>
-
-          <strong id="rsi">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            ADX 14
-          </span>
-
-          <strong id="adx">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            STOCHASTIC
-          </span>
-
-          <strong id="stochastic">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            ATR
-          </span>
-
-          <strong id="atr">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            BOLLINGER UPPER
-          </span>
-
-          <strong id="bollingerUpper">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            BOLLINGER MIDDLE
-          </span>
-
-          <strong id="bollingerMiddle">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            BOLLINGER LOWER
-          </span>
-
-          <strong id="bollingerLower">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            MARKET PSYCHOLOGY
-          </span>
-
-          <strong id="psychology">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            PRICE ACTION
-          </span>
-
-          <strong id="priceAction">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            ANALYSIS REASONS
-          </span>
-
-          <strong id="reasons">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            LAST COMPLETED CANDLE
-          </span>
-
-          <strong id="lastCandle">
-            —
-          </strong>
-
-        </div>
-
-      </div>
-
-    </section>
-
-
-    <!-- ===================================================
-         SCANNER
-    ==================================================== -->
-
-    <section class="panel">
-
-      <div class="panel-title">
-
-        <h3>
-          LIVE PAIR SCANNER
-        </h3>
-
-        <span id="scanInfo">
-          —
-        </span>
-
-      </div>
-
-
-      <div
-        id="scanner"
-        class="scanner"
-      ></div>
-
-    </section>
-
-
-    <!-- ===================================================
-         SYSTEM INFORMATION
-    ==================================================== -->
-
-    <section class="panel">
-
-      <div class="panel-title">
-
-        <h3>
-          SYSTEM STATUS
-        </h3>
-
-      </div>
-
-
-      <div class="indicator-grid">
-
-        <div class="indicator wide">
-
-          <span>
-            DATA PROVIDER
-          </span>
-
-          <strong id="provider">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            PROVIDER REQUESTS / MIN
-          </span>
-
-          <strong id="providerRequests">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            DAILY CREDITS USED
-          </span>
-
-          <strong id="dailyCreditsUsed">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            DAILY CREDITS REMAINING
-          </span>
-
-          <strong id="dailyCreditsRemaining">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            CACHED PAIRS
-          </span>
-
-          <strong id="cachedPairs">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            ACTIVE CANDIDATES
-          </span>
-
-          <strong id="candidateCount">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator">
-
-          <span>
-            SCANNER
-          </span>
-
-          <strong id="scannerStatus">
-            —
-          </strong>
-
-        </div>
-
-
-        <div class="indicator wide">
-
-          <span>
-            LAST SCAN
-          </span>
-
-          <strong id="lastScanAt">
-            —
-          </strong>
-
-        </div>
-
-      </div>
-
-    </section>
-
-
-    <!-- ===================================================
-         FOOTER
-    ==================================================== -->
-
-    <section class="footer-note">
-
-      Data source:
-      <b>Twelve Data LIVE</b>
-
-      • PO AI Predictor V9.1 uses EMA 9/21,
-      RSI 14, ADX 14, Stochastic,
-      Bollinger Bands, Support/Resistance
-      and price action.
-
-      • Backend is the single signal engine.
-
-      • AI confidence is a setup score,
-      not a guaranteed win probability.
-
-      • A CALL or PUT is only displayed when
-      the backend has sufficiently fresh data
-      and a valid setup.
-
-    </section>
-
-  </main>
-
-</div>
-
-
-<script
-  src="script.js"
-></script>
-
+        <p class="muted-text">
+          Provider limits may prevent all 24 pairs from refreshing simultaneously.
+          A cached result is not proof that the underlying market data is fresh.
+        </p>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>PO AI Predictor V9.3.0 · Evidence-based market research</p>
+      <p>Evidence score, not win probability. No guaranteed outcomes. NO TRADE when evidence is insufficient.</p>
+    </footer>
+  </div>
 </body>
 </html>
