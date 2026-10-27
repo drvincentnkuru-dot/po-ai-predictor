@@ -1,980 +1,580 @@
-
-"use strict";
+'use strict';
 
 (() => {
-  const API_BASE = window.PO_API_BASE || "https://po-ai-predictor-api.onrender.com";
-  const REFRESH_INTERVAL_MS = 15000;
-  const MAX_REASON_ITEMS = 10;
+  const API_BASE = String(
+    window.PO_API_BASE || 'https://po-ai-predictor-api.onrender.com'
+  ).replace(/\/+$/, '');
 
-  const $ = (id) => document.getElementById(id);
+  const REFRESH_INTERVAL_MS = 60000;
+  const REQUEST_TIMEOUT_MS = 90000;
+  const MAX_REASONS = 10;
+
+  const $ = id => document.getElementById(id);
 
   const state = {
     busy: false,
+    timer: null,
     lastMarket: null,
-    lastHealth: null,
-    timer: null
+    lastHealth: null
   };
 
   const elements = {
-    backendStatus: $("backendStatus"),
-    analyzeBtn: $("analyzeBtn"),
-    errorBox: $("errorBox"),
-    selectedPair: $("selectedPair"),
-    marketStatus: $("marketStatus"),
-    trendBadge: $("trendBadge"),
-    signalBadge: $("signalBadge"),
-    confidence: $("confidence"),
-    timeframe: $("timeframe"),
-    entryTime: $("entryTime"),
-    expiryTime: $("expiryTime"),
-    entryPrice: $("entryPrice"),
-    callScore: $("callScore"),
-    putScore: $("putScore"),
-    support: $("support"),
-    resistance: $("resistance"),
-    gap: $("gap"),
-    volatility: $("volatility"),
-    dataAge: $("dataAge"),
-    currentPrice: $("currentPrice"),
-    freshness: $("freshness"),
-    ema9: $("ema9"),
-    ema21: $("ema21"),
-    rsi: $("rsi"),
-    adx: $("adx"),
-    stochastic: $("stochastic"),
-    atr: $("atr"),
-    bollingerUpper: $("bollingerUpper"),
-    bollingerMiddle: $("bollingerMiddle"),
-    bollingerLower: $("bollingerLower"),
-    psychology: $("psychology"),
-    priceAction: $("priceAction"),
-    reasons: $("reasons"),
-    lastCandle: $("lastCandle"),
-    scanInfo: $("scanInfo"),
-    scanner: $("scanner"),
-    provider: $("provider"),
-    providerRequests: $("providerRequests"),
-    dailyCreditsUsed: $("dailyCreditsUsed"),
-    dailyCreditsRemaining: $("dailyCreditsRemaining"),
-    cachedPairs: $("cachedPairs"),
-    candidateCount: $("candidateCount"),
-    scannerStatus: $("scannerStatus"),
-    lastScanAt: $("lastScanAt")
+    backendStatus: $('backendStatus'),
+    analyzeBtn: $('analyzeBtn'),
+    errorBox: $('errorBox'),
+    selectedPair: $('selectedPair'),
+    timeframe: $('timeframe'),
+    marketStatus: $('marketStatus'),
+    trendBadge: $('trendBadge'),
+    signalBadge: $('signalBadge'),
+    confidence: $('confidence'),
+    entryTime: $('entryTime'),
+    expiryTime: $('expiryTime'),
+    entryPrice: $('entryPrice'),
+    callScore: $('callScore'),
+    putScore: $('putScore'),
+    support: $('support'),
+    resistance: $('resistance'),
+    gap: $('gap'),
+    volatility: $('volatility'),
+    dataAge: $('dataAge'),
+    currentPrice: $('currentPrice'),
+    freshness: $('freshness'),
+    ema9: $('ema9'),
+    ema21: $('ema21'),
+    rsi: $('rsi'),
+    adx: $('adx'),
+    atr: $('atr'),
+    bollingerUpper: $('bollingerUpper'),
+    bollingerMiddle: $('bollingerMiddle'),
+    bollingerLower: $('bollingerLower'),
+    psychology: $('psychology'),
+    priceAction: $('priceAction'),
+    reasons: $('reasons'),
+    lastCandle: $('lastCandle'),
+    scanInfo: $('scanInfo'),
+    scanner: $('scanner'),
+    provider: $('provider'),
+    providerRequests: $('providerRequests'),
+    dailyCreditsUsed: $('dailyCreditsUsed'),
+    dailyCreditsRemaining: $('dailyCreditsRemaining'),
+    cachedPairs: $('cachedPairs'),
+    candidateCount: $('candidateCount'),
+    scannerStatus: $('scannerStatus'),
+    lastScanAt: $('lastScanAt'),
+    summaryPair: $('summaryPair'),
+    signalReason: $('signalReason'),
+    macdLine: $('macdLine'),
+    macdSignal: $('macdSignal'),
+    macdHistogram: $('macdHistogram'),
+    macdCross: $('macdCross'),
+    stochK: $('stochK'),
+    stochD: $('stochD'),
+    stochasticCross: $('stochasticCross'),
+    emaCross: $('emaCross'),
+    rsiCross: $('rsiCross'),
+    trend5m: $('trend5m'),
+    ema21_5m: $('ema21_5m'),
+    candlePattern: $('candlePattern'),
+    providerName: $('providerName')
   };
 
-  function setText(id, value, fallback = "—") {
+  function text(id, value, fallback = '—') {
     const element = $(id);
     if (!element) return;
-    element.textContent =
-      value === null || value === undefined || value === ""
-        ? fallback
-        : String(value);
+    element.textContent = value === null || value === undefined || value === ''
+      ? fallback
+      : String(value);
   }
 
-  function setHidden(element, hidden) {
-    if (element) element.hidden = hidden;
-  }
-
-  function showError(message) {
-    if (!elements.errorBox) return;
-    elements.errorBox.textContent = message;
-    elements.errorBox.hidden = false;
-  }
-
-  function clearError() {
-    if (!elements.errorBox) return;
-    elements.errorBox.textContent = "";
-    elements.errorBox.hidden = true;
-  }
-
-  function setBadge(element, text, className) {
-    if (!element) return;
-    element.textContent = text;
-    element.className = className;
-  }
-
-  function asObject(value) {
-    return value && typeof value === "object" && !Array.isArray(value)
+  function obj(value) {
+    return value && typeof value === 'object' && !Array.isArray(value)
       ? value
       : {};
   }
 
-  function firstDefined(...values) {
-    return values.find((value) => value !== undefined && value !== null);
+  function first(...values) {
+    return values.find(value => value !== undefined && value !== null);
   }
 
-  function numberOrNull(value) {
-    if (value === null || value === undefined || value === "") return null;
-    const number = Number(value);
-    return Number.isFinite(number) ? number : null;
+  function number(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
   }
 
-  function formatNumber(value, digits = 5) {
-    const number = numberOrNull(value);
-    if (number === null) return "—";
-
-    return number.toLocaleString(undefined, {
+  function fmt(value, digits = 5) {
+    const n = number(value);
+    if (n === null) return '—';
+    return n.toLocaleString(undefined, {
       maximumFractionDigits: digits,
       minimumFractionDigits: 0
     });
   }
 
-  function formatPercent(value, digits = 1) {
-    const number = numberOrNull(value);
-    return number === null ? "—" : `${number.toFixed(digits)}%`;
-  }
-
-  function formatDate(value) {
-    if (!value) return "—";
-
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return String(value);
-
-    return date.toLocaleString([], {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit"
+  function date(value) {
+    if (!value) return '—';
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString([], {
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
     });
   }
 
-  function formatAge(seconds) {
-    const age = numberOrNull(seconds);
-    if (age === null || age < 0) return "Age: unavailable";
-
-    if (age < 60) return `Age: ${Math.round(age)} sec`;
-    if (age < 3600) return `Age: ${Math.floor(age / 60)} min ${Math.round(age % 60)} sec`;
-
-    return `Age: ${Math.floor(age / 3600)} hr ${Math.floor((age % 3600) / 60)} min`;
+  function ageText(value) {
+    const seconds = number(value);
+    if (seconds === null || seconds < 0) return 'Age: unavailable';
+    if (seconds < 60) return `Age: ${Math.round(seconds)} sec`;
+    if (seconds < 3600) {
+      return `Age: ${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} sec`;
+    }
+    return `Age: ${Math.floor(seconds / 3600)} hr ${Math.floor((seconds % 3600) / 60)} min`;
   }
 
-  function normalizeDirection(value) {
-    const direction = String(value || "").trim().toUpperCase();
+  function setBadge(element, label, className) {
+    if (!element) return;
+    element.textContent = label;
+    element.className = className;
+  }
 
-    if (["CALL", "BUY", "UP", "BULLISH"].includes(direction)) return "CALL";
-    if (["PUT", "SELL", "DOWN", "BEARISH"].includes(direction)) return "PUT";
-    return "NO TRADE";
+  function showError(message) {
+    if (!elements.errorBox) return;
+    elements.errorBox.textContent = String(message);
+    elements.errorBox.hidden = false;
+  }
+
+  function clearError() {
+    if (!elements.errorBox) return;
+    elements.errorBox.textContent = '';
+    elements.errorBox.hidden = true;
   }
 
   function normalizeSignal(market) {
-    const data = asObject(market);
-    const signal = asObject(data.signal);
-
-    const raw = firstDefined(
-      signal.action,
-      signal.direction,
-      data.action,
-      data.direction,
-      data.signalAction
-    );
-
-    const direction = normalizeDirection(raw);
+    const data = obj(market);
+    const raw = typeof data.signal === 'string'
+      ? data.signal
+      : first(
+          obj(data.signal).action,
+          obj(data.signal).direction,
+          data.action,
+          data.direction,
+          data.signalAction
+        );
 
     if (
       data.noTrade === true ||
-      signal.noTrade === true ||
       data.tradeAllowed === false ||
-      signal.tradeAllowed === false
-    ) {
-      return "NO TRADE";
-    }
+      obj(data.signal).noTrade === true ||
+      obj(data.signal).tradeAllowed === false
+    ) return 'NO TRADE';
 
-    return direction;
+    const signal = String(raw || '').trim().toUpperCase();
+    if (['CALL', 'BUY', 'UP', 'BULLISH'].includes(signal)) return 'CALL';
+    if (['PUT', 'SELL', 'DOWN', 'BEARISH'].includes(signal)) return 'PUT';
+    return 'NO TRADE';
   }
 
-  function getMarketObject(payload) {
-    const root = asObject(payload);
-
-    return asObject(
-      firstDefined(
-        root.market,
-        root.best,
-        root.result,
-        root.data,
-        root
-      )
-    );
+  function marketFrom(payload) {
+    const root = obj(payload);
+    return obj(first(root.selectedMarket, root.market, root.best, root.result, root.data, root));
   }
 
   function getIndicators(market) {
-    return asObject(market.indicators);
+    return obj(market.indicators);
   }
 
-  function getSignalObject(market) {
-    return asObject(market.signal);
+  function getSignalReason(market) {
+    const signal = obj(market.signal);
+    return first(
+      signal.reason,
+      market.reason,
+      Array.isArray(market.reasons) ? market.reasons[0] : null,
+      'No validated trade signal is available.'
+    );
   }
 
   function getScore(market, direction) {
-    const signal = getSignalObject(market);
-    const scores = asObject(market.scores);
-    const nestedScores = asObject(signal.scores);
-
-    const possible = direction === "CALL"
-      ? [
-          market.callScore,
-          scores.call,
-          scores.CALL,
-          nestedScores.call,
-          signal.callScore
-        ]
-      : [
-          market.putScore,
-          scores.put,
-          scores.PUT,
-          nestedScores.put,
-          signal.putScore
-        ];
-
-    const value = numberOrNull(firstDefined(...possible));
+    const value = number(direction === 'CALL' ? market.callScore : market.putScore);
     return value === null ? 0 : Math.max(0, Math.min(100, value));
   }
 
-  function getEvidenceScore(market) {
-    const signal = getSignalObject(market);
-
-    const score = numberOrNull(
-      firstDefined(
-        signal.score,
-        signal.evidenceScore,
-        market.evidenceScore,
-        market.confidence,
-        market.score
-      )
-    );
-
-    return score === null ? null : Math.max(0, Math.min(100, score));
+  function freshnessOf(market) {
+    return String(first(market.freshness, 'UNKNOWN')).toUpperCase();
   }
 
-  function getFreshness(market) {
-    const quality = asObject(market.dataQuality);
-    const data = asObject(market.data);
-    const meta = asObject(market.meta);
-
-    return String(
-      firstDefined(
-        market.freshness,
-        market.dataFreshness,
-        quality.freshness,
-        quality.status,
-        data.freshness,
-        meta.freshness,
-        "UNKNOWN"
-      )
-    ).toUpperCase();
-  }
-
-  function isStale(market) {
-    const freshness = getFreshness(market);
-    const quality = asObject(market.dataQuality);
-    const data = asObject(market.data);
-
-    if (
-      quality.stale === true ||
-      quality.isFresh === false ||
-      data.stale === true ||
-      market.stale === true
-    ) {
-      return true;
-    }
-
-    return ["STALE", "OLD", "EXPIRED", "INVALID"].includes(freshness);
-  }
-
-  function isExplicitlyInsufficient(market) {
-    const quality = asObject(market.dataQuality);
-    const signal = getSignalObject(market);
-    const reason = String(
-      firstDefined(signal.reason, market.reason, market.statusReason, "")
-    ).toLowerCase();
-
+  function isUnsafe(market) {
+    const freshness = freshnessOf(market);
+    const age = number(market.dataAgeSeconds);
     return (
-      quality.sufficient === false ||
-      quality.valid === false ||
+      !['FRESH'].includes(freshness) ||
+      (age !== null && age > 300) ||
       market.insufficientData === true ||
-      /insufficient|incomplete|not enough data|stale|conflict/.test(reason)
+      market.noTrade === true
     );
   }
 
-  function getReasonList(market) {
-    const signal = getSignalObject(market);
-
-    const raw = firstDefined(
-      signal.reasons,
-      market.reasons,
-      market.explanation,
-      market.evidence
-    );
-
-    if (Array.isArray(raw)) {
-      return raw
-        .map((item) => {
-          if (typeof item === "string") return item;
-          const obj = asObject(item);
-          return firstDefined(obj.message, obj.reason, obj.label, obj.name);
-        })
-        .filter(Boolean)
-        .slice(0, MAX_REASON_ITEMS);
+  function renderSignal(signal) {
+    if (signal === 'CALL') {
+      setBadge(elements.signalBadge, 'CALL', 'signal-badge signal-call');
+    } else if (signal === 'PUT') {
+      setBadge(elements.signalBadge, 'PUT', 'signal-badge signal-put');
+    } else {
+      setBadge(elements.signalBadge, 'NO TRADE', 'signal-badge signal-wait');
     }
-
-    if (typeof raw === "string" && raw.trim()) {
-      return [raw.trim()];
-    }
-
-    const reason = firstDefined(signal.reason, market.reason);
-    return reason ? [String(reason)] : ["No detailed evidence reasons were supplied by the API."];
   }
 
-  function getValue(market, indicatorNames, topLevelNames = []) {
-    const indicators = getIndicators(market);
-
-    for (const name of indicatorNames) {
-      const value = indicators[name];
-      if (value !== undefined && value !== null) {
-        return value;
-      }
+  function renderTrend(value) {
+    const trend = String(value || 'UNKNOWN').toUpperCase();
+    if (trend.includes('BULL') || trend === 'CALL' || trend === 'UP') {
+      setBadge(elements.trendBadge, 'Trend: BULLISH', 'trend-badge trend-up');
+    } else if (trend.includes('BEAR') || trend === 'PUT' || trend === 'DOWN') {
+      setBadge(elements.trendBadge, 'Trend: BEARISH', 'trend-badge trend-down');
+    } else {
+      setBadge(elements.trendBadge, `Trend: ${trend}`, 'trend-badge');
     }
-
-    for (const name of topLevelNames) {
-      const value = market[name];
-      if (value !== undefined && value !== null) {
-        return value;
-      }
-    }
-
-    return null;
   }
 
   function renderReasons(reasons) {
     if (!elements.reasons) return;
-
     elements.reasons.replaceChildren();
 
-    for (const reason of reasons.slice(0, MAX_REASON_ITEMS)) {
-      const item = document.createElement("li");
-      item.textContent = String(reason);
-      elements.reasons.appendChild(item);
+    const list = Array.isArray(reasons) ? reasons : [reasons];
+    const items = list.filter(Boolean).slice(0, MAX_REASONS);
+    if (!items.length) items.push('No detailed reasons were supplied by the API.');
+
+    for (const reason of items) {
+      const li = document.createElement('li');
+      li.textContent = String(reason);
+      elements.reasons.appendChild(li);
     }
-  }
-
-  function renderSignalBadge(signal) {
-    if (signal === "CALL") {
-      setBadge(elements.signalBadge, "CALL", "signal-badge signal-call");
-    } else if (signal === "PUT") {
-      setBadge(elements.signalBadge, "PUT", "signal-badge signal-put");
-    } else {
-      setBadge(elements.signalBadge, "NO TRADE", "signal-badge signal-wait");
-    }
-  }
-
-  function renderTrend(trend) {
-    const normalized = String(trend || "UNKNOWN").toUpperCase();
-
-    if (normalized.includes("BULL") || normalized === "CALL" || normalized === "UP") {
-      setBadge(elements.trendBadge, "Trend: BULLISH", "trend-badge trend-up");
-      return;
-    }
-
-    if (normalized.includes("BEAR") || normalized === "PUT" || normalized === "DOWN") {
-      setBadge(elements.trendBadge, "Trend: BEARISH", "trend-badge trend-down");
-      return;
-    }
-
-    setBadge(elements.trendBadge, `Trend: ${normalized}`, "trend-badge");
   }
 
   function renderHealth(payload) {
-    const root = asObject(payload);
-    const health = asObject(firstDefined(root.health, root.data, root));
-
+    const root = obj(payload);
+    const health = obj(first(root.health, root.data, root));
     state.lastHealth = health;
 
-    const ok =
-      health.ok === true ||
-      health.status === "ok" ||
-      health.status === "healthy" ||
-      health.online === true;
-
+    const online = health.ok === true && health.configured !== false;
     setBadge(
       elements.backendStatus,
-      ok ? "API online" : "API status unknown",
-      ok ? "status-badge status-online" : "status-badge status-unknown"
+      online ? 'API online' : health.configured === false ? 'API key missing' : 'API status unknown',
+      online ? 'status-badge status-online' : 'status-badge status-unknown'
     );
 
-    const provider = asObject(health.provider);
-    const usage = asObject(firstDefined(health.usage, health.credits, health.quota));
-    const counters = asObject(health.counters);
+    const meta = obj(first(health.metadata, health.meta, {}));
+    text('providerName', first(meta.provider, health.provider, 'Twelve Data LIVE'));
+    text('providerRequests', first(meta.providerRequests, health.providerRequests));
+    text('dailyCreditsUsed', first(meta.dailyCreditsUsed, health.dailyCreditsUsed));
+    text('dailyCreditsRemaining', first(meta.dailyCreditsRemaining, health.dailyCreditsRemaining));
+    text('cachedPairs', first(meta.cachedPairs, health.cachedPairs, 0));
+    text('lastScanAt', date(first(health.lastScanAt, meta.lastScanAt)));
 
-    setText(
-      "providerName",
-      firstDefined(provider.name, health.providerName, health.provider, "Twelve Data")
-    );
-
-    setText(
-      "providerRequests",
-      firstDefined(
-        health.requestsThisMinute,
-        health.requestsPerMinute,
-        counters.requests,
-        usage.requests,
-        usage.used
-      )
-    );
-
-    setText(
-      "dailyCreditsUsed",
-      firstDefined(
-        health.dailyCreditsUsed,
-        usage.dailyCreditsUsed,
-        usage.usedToday,
-        usage.used
-      )
-    );
-
-    setText(
-      "dailyCreditsRemaining",
-      firstDefined(
-        health.dailyCreditsRemaining,
-        usage.dailyCreditsRemaining,
-        usage.remaining,
-        usage.creditsRemaining
-      )
-    );
-
-    const apiVersion = firstDefined(health.version, root.version);
-    if (apiVersion) {
-      setText("provider", `Provider: Twelve Data LIVE · API ${apiVersion}`);
+    if (elements.provider) {
+      elements.provider.textContent = `Provider: ${first(meta.provider, health.provider, 'Twelve Data LIVE')} · API ${first(health.version, meta.version, '—')}`;
     }
   }
 
   function renderMarket(payload) {
-    const market = getMarketObject(payload);
+    const root = obj(payload);
+    const market = marketFrom(root);
     state.lastMarket = market;
 
-    const signalObject = getSignalObject(market);
     const indicators = getIndicators(market);
-    const technical = asObject(market.technical);
-    const prices = asObject(market.prices);
-    const trendObject = asObject(firstDefined(market.trend, indicators.trend));
+    const pair = String(first(market.pair, elements.selectedPair?.value, 'EUR/USD'));
+    const timeframe = String(first(market.timeframe, elements.timeframe?.value, '1'));
 
-    const pair = String(
-      firstDefined(market.pair, market.symbol, market.currencyPair, elements.selectedPair?.value, "EUR/USD")
-    );
+    text('summaryPair', pair);
 
-    const timeframe = String(
-      firstDefined(market.timeframe, market.interval, elements.timeframe?.value, "1")
-    );
-
-    setText("summaryPair", pair);
-    setText("selectedPair", pair);
-    setText("scanInfo", `Latest API result: ${pair} · ${timeframe}m`);
-
-    const currentPrice = firstDefined(
-      market.currentPrice,
-      market.price,
-      prices.current,
-      prices.close,
-      market.close
-    );
-
-    const entryPrice = firstDefined(
-      signalObject.entryPrice,
-      market.entryPrice,
-      market.entry,
-      prices.entry
-    );
-
-    setText("currentPrice", formatNumber(currentPrice));
-    setText("entryPrice", formatNumber(entryPrice));
-
-    const freshness = getFreshness(market);
-    const stale = isStale(market);
-    const insufficient = isExplicitlyInsufficient(market);
-
-    setText("freshness", stale ? "STALE" : freshness);
-    setText(
-      "dataAge",
-      formatAge(
-        firstDefined(
-          market.dataAgeSeconds,
-          market.ageSeconds,
-          asObject(market.dataQuality).ageSeconds,
-          asObject(market.meta).dataAgeSeconds
-        )
-      )
-    );
-
-    const marketOpen = firstDefined(
-      market.marketOpen,
-      market.isMarketOpen,
-      asObject(market.market).open
-    );
-
-    if (marketOpen === false) {
-      setBadge(elements.marketStatus, "Market closed", "status-badge status-unknown");
-    } else if (marketOpen === true) {
-      setBadge(elements.marketStatus, "Market open", "status-badge status-online");
-    } else {
-      setBadge(elements.marketStatus, "Market status: unknown", "status-badge status-unknown");
+    // Never replace the select's text content; preserve its option list.
+    if (elements.selectedPair &&
+        [...elements.selectedPair.options].some(option => option.value === pair)) {
+      elements.selectedPair.value = pair;
     }
 
-    const trend = firstDefined(
-      market.trend5m,
-      indicators.trend5m,
-      trendObject.direction,
-      market.trendDirection,
-      market.trend,
-      "UNKNOWN"
+    text('scanInfo', `${pair} · ${timeframe}m · analysis response received`);
+
+    const freshness = freshnessOf(market);
+    const dataAge = number(market.dataAgeSeconds);
+    const unsafe = isUnsafe(market);
+
+    text('freshness', unsafe ? freshness === 'FRESH' ? 'CHECK DATA' : freshness : freshness);
+    text('dataAge', ageText(dataAge));
+    text('currentPrice', fmt(market.currentPrice));
+    text('entryPrice', fmt(market.entryPrice));
+
+    setBadge(
+      elements.marketStatus,
+      'Market status: provider candles',
+      'status-badge status-unknown'
     );
 
-    renderTrend(trend);
+    renderTrend(first(indicators.trend5m, 'UNKNOWN'));
 
     let signal = normalizeSignal(market);
+    if (unsafe) signal = 'NO TRADE';
+    renderSignal(signal);
 
-    // The frontend may veto a signal if the backend explicitly reports
-    // stale or insufficient data. It never creates a new trading signal.
-    if (stale || insufficient) {
-      signal = "NO TRADE";
-    }
+    text('confidence', signal === 'NO TRADE' ? '—' : Math.round(number(market.confidence) || 0));
+    text('callScore', fmt(market.callScore, 0));
+    text('putScore', fmt(market.putScore, 0));
+    text('gap', fmt(market.gap, 0));
+    text('entryTime', date(market.entryTime));
+    text('expiryTime', date(market.expiryTime));
 
-    renderSignalBadge(signal);
+    text('ema9', fmt(indicators.ema9));
+    text('ema21', fmt(indicators.ema21));
+    text('rsi', fmt(indicators.rsi9, 2));
+    text('adx', fmt(indicators.adx14, 2));
+    text('atr', fmt(indicators.atr14));
+    text('ema21_5m', fmt(indicators.ema21_5m));
+    text('emaCross', `Crossover: ${first(indicators.emaCross, '—')}`);
+    text('rsiCross', `RSI cross: ${first(indicators.rsiCross, '—')}`);
+    text('trend5m', `5m trend: ${first(indicators.trend5m, '—')}`);
 
-    const evidenceScore = getEvidenceScore(market);
-    setText("confidence", evidenceScore === null ? "—" : Math.round(evidenceScore));
+    const macd = obj(indicators.macd);
+    text('macdLine', fmt(macd.line, 6));
+    text('macdSignal', fmt(macd.signal, 6));
+    text('macdHistogram', `Histogram: ${fmt(macd.histogram, 6)}`);
+    text('macdCross', `MACD cross: ${first(macd.crossover, '—')}`);
 
-    const callScore = getScore(market, "CALL");
-    const putScore = getScore(market, "PUT");
+    const stochastic = obj(indicators.stochastic);
+    text('stochK', fmt(stochastic.k, 2));
+    text('stochD', fmt(stochastic.d, 2));
+    text('stochasticCross', `Stochastic cross: ${first(stochastic.crossover, '—')}`);
 
-    setText("callScore", callScore);
-    setText("putScore", putScore);
-    setText("gap", Math.abs(callScore - putScore));
+    const bands = obj(indicators.bollinger);
+    text('bollingerUpper', fmt(bands.upper));
+    text('bollingerMiddle', fmt(bands.middle));
+    text('bollingerLower', fmt(bands.lower));
 
-    const timing = asObject(market.timing);
-    setText(
-      "entryTime",
-      formatDate(firstDefined(signalObject.entryTime, market.entryTime, timing.entryTime))
-    );
-    setText(
-      "expiryTime",
-      formatDate(firstDefined(signalObject.expiryTime, market.expiryTime, timing.expiryTime))
-    );
+    const levels = obj(market.supportResistance);
+    text('support', fmt(levels.support));
+    text('resistance', fmt(levels.resistance));
+    text('volatility', first(market.volatility, 'UNKNOWN'));
 
-    const ema9 = firstDefined(indicators.ema9, technical.ema9);
-    const ema21 = firstDefined(indicators.ema21, technical.ema21);
-    const rsi9 = firstDefined(indicators.rsi9, indicators.rsi, technical.rsi9, technical.rsi);
-    const adx14 = firstDefined(indicators.adx14, indicators.adx, technical.adx14, technical.adx);
-    const atr14 = firstDefined(indicators.atr14, indicators.atr, technical.atr14, technical.atr);
-    const ema21_5m = firstDefined(indicators.ema21_5m, technical.ema21_5m);
+    const pattern = market.candlePattern;
+    text('candlePattern', typeof pattern === 'string' ? pattern : first(obj(pattern).name, '—'));
+    text('lastCandle', market.lastCandle ? `Latest completed candle: ${date(market.lastCandle)}` : 'Latest completed candle: unavailable');
+    text('priceAction', first(market.priceAction, 'Price-action interpretation unavailable.'));
+    text('psychology', first(market.marketPsychology, 'Market psychology unavailable.'));
 
-    setText("ema9", formatNumber(ema9));
-    setText("ema21", formatNumber(ema21));
-    setText("rsi", formatNumber(rsi9, 2));
-    setText("adx", formatNumber(adx14, 2));
-    setText("atr", formatNumber(atr14));
-    setText("ema21_5m", formatNumber(ema21_5m));
-
-    const emaCross = firstDefined(
-      indicators.emaCross,
-      indicators.emaCrossover,
-      technical.emaCross,
-      "—"
-    );
-    const rsiCross = firstDefined(
-      indicators.rsiCross,
-      indicators.rsiCrossover,
-      technical.rsiCross,
-      "—"
-    );
-
-    setText("emaCross", `Crossover: ${emaCross}`);
-    setText("rsiCross", `RSI cross: ${rsiCross}`);
-    setText("trend5m", `5m trend: ${trend}`);
-
-    const macd = asObject(indicators.macd);
-    const macdLine = firstDefined(macd.line, indicators.macdLine, technical.macdLine);
-    const macdSignal = firstDefined(macd.signal, indicators.macdSignal, technical.macdSignal);
-    const macdHistogram = firstDefined(
-      macd.histogram,
-      indicators.macdHistogram,
-      technical.macdHistogram
-    );
-
-    setText("macdLine", formatNumber(macdLine, 6));
-    setText("macdSignal", formatNumber(macdSignal, 6));
-    setText("macdHistogram", `Histogram: ${formatNumber(macdHistogram, 6)}`);
-    setText(
-      "macdCross",
-      `MACD cross: ${firstDefined(macd.crossover, macd.cross, indicators.macdCross, "—")}`
-    );
-
-    const stochastic = asObject(indicators.stochastic);
-    const stochK = firstDefined(
-      stochastic.k,
-      stochastic.percentK,
-      indicators.stochasticK,
-      indicators.stochK
-    );
-    const stochD = firstDefined(
-      stochastic.d,
-      stochastic.percentD,
-      indicators.stochasticD,
-      indicators.stochD
-    );
-
-    setText("stochK", formatNumber(stochK, 2));
-    setText("stochD", formatNumber(stochD, 2));
-    setText(
-      "stochasticCross",
-      `Stochastic cross: ${firstDefined(stochastic.crossover, stochastic.cross, indicators.stochasticCross, "—")}`
-    );
-
-    const bollinger = asObject(firstDefined(indicators.bollinger, technical.bollinger));
-
-    setText(
-      "bollingerUpper",
-      formatNumber(firstDefined(bollinger.upper, indicators.bollingerUpper))
-    );
-    setText(
-      "bollingerMiddle",
-      formatNumber(firstDefined(bollinger.middle, indicators.bollingerMiddle))
-    );
-    setText(
-      "bollingerLower",
-      formatNumber(firstDefined(bollinger.lower, indicators.bollingerLower))
-    );
-
-    const levels = asObject(firstDefined(market.levels, indicators.levels));
-    setText("support", formatNumber(firstDefined(market.support, levels.support)));
-    setText("resistance", formatNumber(firstDefined(market.resistance, levels.resistance)));
-
-    setText(
-      "volatility",
-      firstDefined(
-        market.volatilityLabel,
-        indicators.volatilityLabel,
-        formatNumber(atr14),
-        "—"
-      )
-    );
-
-    const patterns = asObject(firstDefined(market.patterns, indicators.patterns));
-    const candlePattern = firstDefined(
-      market.candlePattern,
-      patterns.detected,
-      patterns.pattern,
-      indicators.candlePattern,
-      "No confirmed pattern"
-    );
-
-    setText("candlePattern", candlePattern);
-
-    const lastCandle = asObject(firstDefined(market.lastCandle, market.candle));
-    const candleText = firstDefined(
-      market.lastCandleText,
-      lastCandle.summary,
-      lastCandle.description,
-      lastCandle.time ? `Time: ${formatDate(lastCandle.time)}` : null,
-      "Latest completed candle details unavailable."
-    );
-
-    setText("lastCandle", candleText);
-
-    setText(
-      "priceAction",
-      firstDefined(
-        market.priceAction,
-        technical.priceAction,
-        indicators.priceAction,
-        "Price-action interpretation unavailable."
-      )
-    );
-
-    setText(
-      "psychology",
-      firstDefined(
-        market.psychology,
-        technical.psychology,
-        indicators.psychology,
-        "Market psychology is not available from this response."
-      )
-    );
-
-    const reasons = getReasonList(market);
-
-    if (stale) {
-      reasons.unshift("NO TRADE: backend reports stale market data.");
-    }
-
-    if (insufficient) {
-      reasons.unshift("NO TRADE: backend reports insufficient or incomplete evidence.");
-    }
-
-    if (signal === "NO TRADE" && reasons.length === 0) {
-      reasons.push("NO TRADE: the API did not provide a validated CALL or PUT signal.");
-    }
-
+    const reasons = Array.isArray(market.reasons) ? market.reasons.slice() : [];
+    if (unsafe) reasons.unshift('NO TRADE: market data is stale, unavailable, or not confirmed fresh.');
+    if (signal === 'NO TRADE' && !reasons.length) reasons.push('NO TRADE: evidence is insufficient or conflicting.');
     renderReasons(reasons);
 
-    if (signal === "NO TRADE") {
-      setText(
-        "signalReason",
-        stale
-          ? "NO TRADE — market data is stale."
-          : insufficient
-            ? "NO TRADE — evidence is insufficient or incomplete."
-            : firstDefined(signalObject.reason, market.reason, "No validated trade signal is available.")
-      );
-    } else {
-      setText(
-        "signalReason",
-        firstDefined(signalObject.reason, market.reason, "Signal returned by the backend.")
-      );
-    }
-
-    const meta = asObject(market.meta);
-    setText(
-      "provider",
-      `Provider: ${firstDefined(meta.provider, market.provider, "Twelve Data LIVE")}`
+    text(
+      'signalReason',
+      signal === 'NO TRADE'
+        ? unsafe
+          ? 'NO TRADE — data freshness or sufficiency has not been confirmed.'
+          : getSignalReason(market)
+        : getSignalReason(market)
     );
 
-    setText(
-      "lastScanAt",
-      formatDate(firstDefined(market.lastScanAt, market.scannedAt, meta.scannedAt, market.updatedAt))
+    const meta = obj(root.metadata);
+    text('providerRequests', first(meta.providerRequests, '—'));
+    text('dailyCreditsUsed', first(meta.dailyCreditsUsed, '—'));
+    text('dailyCreditsRemaining', first(meta.dailyCreditsRemaining, '—'));
+    text('cachedPairs', first(meta.cachedPairs, '—'));
+
+    const scanner = obj(root.scanner);
+    text('lastScanAt', date(first(scanner.lastScanAt, root.lastScanAt)));
+    text('candidateCount', Array.isArray(root.rankedCandidates) ? root.rankedCandidates.length : 0);
+    setBadge(
+      elements.scannerStatus,
+      scanner.running ? 'Scanning' : 'Scan status reported',
+      scanner.running ? 'status-badge status-unknown' : 'status-badge status-online'
     );
 
-    setText(
-      "cachedPairs",
-      firstDefined(market.cachedPairs, meta.cachedPairs, asObject(market.scanner).cachedPairs, "—")
-    );
-
-    setText(
-      "candidateCount",
-      firstDefined(market.candidateCount, meta.candidateCount, asObject(market.scanner).candidateCount, "—")
-    );
-
-    const scannerStatus = firstDefined(
-      market.scannerStatus,
-      asObject(market.scanner).status,
-      "Analysis updated"
-    );
-
-    setBadge(elements.scannerStatus, String(scannerStatus), "status-badge status-unknown");
-
-    renderScanner(firstDefined(market.scannerResults, market.candidates, market.scanner?.results, []));
+    if (Array.isArray(root.rankedCandidates)) renderScanner(root.rankedCandidates);
   }
 
   function renderScanner(results) {
     if (!elements.scanner) return;
-
     elements.scanner.replaceChildren();
 
     if (!Array.isArray(results) || results.length === 0) {
-      const empty = document.createElement("p");
-      empty.className = "muted-text";
-      empty.textContent = "No scanner candidates supplied by the API. This does not mean that no market opportunities exist.";
-      elements.scanner.appendChild(empty);
+      const p = document.createElement('p');
+      p.className = 'muted-text';
+      p.textContent = 'No validated candidates are currently available. This does not mean future market movements are predictable.';
+      elements.scanner.appendChild(p);
       return;
     }
 
-    for (const item of results.slice(0, 24)) {
-      const rowData = asObject(item);
-      const pair = String(firstDefined(rowData.pair, rowData.symbol, "Unknown pair"));
-      const signal = normalizeSignal(rowData);
-      const score = getEvidenceScore(rowData);
-      const row = document.createElement("article");
-      row.className = "scanner-row";
+    for (const candidate of results.slice(0, 24)) {
+      const item = obj(candidate);
+      const pair = String(item.pair || 'Unknown pair');
+      const signal = normalizeSignal(item);
 
-      const pairName = document.createElement("strong");
-      pairName.className = "scanner-pair";
-      pairName.textContent = pair;
+      const row = document.createElement('article');
+      row.className = 'scanner-row';
+      row.tabIndex = 0;
+      row.setAttribute('role', 'button');
+      row.setAttribute('aria-label', `Analyze ${pair}`);
 
-      const badge = document.createElement("span");
-      badge.className =
-        signal === "CALL"
-          ? "scan-call"
-          : signal === "PUT"
-            ? "scan-put"
-            : "scan-wait";
+      const pairLabel = document.createElement('strong');
+      pairLabel.className = 'scanner-pair';
+      pairLabel.textContent = `${pair} · ${item.timeframe || '?'}m`;
+
+      const badge = document.createElement('span');
+      badge.className = signal === 'CALL' ? 'scan-call' : signal === 'PUT' ? 'scan-put' : 'scan-wait';
       badge.textContent = signal;
 
-      const scoreElement = document.createElement("span");
-      scoreElement.className = "scanner-score";
-      scoreElement.textContent = score === null ? "Score: —" : `Score: ${Math.round(score)}/100`;
+      const score = document.createElement('span');
+      score.className = 'scanner-score';
+      score.textContent = `Score: ${number(item.confidence) === null ? '—' : `${Math.round(item.confidence)}/100`}`;
 
-      const reason = document.createElement("span");
-      reason.className = "scanner-reason";
-      reason.textContent = String(
-        firstDefined(asObject(rowData.signal).reason, rowData.reason, "Evidence review required.")
-      );
+      const reason = document.createElement('span');
+      reason.className = 'scanner-reason';
+      reason.textContent = String(first(item.reason, 'Evidence review required.'));
 
-      row.append(pairName, badge, scoreElement, reason);
+      row.append(pairLabel, badge, score, reason);
 
-      row.addEventListener("click", () => {
-        if (elements.selectedPair) {
+      const choose = () => {
+        if (elements.selectedPair &&
+            [...elements.selectedPair.options].some(option => option.value === pair)) {
           elements.selectedPair.value = pair;
         }
+        if (elements.timeframe && [1, 2, 3].includes(Number(item.timeframe))) {
+          elements.timeframe.value = String(item.timeframe);
+        }
         analyzeMarket();
-      });
+      };
 
+      row.addEventListener('click', choose);
+      row.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          choose();
+        }
+      });
       elements.scanner.appendChild(row);
     }
   }
 
-  async function fetchJson(path, options = {}) {
+  async function fetchJson(path) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
       const response = await fetch(`${API_BASE}${path}`, {
-        method: "GET",
-        cache: "no-store",
-        ...options,
-        signal: controller.signal,
-        headers: {
-          Accept: "application/json",
-          ...(options.headers || {})
-        }
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+        signal: controller.signal
       });
 
-      const bodyText = await response.text();
+      const raw = await response.text();
       let payload;
-
       try {
-        payload = bodyText ? JSON.parse(bodyText) : {};
+        payload = raw ? JSON.parse(raw) : {};
       } catch {
         throw new Error(`API returned invalid JSON (${response.status}).`);
       }
 
-      if (!response.ok) {
-        const message = firstDefined(
-          payload.error,
-          payload.message,
-          `API request failed (${response.status}).`
-        );
-        throw new Error(String(message));
+      if (!response.ok || payload.ok === false) {
+        throw new Error(String(first(payload.error, payload.message, `API request failed (${response.status}).`)));
       }
-
       return payload;
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(timer);
     }
   }
 
   async function checkHealth() {
     try {
-      const payload = await fetchJson("/api/health");
-      renderHealth(payload);
+      renderHealth(await fetchJson('/api/health'));
       return true;
     } catch (error) {
-      setBadge(
-        elements.backendStatus,
-        "API offline / unavailable",
-        "status-badge status-offline"
-      );
-      setText("scanInfo", "Unable to confirm API health.");
+      setBadge(elements.backendStatus, 'API offline / unavailable', 'status-badge status-offline');
       return false;
     }
   }
 
   async function analyzeMarket() {
     if (state.busy) return;
-
     state.busy = true;
     clearError();
 
     if (elements.analyzeBtn) {
       elements.analyzeBtn.disabled = true;
-      elements.analyzeBtn.textContent = "Analyzing…";
+      elements.analyzeBtn.textContent = 'Analyzing…';
     }
 
-    const pair = elements.selectedPair?.value || "EUR/USD";
-    const timeframe = elements.timeframe?.value || "1";
+    const pair = elements.selectedPair?.value || 'EUR/USD';
+    const timeframe = elements.timeframe?.value || '1';
 
     try {
-      const params = new URLSearchParams({
-        pair,
-        timeframe
-      });
-
-      const payload = await fetchJson(`/api/best?${params.toString()}`);
-
-      if (payload && payload.ok === false) {
-        throw new Error(
-          String(firstDefined(payload.error, payload.message, "The API could not complete the analysis."))
-        );
-      }
-
+      const query = new URLSearchParams({ pair, timeframe });
+      const payload = await fetchJson(`/api/analyze?${query.toString()}`);
       renderMarket(payload);
 
-      const market = getMarketObject(payload);
-      const signal = normalizeSignal(market);
+      // Refresh scanner independently; this endpoint does not replace the
+      // selected pair's analysis in the main evidence panel.
+      fetchJson('/api/best')
+        .then(scanPayload => {
+          const root = obj(scanPayload);
+          renderScanner(root.rankedCandidates || []);
+          const scanner = obj(root.scanner);
+          text('candidateCount', Array.isArray(root.rankedCandidates) ? root.rankedCandidates.length : 0);
+          text('lastScanAt', date(scanner.lastScanAt));
+          text('cachedPairs', first(obj(root.metadata).cachedPairs, '—'));
+          setBadge(
+            elements.scannerStatus,
+            scanner.running ? 'Scanning' : 'Scan status reported',
+            scanner.running ? 'status-badge status-unknown' : 'status-badge status-online'
+          );
+        })
+        .catch(() => {
+          // Keep the last known scanner display if the optional scan request fails.
+        });
 
-      if (signal === "NO TRADE") {
-        setText(
-          "scanInfo",
-          `${pair} · ${timeframe}m · Analysis complete · NO TRADE if evidence is insufficient`
-        );
-      } else {
-        setText("scanInfo", `${pair} · ${timeframe}m · Backend signal received`);
-      }
+      text('scanInfo', `${pair} · ${timeframe}m · analysis response received`);
     } catch (error) {
-      const message = error?.name === "AbortError"
-        ? "The API request timed out. Please try again."
-        : (error?.message || "Unable to analyze the market.");
+      const message = error.name === 'AbortError'
+        ? 'The API request timed out. No new signal is available.'
+        : String(error.message || 'Unable to analyze the market.');
 
       showError(message);
-      setText("scanInfo", "Analysis failed. No new signal was generated.");
-
-      setBadge(
-        elements.signalBadge,
-        "NO TRADE",
-        "signal-badge signal-wait"
-      );
-      setText("signalReason", "NO TRADE — analysis failed or the API could not be verified.");
-      renderReasons([message, "No trade decision should be inferred from a failed request."]);
+      text('scanInfo', 'Analysis failed. No new signal was generated.');
+      renderSignal('NO TRADE');
+      text('confidence', '—');
+      text('signalReason', 'NO TRADE — analysis failed or could not be verified.');
+      renderReasons([message, 'Do not infer a trade from a failed request.']);
     } finally {
       state.busy = false;
-
       if (elements.analyzeBtn) {
         elements.analyzeBtn.disabled = false;
-        elements.analyzeBtn.textContent = "Analyze market";
+        elements.analyzeBtn.textContent = 'Analyze market';
       }
     }
-  }
-
-  function startRefresh() {
-    if (state.timer) clearInterval(state.timer);
-
-    state.timer = setInterval(() => {
-      checkHealth();
-      analyzeMarket();
-    }, REFRESH_INTERVAL_MS);
   }
 
   function bindEvents() {
-    if (elements.analyzeBtn) {
-      elements.analyzeBtn.addEventListener("click", analyzeMarket);
-    }
-
-    if (elements.selectedPair) {
-      elements.selectedPair.addEventListener("change", analyzeMarket);
-    }
-
-    if (elements.timeframe) {
-      elements.timeframe.addEventListener("change", analyzeMarket);
-    }
+    elements.analyzeBtn?.addEventListener('click', analyzeMarket);
+    elements.selectedPair?.addEventListener('change', analyzeMarket);
+    elements.timeframe?.addEventListener('change', analyzeMarket);
   }
 
   async function initialize() {
     bindEvents();
     await checkHealth();
     await analyzeMarket();
-    startRefresh();
+
+    if (state.timer) clearInterval(state.timer);
+    state.timer = setInterval(() => {
+      checkHealth();
+      analyzeMarket();
+    }, REFRESH_INTERVAL_MS);
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initialize, { once: true });
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initialize, { once: true });
   } else {
     initialize();
   }
