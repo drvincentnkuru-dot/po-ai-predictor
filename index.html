@@ -5,8 +5,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#101827">
-  <meta name="description" content="PO AI Predictor V9.3.0 — live forex market analysis and evidence-gated research signals.">
-  <title>PO AI Predictor V9.3.0</title>
+  <meta name="description" content="PO AI Predictor V9.3.1 — live forex market analysis with evidence-gated research signals.">
+  <title>PO AI Predictor V9.3.1</title>
   <link rel="stylesheet" href="style.css">
   <script src="script.js" defer></script>
 </head>
@@ -17,7 +17,7 @@
         <div class="brand-mark" aria-hidden="true">PO</div>
         <div>
           <h1>PO AI PREDICTOR</h1>
-          <p class="version">V9.3.0 · LIVE MARKET RESEARCH</p>
+          <p class="version">V9.3.1 · LIVE MARKET RESEARCH</p>
         </div>
       </div>
 
@@ -40,8 +40,8 @@
       <section class="control-panel panel">
         <div class="section-heading">
           <div>
-            <h2>Market scanner</h2>
-            <p>Select a forex pair and analysis timeframe.</p>
+            <h2>Selected market analysis</h2>
+            <p>Choose one forex pair and a 1m, 2m, or 3m analysis timeframe.</p>
           </div>
           <button id="analyzeBtn" type="button">Analyze market</button>
         </div>
@@ -104,7 +104,7 @@
           <div class="score-card">
             <span class="metric-label">Evidence score</span>
             <div class="score-value">
-              <span id="confidence">0</span><span class="score-out-of">/100</span>
+              <span id="confidence">—</span><span class="score-out-of">/100</span>
             </div>
             <p>Not a probability of winning</p>
           </div>
@@ -144,15 +144,15 @@
         <div class="score-comparison">
           <div class="direction-score">
             <span>CALL evidence</span>
-            <strong id="callScore">0</strong>
+            <strong id="callScore">—</strong>
           </div>
           <div class="direction-score">
             <span>PUT evidence</span>
-            <strong id="putScore">0</strong>
+            <strong id="putScore">—</strong>
           </div>
           <div class="direction-score">
             <span>Evidence gap</span>
-            <strong id="gap">0</strong>
+            <strong id="gap">—</strong>
           </div>
         </div>
 
@@ -302,7 +302,7 @@
         </div>
       </section>
 
-      <section class="panel scanner-panel">
+      <section class="panel scanner-panel" hidden>
         <div class="section-heading">
           <div>
             <h2>24-pair scanner</h2>
@@ -327,7 +327,7 @@
         </div>
 
         <div id="scanner" class="scanner" aria-live="polite">
-          <p class="muted-text">Scanner results will appear when available.</p>
+          <p class="muted-text">Scanner is disabled in selected-pair analysis mode.</p>
         </div>
       </section>
 
@@ -366,7 +366,7 @@
     </main>
 
     <footer class="app-footer">
-      <p>PO AI Predictor V9.3.0 · Evidence-based market research</p>
+      <p>PO AI Predictor V9.3.1 · Evidence-based market research</p>
       <p>Evidence score, not win probability. No guaranteed outcomes. NO TRADE when evidence is insufficient.</p>
     </footer>
   </div>
