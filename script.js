@@ -6,19 +6,22 @@
     window.PO_API_BASE || 'https://po-ai-predictor-api.onrender.com'
   ).replace(/\/+$/, '');
 
-  // Mode A: analyze only the pair selected by the user; do not run /api/best scanner.
+  // Selected-pair mode: no automatic /api/best scanner.
   const REFRESH_INTERVAL_MS = 60000;
   const REQUEST_TIMEOUT_MS = 90000;
   const MAX_REASONS = 10;
+  const MAX_DATA_AGE_SECONDS = 300;
   const ALLOWED_TIMEFRAMES = new Set(['1', '2', '3']);
 
   const $ = id => document.getElementById(id);
+
   const state = {
     busy: false,
     timer: null,
     healthBusy: false,
     lastMarket: null,
     lastHealth: null,
+    rerunRequested: false,
     requestSequence: 0
   };
 
@@ -242,15 +245,18 @@
     return String(first(market.freshness, 'UNKNOWN')).toUpperCase();
   }
 
+  // NO TRADE alone does not mean the data is stale.
+  // Signal quality and data freshness are checked separately.
   function isUnsafe(market) {
     const freshness = freshnessOf(market);
     const age = number(market.dataAgeSeconds);
 
     return (
       freshness !== 'FRESH' ||
-      (age !== null && age > 300) ||
-      market.insufficientData === true ||
-      market.noTrade === true
+      age === null ||
+      age < 0 ||
+      age > MAX_DATA_AGE_SECONDS ||
+      market.insufficientData === true
     );
   }
 
@@ -349,7 +355,7 @@
 
     state.lastHealth = health;
 
-    const configured = health.configured !== false;
+    const configured = health.configured === true;
     const online = health.ok === true && configured;
 
     setBadge(
@@ -357,7 +363,7 @@
       online
         ? `API online · ${first(health.version, 'version unknown')}`
         : !configured
-          ? 'API key missing'
+          ? 'API key missing or not configured'
           : 'API status unavailable',
       online
         ? 'status-badge status-online'
@@ -453,7 +459,6 @@
     text('ema9', fmt(indicators.ema9));
     text('ema21', fmt(indicators.ema21));
 
-    // V9.3.1 uses rsi9 and adx14.
     text('rsi', fmt(first(indicators.rsi9, indicators.rsi), 2));
     text('adx', fmt(first(indicators.adx14, indicators.adx), 2));
     text('atr', fmt(first(indicators.atr14, indicators.atr)));
@@ -544,12 +549,12 @@
 
     if (unsafe) {
       reasons.unshift(
-        'NO TRADE: market data is stale, unavailable, or not confirmed fresh.'
+        'NO TRADE: data freshness, data age, or data sufficiency could not be verified.'
       );
-    }
-
-    if (signal === 'NO TRADE' && !reasons.length) {
-      reasons.push('NO TRADE: evidence is insufficient or conflicting.');
+    } else if (signal === 'NO TRADE' && !reasons.length) {
+      reasons.push(
+        'NO TRADE: evidence is insufficient or conflicting.'
+      );
     }
 
     renderReasons(reasons);
@@ -562,8 +567,6 @@
     );
 
     renderUsage(root.metadata);
-
-    // Mode A intentionally does not call /api/best or render 24-pair scanner candidates.
   }
 
   function resetMarketAfterFailure(message) {
@@ -665,9 +668,15 @@
   }
 
   async function analyzeMarket() {
-    if (state.busy) return;
+    // If the user changes pair/timeframe during an active request,
+    // queue one more request using the latest selected values.
+    if (state.busy) {
+      state.rerunRequested = true;
+      return;
+    }
 
     state.busy = true;
+    state.rerunRequested = false;
 
     const sequence = ++state.requestSequence;
 
@@ -685,6 +694,10 @@
       elements.timeframe && elements.timeframe.value || '1';
 
     try {
+      if (!ALLOWED_TIMEFRAMES.has(String(timeframe))) {
+        throw new Error('Unsupported timeframe. Choose 1, 2, or 3 minutes.');
+      }
+
       const query = new URLSearchParams({ pair, timeframe });
 
       const payload = await fetchJson(
@@ -692,6 +705,14 @@
       );
 
       if (sequence === state.requestSequence) {
+        const returnedMarket = marketFrom(payload);
+        const returnedPair = String(first(returnedMarket.pair, ''));
+
+        // Do not render a result for a different pair than requested.
+        if (returnedPair && returnedPair !== pair) {
+          throw new Error('The API returned a different pair than requested.');
+        }
+
         renderMarket(payload);
       }
     } catch (error) {
@@ -710,6 +731,11 @@
         elements.analyzeBtn.disabled = false;
         elements.analyzeBtn.textContent = 'Analyze market';
       }
+
+      if (state.rerunRequested) {
+        state.rerunRequested = false;
+        analyzeMarket();
+      }
     }
   }
 
@@ -726,11 +752,12 @@
       elements.timeframe.addEventListener('change', analyzeMarket);
     }
 
-    // Hide the legacy scanner panel for Mode A.
-    const scannerPanel =
-      elements.scanner && elements.scanner.closest('.scanner-panel');
+    // Mode A deliberately hides the legacy 24-pair scanner.
+    const scannerPanel = document.querySelector('.scanner-panel');
 
-    if (scannerPanel) scannerPanel.hidden = true;
+    if (scannerPanel) {
+      scannerPanel.hidden = true;
+    }
 
     const controlHeading = document.querySelector(
       '.control-panel .section-heading h2'
