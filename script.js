@@ -3,72 +3,58 @@
 
 (() => {
   const API_BASE = String(
-    window.PO_API_BASE || 'https://po-ai-predictor-api.onrender.com'
+    window.PO_API_BASE ||
+      'https://po-ai-predictor-api.onrender.com'
   ).replace(/\/+$/, '');
 
   const HEALTH_INTERVAL_MS = 60000;
   const SCAN_POLL_INTERVAL_MS = 5000;
-  const REQUEST_TIMEOUT_MS = 28000;
+  const REQUEST_TIMEOUT_MS = 90000;
   const MAX_DATA_AGE_SECONDS = 300;
   const MAX_REASONS = 10;
 
   const $ = id => document.getElementById(id);
 
   const state = {
-    healthBusy: false,
     analysisBusy: false,
     scanBusy: false,
+    healthBusy: false,
     scanTimer: null,
+    healthTimer: null,
     lastMarket: null,
     lastHealth: null,
-    requestSequence: 0
+    requestId: 0
   };
 
-  const elements = {
+  const el = {
     backendStatus: $('backendStatus'),
+    marketStatus: $('marketStatus'),
     analyzeBtn: $('analyzeBtn'),
-    errorBox: $('errorBox'),
     selectedPair: $('selectedPair'),
     timeframe: $('timeframe'),
-    marketStatus: $('marketStatus'),
-    trendBadge: $('trendBadge'),
+    errorBox: $('errorBox'),
+    scanInfo: $('scanInfo'),
     signalBadge: $('signalBadge'),
     confidence: $('confidence'),
+    summaryPair: $('summaryPair'),
+    trendBadge: $('trendBadge'),
+    freshness: $('freshness'),
+    dataAge: $('dataAge'),
     entryTime: $('entryTime'),
     expiryTime: $('expiryTime'),
+    currentPrice: $('currentPrice'),
     entryPrice: $('entryPrice'),
     callScore: $('callScore'),
     putScore: $('putScore'),
-    support: $('support'),
-    resistance: $('resistance'),
     gap: $('gap'),
-    volatility: $('volatility'),
-    dataAge: $('dataAge'),
-    currentPrice: $('currentPrice'),
-    freshness: $('freshness'),
+    signalReason: $('signalReason'),
     ema9: $('ema9'),
     ema21: $('ema21'),
+    emaCross: $('emaCross'),
+    trend5m: $('trend5m'),
     rsi: $('rsi'),
+    rsiCross: $('rsiCross'),
     adx: $('adx'),
-    atr: $('atr'),
-    bollingerUpper: $('bollingerUpper'),
-    bollingerMiddle: $('bollingerMiddle'),
-    bollingerLower: $('bollingerLower'),
-    psychology: $('psychology'),
-    priceAction: $('priceAction'),
-    reasons: $('reasons'),
-    lastCandle: $('lastCandle'),
-    scanInfo: $('scanInfo'),
-    provider: $('provider'),
-    providerRequests: $('providerRequests'),
-    dailyCreditsUsed: $('dailyCreditsUsed'),
-    dailyCreditsRemaining: $('dailyCreditsRemaining'),
-    cachedPairs: $('cachedPairs'),
-    candidateCount: $('candidateCount'),
-    scannerStatus: $('scannerStatus'),
-    lastScanAt: $('lastScanAt'),
-    summaryPair: $('summaryPair'),
-    signalReason: $('signalReason'),
     macdLine: $('macdLine'),
     macdSignal: $('macdSignal'),
     macdHistogram: $('macdHistogram'),
@@ -76,39 +62,64 @@
     stochK: $('stochK'),
     stochD: $('stochD'),
     stochasticCross: $('stochasticCross'),
-    emaCross: $('emaCross'),
-    rsiCross: $('rsiCross'),
-    trend5m: $('trend5m'),
+    atr: $('atr'),
+    bollingerUpper: $('bollingerUpper'),
+    bollingerMiddle: $('bollingerMiddle'),
+    bollingerLower: $('bollingerLower'),
     ema21_5m: $('ema21_5m'),
+    support: $('support'),
+    resistance: $('resistance'),
+    volatility: $('volatility'),
     candlePattern: $('candlePattern'),
-    providerName: $('providerName')
+    lastCandle: $('lastCandle'),
+    priceAction: $('priceAction'),
+    psychology: $('psychology'),
+    reasons: $('reasons'),
+    provider: $('provider'),
+    providerName: $('providerName'),
+    providerRequests: $('providerRequests'),
+    dailyCreditsUsed: $('dailyCreditsUsed'),
+    dailyCreditsRemaining: $('dailyCreditsRemaining'),
+    cachedPairs: $('cachedPairs'),
+    candidateCount: $('candidateCount'),
+    scannerStatus: $('scannerStatus'),
+    lastScanAt: $('lastScanAt')
   };
 
   function obj(value) {
-    return value && typeof value === 'object' && !Array.isArray(value)
+    return value &&
+      typeof value === 'object' &&
+      !Array.isArray(value)
       ? value
       : {};
   }
 
   function first(...values) {
     return values.find(
-      value => value !== undefined && value !== null && value !== ''
+      value =>
+        value !== undefined &&
+        value !== null &&
+        value !== ''
     );
   }
 
-  function number(value) {
-    if (value === null || value === undefined || value === '') return null;
+  function num(value) {
+    if (
+      value === null ||
+      value === undefined ||
+      value === ''
+    ) return null;
+
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
   }
 
   function fmt(value, digits = 5) {
-    const n = number(value);
+    const n = num(value);
     if (n === null) return '—';
 
     return n.toLocaleString(undefined, {
-      maximumFractionDigits: digits,
-      minimumFractionDigits: 0
+      maximumFractionDigits: digits
     });
   }
 
@@ -116,88 +127,108 @@
     if (!value) return '—';
 
     const d = new Date(value);
-    if (Number.isNaN(d.getTime())) return String(value);
 
-    return d.toLocaleString([], {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
+    return Number.isNaN(d.getTime())
+      ? String(value)
+      : d.toLocaleString();
   }
 
-  function ageText(value) {
-    const seconds = number(value);
+  function ageLabel(value) {
+    const n = num(value);
 
-    if (seconds === null || seconds < 0) return 'Age: unavailable';
-    if (seconds < 60) return `Age: ${Math.round(seconds)} sec`;
+    if (n === null || n < 0) return 'Age: unavailable';
+    if (n < 60) return `Age: ${Math.round(n)} sec`;
 
-    if (seconds < 3600) {
-      return `Age: ${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} sec`;
-    }
-
-    return `Age: ${Math.floor(seconds / 3600)} hr ${Math.floor((seconds % 3600) / 60)} min`;
+    return `Age: ${Math.floor(n / 60)} min ${Math.round(n % 60)} sec`;
   }
 
-  function text(id, value, fallback = '—') {
-    const element = $(id);
-    if (!element) return;
+  function setText(id, value, fallback = '—') {
+    const node = $(id);
+    if (!node) return;
 
-    element.textContent =
+    node.textContent =
       value === null || value === undefined || value === ''
         ? fallback
         : String(value);
   }
 
-  function setBadge(element, label, className) {
-    if (!element) return;
-    element.textContent = label;
-    element.className = className;
+  function setBadge(node, label, className) {
+    if (!node) return;
+
+    node.textContent = label;
+    node.className = className;
   }
 
   function showError(message) {
-    if (!elements.errorBox) return;
-    elements.errorBox.textContent = String(message);
-    elements.errorBox.hidden = false;
+    if (!el.errorBox) return;
+
+    el.errorBox.textContent = String(message);
+    el.errorBox.hidden = false;
   }
 
   function clearError() {
-    if (!elements.errorBox) return;
-    elements.errorBox.textContent = '';
-    elements.errorBox.hidden = true;
+    if (!el.errorBox) return;
+
+    el.errorBox.textContent = '';
+    el.errorBox.hidden = true;
   }
 
-  function normalizeSignal(market) {
-    const data = obj(market);
-    const signalObject = obj(data.signal);
+  async function requestJson(path, options = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      options.timeout || REQUEST_TIMEOUT_MS
+    );
 
-    if (
-      data.noTrade === true ||
-      data.tradeAllowed === false ||
-      signalObject.noTrade === true ||
-      signalObject.tradeAllowed === false
-    ) {
-      return 'NO TRADE';
-    }
+    try {
+      const response = await fetch(`${API_BASE}${path}`, {
+        method: options.method || 'GET',
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json',
+          ...(options.body
+            ? { 'Content-Type': 'application/json' }
+            : {})
+        },
+        ...(options.body
+          ? { body: JSON.stringify(options.body) }
+          : {}),
+        signal: controller.signal
+      });
 
-    const raw = typeof data.signal === 'string'
-      ? data.signal
-      : first(
-          signalObject.action,
-          signalObject.direction,
-          data.action,
-          data.direction,
-          data.signalAction
+      const raw = await response.text();
+      let payload;
+
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(
+          `API returned invalid JSON (HTTP ${response.status}).`
         );
+      }
 
-    const signal = String(raw || '').trim().toUpperCase();
+      if (!response.ok || payload.ok === false) {
+        throw new Error(
+          first(
+            payload.error,
+            payload.message,
+            `Request failed (HTTP ${response.status}).`
+          )
+        );
+      }
 
-    if (['CALL', 'BUY', 'UP', 'BULLISH'].includes(signal)) return 'CALL';
-    if (['PUT', 'SELL', 'DOWN', 'BEARISH'].includes(signal)) return 'PUT';
+      return payload;
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw new Error(
+          'The request timed out. No new signal was confirmed.'
+        );
+      }
 
-    return 'NO TRADE';
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function marketFrom(payload) {
@@ -212,19 +243,52 @@
     ));
   }
 
-  function getIndicators(market) {
+  function indicatorsFrom(market) {
     return obj(market.indicators);
   }
 
-  function freshnessOf(market) {
-    return String(first(market.freshness, 'UNKNOWN')).toUpperCase();
+  function getSignal(market) {
+    const signalObject = obj(market.signal);
+
+    if (
+      market.noTrade === true ||
+      market.tradeAllowed === false ||
+      signalObject.noTrade === true ||
+      signalObject.tradeAllowed === false
+    ) {
+      return 'NO TRADE';
+    }
+
+    const raw = String(first(
+      typeof market.signal === 'string'
+        ? market.signal
+        : null,
+      signalObject.action,
+      signalObject.direction,
+      market.action,
+      market.direction,
+      'NO TRADE'
+    )).toUpperCase().trim();
+
+    if (['CALL', 'BUY', 'UP', 'BULLISH'].includes(raw)) {
+      return 'CALL';
+    }
+
+    if (['PUT', 'SELL', 'DOWN', 'BEARISH'].includes(raw)) {
+      return 'PUT';
+    }
+
+    return 'NO TRADE';
   }
 
   function isUnsafe(market) {
-    const age = number(market.dataAgeSeconds);
+    const age = num(market.dataAgeSeconds);
+    const freshness = String(
+      first(market.freshness, 'UNKNOWN')
+    ).toUpperCase();
 
     return (
-      freshnessOf(market) !== 'FRESH' ||
+      freshness !== 'FRESH' ||
       age === null ||
       age < 0 ||
       age > MAX_DATA_AGE_SECONDS ||
@@ -232,72 +296,88 @@
     );
   }
 
-  function getSignalReason(market) {
-    const signal = obj(market.signal);
-
-    return first(
-      signal.reason,
-      market.reason,
-      Array.isArray(market.reasons) ? market.reasons[0] : null,
-      'Evidence is insufficient or conflicting; no validated trade signal is available.'
-    );
-  }
-
   function renderSignal(signal) {
     if (signal === 'CALL') {
-      setBadge(elements.signalBadge, 'CALL', 'signal-badge signal-call');
+      setBadge(
+        el.signalBadge,
+        'CALL',
+        'signal-badge signal-call'
+      );
     } else if (signal === 'PUT') {
-      setBadge(elements.signalBadge, 'PUT', 'signal-badge signal-put');
+      setBadge(
+        el.signalBadge,
+        'PUT',
+        'signal-badge signal-put'
+      );
     } else {
-      setBadge(elements.signalBadge, 'NO TRADE', 'signal-badge signal-wait');
+      setBadge(
+        el.signalBadge,
+        'NO TRADE',
+        'signal-badge signal-wait'
+      );
     }
   }
 
   function renderTrend(value) {
     const trend = String(value || 'UNKNOWN').toUpperCase();
 
-    if (trend.includes('BULL') || trend === 'CALL' || trend === 'UP') {
-      setBadge(elements.trendBadge, 'Trend: BULLISH', 'trend-badge trend-up');
-    } else if (trend.includes('BEAR') || trend === 'PUT' || trend === 'DOWN') {
-      setBadge(elements.trendBadge, 'Trend: BEARISH', 'trend-badge trend-down');
+    if (trend.includes('BULL') || trend === 'UP') {
+      setBadge(
+        el.trendBadge,
+        'Trend: BULLISH',
+        'trend-badge trend-up'
+      );
+    } else if (trend.includes('BEAR') || trend === 'DOWN') {
+      setBadge(
+        el.trendBadge,
+        'Trend: BEARISH',
+        'trend-badge trend-down'
+      );
     } else {
-      setBadge(elements.trendBadge, `Trend: ${trend}`, 'trend-badge');
+      setBadge(
+        el.trendBadge,
+        `Trend: ${trend}`,
+        'trend-badge'
+      );
     }
   }
 
   function renderReasons(reasons) {
-    if (!elements.reasons) return;
+    if (!el.reasons) return;
 
-    elements.reasons.replaceChildren();
+    el.reasons.replaceChildren();
 
     const items = (
       Array.isArray(reasons) ? reasons : [reasons]
     ).filter(Boolean).slice(0, MAX_REASONS);
 
     if (!items.length) {
-      items.push('The API did not provide detailed decision reasons.');
+      items.push('No additional decision reasons were supplied.');
     }
 
     for (const reason of items) {
       const li = document.createElement('li');
       li.textContent = String(reason);
-      elements.reasons.appendChild(li);
+      el.reasons.appendChild(li);
     }
   }
 
   function renderUsage(metadata) {
     const meta = obj(metadata);
 
-    text('providerName', first(meta.provider, 'Twelve Data LIVE'));
-    text('providerRequests', first(meta.providerRequests, '—'));
-    text('dailyCreditsUsed', first(meta.dailyCreditsUsed, '—'));
-    text('dailyCreditsRemaining', first(meta.dailyCreditsRemaining, '—'));
-    text('cachedPairs', first(meta.cachedPairs, 0));
+    setText(
+      'providerName',
+      first(meta.provider, 'Twelve Data LIVE')
+    );
+    setText('providerRequests', meta.providerRequests);
+    setText('dailyCreditsUsed', meta.dailyCreditsUsed);
+    setText('dailyCreditsRemaining', meta.dailyCreditsRemaining);
+    setText('cachedPairs', first(meta.cachedPairs, 0));
 
-    if (elements.provider) {
-      elements.provider.textContent =
-        `Provider: ${first(meta.provider, 'Twelve Data LIVE')} · API ${first(meta.version, '—')}`;
-    }
+    setText(
+      'provider',
+      `${first(meta.provider, 'Twelve Data LIVE')} · API ${first(meta.version, '—')}`
+    );
   }
 
   function renderHealth(payload) {
@@ -306,15 +386,14 @@
 
     state.lastHealth = health;
 
-    const configured = health.configured === true;
-    const online = health.ok === true && configured;
+    const online = health.ok === true && health.configured === true;
 
     setBadge(
-      elements.backendStatus,
+      el.backendStatus,
       online
         ? `API online · ${first(health.version, 'version unknown')}`
-        : !configured
-          ? 'API key missing or not configured'
+        : health.configured === false
+          ? 'API key not configured'
           : 'API status unavailable',
       online
         ? 'status-badge status-online'
@@ -327,173 +406,319 @@
   function renderMarket(payload) {
     const root = obj(payload);
     const market = marketFrom(root);
+    const indicators = indicatorsFrom(market);
+    const macd = obj(indicators.macd);
+    const stochastic = obj(indicators.stochastic);
+    const bands = obj(indicators.bollinger);
+    const levels = obj(market.supportResistance);
 
     state.lastMarket = market;
 
-    const indicators = getIndicators(market);
-    const pair = String(first(market.pair, 'NO MARKET'));
-    const timeframe = String(first(market.timeframe, '—'));
+    const pair = String(first(
+      market.pair,
+      el.selectedPair?.value,
+      'NO MARKET'
+    ));
 
-    text('summaryPair', pair);
-    text('scanInfo', `${pair} · ${timeframe}m · analysis result received`);
+    const timeframe = first(
+      market.timeframe,
+      el.timeframe?.value,
+      '—'
+    );
 
-    const freshness = freshnessOf(market);
-    const age = number(market.dataAgeSeconds);
+    setText('summaryPair', pair);
+    setText('currentPrice', fmt(market.currentPrice));
+    setText('entryPrice', fmt(market.entryPrice));
+    setText('entryTime', date(market.entryTime));
+    setText('expiryTime', date(market.expiryTime));
+
+    const age = num(market.dataAgeSeconds);
+    const freshness = String(
+      first(market.freshness, 'UNKNOWN')
+    ).toUpperCase();
+
     const unsafe = isUnsafe(market);
 
-    text('freshness', unsafe && freshness === 'FRESH' ? 'CHECK DATA' : freshness);
-    text('dataAge', ageText(age));
-    text('currentPrice', fmt(market.currentPrice));
-    text('entryPrice', fmt(market.entryPrice));
+    setText(
+      'freshness',
+      unsafe && freshness === 'FRESH'
+        ? 'CHECK DATA'
+        : freshness
+    );
+
+    setText('dataAge', ageLabel(age));
 
     setBadge(
-      elements.marketStatus,
-      unsafe ? 'Market status: verify data' : 'Market status: fresh provider data',
-      unsafe ? 'status-badge status-unknown' : 'status-badge status-online'
+      el.marketStatus,
+      unsafe
+        ? 'Market status: verify data'
+        : 'Market status: fresh provider data',
+      unsafe
+        ? 'status-badge status-unknown'
+        : 'status-badge status-online'
     );
 
     renderTrend(first(indicators.trend5m, 'UNKNOWN'));
 
-    let signal = normalizeSignal(market);
+    let signal = getSignal(market);
+
     if (unsafe) signal = 'NO TRADE';
 
     renderSignal(signal);
 
-    text('confidence', signal === 'NO TRADE' ? '—' : fmt(market.confidence, 0));
-    text('callScore', fmt(market.callScore, 0));
-    text('putScore', fmt(market.putScore, 0));
-    text('gap', fmt(market.gap, 0));
-    text('entryTime', date(market.entryTime));
-    text('expiryTime', date(market.expiryTime));
-
-    text('ema9', fmt(indicators.ema9));
-    text('ema21', fmt(indicators.ema21));
-    text('rsi', fmt(first(indicators.rsi9, indicators.rsi), 2));
-    text('adx', fmt(first(indicators.adx14, indicators.adx), 2));
-    text('atr', fmt(first(indicators.atr14, indicators.atr)));
-    text('ema21_5m', fmt(indicators.ema21_5m));
-
-    text('emaCross', `Crossover: ${first(indicators.emaCross, '—')}`);
-    text('rsiCross', `RSI cross: ${first(indicators.rsiCross, '—')}`);
-    text('trend5m', `5m trend: ${first(indicators.trend5m, '—')}`);
-
-    const macd = obj(indicators.macd);
-    text('macdLine', fmt(macd.line, 6));
-    text('macdSignal', fmt(macd.signal, 6));
-    text('macdHistogram', `Histogram: ${fmt(macd.histogram, 6)}`);
-    text('macdCross', `MACD cross: ${first(macd.crossover, '—')}`);
-
-    const stochastic = obj(indicators.stochastic);
-    text('stochK', fmt(stochastic.k, 2));
-    text('stochD', fmt(stochastic.d, 2));
-    text('stochasticCross', `Stochastic cross: ${first(stochastic.crossover, '—')}`);
-
-    const bands = obj(indicators.bollinger);
-    text('bollingerUpper', fmt(bands.upper));
-    text('bollingerMiddle', fmt(first(bands.middle, bands.mid)));
-    text('bollingerLower', fmt(bands.lower));
-
-    const levels = obj(market.supportResistance);
-    text('support', fmt(levels.support));
-    text('resistance', fmt(levels.resistance));
-    text('volatility', first(market.volatility, 'UNKNOWN'));
-
-    const pattern = market.candlePattern;
-    text(
-      'candlePattern',
-      typeof pattern === 'string' ? pattern : first(obj(pattern).name, '—')
+    setText(
+      'confidence',
+      signal === 'NO TRADE'
+        ? '—'
+        : fmt(market.confidence, 0)
     );
 
-    text(
+    setText('callScore', fmt(market.callScore, 0));
+    setText('putScore', fmt(market.putScore, 0));
+    setText('gap', fmt(market.gap, 0));
+
+    setText('ema9', fmt(indicators.ema9));
+    setText('ema21', fmt(indicators.ema21));
+    setText(
+      'emaCross',
+      `Crossover: ${first(indicators.emaCross, '—')}`
+    );
+    setText(
+      'trend5m',
+      `5m trend: ${first(indicators.trend5m, '—')}`
+    );
+
+    setText(
+      'rsi',
+      fmt(first(indicators.rsi9, indicators.rsi), 2)
+    );
+    setText(
+      'rsiCross',
+      `RSI cross: ${first(indicators.rsiCross, '—')}`
+    );
+    setText(
+      'adx',
+      fmt(first(indicators.adx14, indicators.adx), 2)
+    );
+
+    setText('macdLine', fmt(macd.line, 6));
+    setText('macdSignal', fmt(macd.signal, 6));
+    setText(
+      'macdHistogram',
+      `Histogram: ${fmt(macd.histogram, 6)}`
+    );
+    setText(
+      'macdCross',
+      `MACD cross: ${first(macd.crossover, '—')}`
+    );
+
+    setText('stochK', fmt(stochastic.k, 2));
+    setText('stochD', fmt(stochastic.d, 2));
+    setText(
+      'stochasticCross',
+      `Stochastic cross: ${first(stochastic.crossover, '—')}`
+    );
+
+    setText('atr', fmt(first(indicators.atr14, indicators.atr)));
+    setText('bollingerUpper', fmt(bands.upper));
+    setText(
+      'bollingerMiddle',
+      fmt(first(bands.middle, bands.mid))
+    );
+    setText('bollingerLower', fmt(bands.lower));
+    setText('ema21_5m', fmt(indicators.ema21_5m));
+
+    setText('support', fmt(levels.support));
+    setText('resistance', fmt(levels.resistance));
+    setText(
+      'volatility',
+      first(market.volatility, 'UNKNOWN')
+    );
+
+    const pattern = market.candlePattern;
+
+    setText(
+      'candlePattern',
+      typeof pattern === 'string'
+        ? pattern
+        : first(obj(pattern).name, '—')
+    );
+
+    setText(
       'lastCandle',
       market.lastCandle
         ? `Latest completed candle: ${date(market.lastCandle)}`
         : 'Latest completed candle: unavailable'
     );
 
-    text('priceAction', first(market.priceAction, 'Price-action interpretation unavailable.'));
-    text('psychology', first(market.marketPsychology, 'Market psychology unavailable.'));
+    setText(
+      'priceAction',
+      first(
+        market.priceAction,
+        'Price-action interpretation unavailable.'
+      )
+    );
 
-    const reasons = Array.isArray(market.reasons) ? market.reasons.slice() : [];
+    setText(
+      'psychology',
+      first(
+        market.marketPsychology,
+        'Market psychology unavailable.'
+      )
+    );
+
+    let reasons = Array.isArray(market.reasons)
+      ? market.reasons.slice()
+      : [];
 
     if (unsafe) {
-      reasons.unshift('NO TRADE: data freshness, data age, or data sufficiency could not be verified.');
-    } else if (signal === 'NO TRADE' && !reasons.length) {
-      reasons.push('NO TRADE: evidence is insufficient or conflicting.');
+      reasons.unshift(
+        'NO TRADE: freshness or data sufficiency could not be verified.'
+      );
+    }
+
+    if (signal === 'NO TRADE' && reasons.length === 0) {
+      reasons.push(
+        'NO TRADE: evidence is insufficient or conflicting.'
+      );
     }
 
     renderReasons(reasons);
 
-    text(
+    setText(
       'signalReason',
       unsafe
         ? 'NO TRADE — data freshness or sufficiency has not been confirmed.'
-        : getSignalReason(market)
+        : first(
+            obj(market.signal).reason,
+            market.reason,
+            reasons[0],
+            'Review all indicators before making a decision.'
+          )
     );
 
     renderUsage(root.metadata);
-  }
 
-  async function requestJson(path, options = {}) {
-    const controller = new AbortController();
-    const timeoutMs = options.timeoutMs || REQUEST_TIMEOUT_MS;
-
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const response = await fetch(`${API_BASE}${path}`, {
-        method: options.method || 'GET',
-        cache: 'no-store',
-        headers: {
-          Accept: 'application/json',
-          ...(options.body ? { 'Content-Type': 'application/json' } : {})
-        },
-        ...(options.body ? { body: JSON.stringify(options.body) } : {}),
-        signal: controller.signal
-      });
-
-      const raw = await response.text();
-      let payload;
-
-      try {
-        payload = raw ? JSON.parse(raw) : {};
-      } catch {
-        throw new Error(`API returned invalid JSON (${response.status}).`);
-      }
-
-      if (!response.ok || payload.ok === false) {
-        throw new Error(String(first(
-          payload.error,
-          payload.message,
-          `API request failed (${response.status}).`
-        )));
-      }
-
-      return payload;
-    } catch (error) {
-      if (error.name === 'AbortError') {
-        throw new Error('The request took too long. No new signal was generated; please retry.');
-      }
-      throw error;
-    } finally {
-      clearTimeout(timer);
-    }
+    setText(
+      'scanInfo',
+      `${pair} · ${timeframe}m · individual analysis completed`
+    );
   }
 
   async function checkHealth() {
     if (state.healthBusy) return;
+
     state.healthBusy = true;
 
     try {
       renderHealth(await requestJson('/api/health'));
     } catch {
       setBadge(
-        elements.backendStatus,
+        el.backendStatus,
         'API offline / unavailable',
         'status-badge status-offline'
       );
     } finally {
       state.healthBusy = false;
+    }
+  }
+
+  function addScanButton() {
+    if ($('backgroundScanBtn')) return;
+
+    const button = document.createElement('button');
+    button.id = 'backgroundScanBtn';
+    button.type = 'button';
+    button.textContent = 'Scan all 24 pairs in background';
+    button.style.marginTop = '10px';
+
+    button.addEventListener('click', startBackgroundScan);
+
+    if (el.analyzeBtn?.parentElement) {
+      el.analyzeBtn.insertAdjacentElement('afterend', button);
+    } else {
+      document.querySelector('.control-panel')
+        ?.appendChild(button);
+    }
+  }
+
+  function setBusy(button, busy, busyText, normalText) {
+    if (!button) return;
+
+    button.disabled = busy;
+    button.textContent = busy ? busyText : normalText;
+  }
+
+  async function analyzeSelectedPair() {
+    if (state.analysisBusy) return;
+
+    const pair = String(
+      el.selectedPair?.value || ''
+    ).trim().toUpperCase();
+
+    const timeframe = String(
+      el.timeframe?.value || '1'
+    );
+
+    if (!pair || !['1', '2', '3'].includes(timeframe)) {
+      showError('Choose a valid currency pair and timeframe.');
+      return;
+    }
+
+    state.analysisBusy = true;
+    const requestId = ++state.requestId;
+
+    clearError();
+    setBusy(
+      el.analyzeBtn,
+      true,
+      'Analyzing selected pair…',
+      'Analyze selected pair'
+    );
+
+    setText(
+      'scanInfo',
+      `Requesting ${pair} · ${timeframe}m analysis. The 24-pair scan is separate.`
+    );
+
+    try {
+      const query = new URLSearchParams({
+        pair,
+        timeframe
+      });
+
+      const payload = await requestJson(
+        `/api/analyze?${query.toString()}`
+      );
+
+      if (requestId !== state.requestId) return;
+
+      const market = marketFrom(payload);
+
+      if (!market.pair) {
+        throw new Error(
+          'The API response did not include the selected market.'
+        );
+      }
+
+      renderMarket(payload);
+    } catch (error) {
+      if (requestId === state.requestId) {
+        showError(String(error.message || error));
+        setText(
+          'signalReason',
+          'Analysis failed. Do not infer a CALL or PUT from an error.'
+        );
+        renderSignal('NO TRADE');
+      }
+    } finally {
+      state.analysisBusy = false;
+      setBusy(
+        el.analyzeBtn,
+        false,
+        '',
+        'Analyze selected pair'
+      );
     }
   }
 
@@ -506,43 +731,49 @@
       ? root.rankedCandidates
       : [];
 
-    const scannerPanel = document.querySelector('.scanner-panel');
-    const scannerElement = $('scanner');
+    const panel = document.querySelector('.scanner-panel');
+    const scannerNode = $('scanner');
 
-    if (scannerPanel) scannerPanel.hidden = false;
+    if (panel) panel.hidden = false;
 
-    text('cachedPairs', first(root.metadata && root.metadata.cachedPairs, 0));
-    text('candidateCount', candidates.length);
-    text('lastScanAt', date(first(scanner.lastScanAt, root.lastScanAt)));
+    setText(
+      'cachedPairs',
+      first(obj(root.metadata).cachedPairs, 0)
+    );
+    setText('candidateCount', candidates.length);
+    setText(
+      'lastScanAt',
+      date(first(scanner.lastScanAt, root.lastScanAt))
+    );
 
     const running = scanner.running === true;
-    const completed = number(progress.completed) || 0;
-    const total = number(progress.total) || number(scanner.pairs) || 24;
+    const completed = num(progress.completed) || 0;
+    const total = num(progress.total) || num(scanner.pairs) || 24;
 
     setBadge(
-      elements.scannerStatus,
+      el.scannerStatus,
       running
         ? `Scanning ${completed}/${total}`
         : candidates.length
-          ? `${candidates.length} qualified candidate(s)`
-          : 'No qualified signal',
+          ? `${candidates.length} candidate(s)`
+          : 'No qualified candidate',
       running
         ? 'status-badge status-unknown'
         : 'status-badge status-online'
     );
 
-    if (scannerPanel && scannerPanel.hidden) scannerPanel.hidden = false;
+    if (!scannerNode) return;
 
-    if (!scannerElement) return;
-    scannerElement.replaceChildren();
+    scannerNode.replaceChildren();
 
     if (!candidates.length) {
       const p = document.createElement('p');
       p.className = 'muted-text';
       p.textContent = running
-        ? `Background scan in progress: ${completed}/${total} pairs processed.`
-        : 'No candidate passed all evidence and freshness checks. NO TRADE is valid.';
-      scannerElement.appendChild(p);
+        ? `Scan in progress: ${completed}/${total} pairs checked.`
+        : 'No candidate passed the evidence and freshness checks. NO TRADE.';
+
+      scannerNode.appendChild(p);
       return;
     }
 
@@ -551,32 +782,26 @@
 
     for (const candidate of candidates.slice(0, 10)) {
       const li = document.createElement('li');
-      const strong = document.createElement('strong');
+      const title = document.createElement('strong');
+      const detail = document.createElement('p');
 
-      strong.textContent =
+      title.textContent =
         `${candidate.pair} · ${candidate.timeframe}m · ${candidate.signal}`;
 
-      const detail = document.createElement('p');
       detail.textContent =
-        `Evidence score: ${fmt(candidate.confidence, 0)}/100 · ${String(candidate.reason || 'Evidence review.')}`;
+        `Evidence score: ${fmt(candidate.confidence, 0)}/100 · ` +
+        `Data age: ${fmt(candidate.dataAgeSeconds, 0)} sec · ` +
+        String(candidate.reason || 'Evidence review.');
 
-      li.append(strong, detail);
+      li.append(title, detail);
       list.appendChild(li);
     }
 
-    scannerElement.appendChild(list);
-  }
-
-  function stopScanPolling() {
-    if (state.scanTimer) {
-      clearInterval(state.scanTimer);
-      state.scanTimer = null;
-    }
+    scannerNode.appendChild(list);
   }
 
   async function pollBackgroundScan() {
-    if (state.scanBusy) return;
-    state.scanBusy = true;
+    if (!state.scanBusy) return;
 
     try {
       const payload = await requestJson('/api/best');
@@ -585,164 +810,136 @@
       const scanner = obj(payload.scanner);
 
       if (scanner.running === true) {
-        text(
+        setText(
           'scanInfo',
-          `Background scan running: ${number(obj(scanner.progress).completed) || 0}/${number(obj(scanner.progress).total) || 24} pairs. You can continue analysing an individual pair.`
+          `Background scan running: ${num(obj(scanner.progress).completed) || 0}/24 pairs. You can continue analyzing a selected pair.`
         );
         return;
       }
 
-      stopScanPolling();
+      if (state.scanTimer) {
+        clearInterval(state.scanTimer);
+        state.scanTimer = null;
+      }
 
-      text(
-        'scanInfo',
-        `Background scan stopped or completed. Last scan: ${date(scanner.lastScanAt)}.`
+      state.scanBusy = false;
+
+      setBusy(
+        $('backgroundScanBtn'),
+        false,
+        '',
+        'Scan all 24 pairs in background'
       );
 
-      if (state.scanButton) {
-        state.scanButton.disabled = false;
-        state.scanButton.textContent = 'Scan all 24 pairs in background';
+      setText(
+        'scanInfo',
+        'Background scan stopped or completed. Review the candidate list and freshness.'
+      );
+
+      if (scanner.lastScanAt || payload.lastScanAt) {
+        renderScanner(payload);
       }
     } catch (error) {
-      text('scanInfo', `Could not refresh background scan status: ${error.message}`);
-    } finally {
-      state.scanBusy = false;
-    }
-  }
-
-  async function analyzeMarket() {
-    if (state.analysisBusy) return;
-
-    state.analysisBusy = true;
-    const sequence = ++state.requestSequence;
-
-    clearError();
-
-    const pair = elements.selectedPair ? elements.selectedPair.value : 'EUR/USD';
-    const timeframe = elements.timeframe ? elements.timeframe.value : '1';
-
-    if (elements.analyzeBtn) {
-      elements.analyzeBtn.disabled = true;
-      elements.analyzeBtn.textContent = 'Analysing selected pair…';
-    }
-
-    text('scanInfo', `Analysing ${pair} on the ${timeframe}-minute timeframe…`);
-
-    try {
-      const query = new URLSearchParams({ pair, timeframe });
-      const payload = await requestJson(`/api/analyze?${query.toString()}`);
-
-      if (sequence !== state.requestSequence) return;
-
-      renderMarket(payload);
-      renderUsage(payload.metadata);
-
-      const market = marketFrom(payload);
-      const signal = normalizeSignal(market);
-
-      if (isUnsafe(market)) {
-        text('scanInfo', `${pair} analysis returned, but the data is not fresh enough for a trade.`);
-      } else if (signal === 'NO TRADE') {
-        text('scanInfo', `${pair} analysis complete. Evidence did not qualify for a trade.`);
-      } else {
-        text('scanInfo', `${pair} analysis complete · ${signal} · evidence score ${fmt(market.confidence, 0)}/100.`);
-      }
-    } catch (error) {
-      showError(error.message || 'Unable to analyse this pair.');
-      text('scanInfo', 'Analysis failed. No new signal was generated.');
-      renderSignal('NO TRADE');
-      text('confidence', '—');
-      text('signalReason', 'No trade: the analysis request failed or data could not be verified.');
-      renderReasons([
-        error.message || 'Analysis request failed.',
-        'Do not infer a trade from a failed request.'
-      ]);
-    } finally {
-      state.analysisBusy = false;
-
-      if (elements.analyzeBtn) {
-        elements.analyzeBtn.disabled = false;
-        elements.analyzeBtn.textContent = 'Analyse selected pair';
-      }
+      setText(
+        'scanInfo',
+        `Could not refresh scanner status: ${String(error.message || error)}`
+      );
     }
   }
 
   async function startBackgroundScan() {
-    if (state.scanBusy) return;
+    if (state.scanBusy) {
+      showError('A background scan is already running.');
+      return;
+    }
 
     clearError();
 
-    if (state.scanButton) {
-      state.scanButton.disabled = true;
-      state.scanButton.textContent = 'Starting background scan…';
-    }
-
     try {
-      const payload = await requestJson('/api/scan', {
-        method: 'POST',
-        body: {},
-        timeoutMs: 10000
-      });
+      const current = await requestJson('/api/best');
+      const scanner = obj(current.scanner);
 
-      renderScanner(payload);
-      text(
-        'scanInfo',
-        'Background scan requested. You can analyse a selected pair without waiting for all 24 pairs.'
-      );
+      if (scanner.running === true) {
+        state.scanBusy = true;
+        showError(
+          'A scan is already running on the backend. Monitoring its progress.'
+        );
+      } else {
+        const started = await requestJson('/api/scan', {
+          method: 'POST',
+          body: {}
+        });
 
-      stopScanPolling();
-      state.scanTimer = setInterval(pollBackgroundScan, SCAN_POLL_INTERVAL_MS);
-      await pollBackgroundScan();
-    } catch (error) {
-      showError(error.message || 'Could not start the background scan.');
+        if (started.ok !== true) {
+          throw new Error(
+            first(started.error, 'The scan could not be started.')
+          );
+        }
 
-      if (state.scanButton) {
-        state.scanButton.disabled = false;
-        state.scanButton.textContent = 'Scan all 24 pairs in background';
+        state.scanBusy = true;
+        setText(
+          'scanInfo',
+          'Background scan started. Selected-pair analysis remains available separately.'
+        );
       }
 
-      text('scanInfo', 'Background scan was not started. You can still analyse one pair.');
+      setBusy(
+        $('backgroundScanBtn'),
+        true,
+        'Background scan running…',
+        'Scan all 24 pairs in background'
+      );
+
+      if (state.scanTimer) clearInterval(state.scanTimer);
+
+      state.scanTimer = setInterval(
+        pollBackgroundScan,
+        SCAN_POLL_INTERVAL_MS
+      );
+
+      await pollBackgroundScan();
+    } catch (error) {
+      showError(String(error.message || error));
+      state.scanBusy = false;
+
+      setBusy(
+        $('backgroundScanBtn'),
+        false,
+        '',
+        'Scan all 24 pairs in background'
+      );
     }
   }
 
   function bindEvents() {
-    const controlGrid = document.querySelector('.control-grid');
-    if (controlGrid) controlGrid.hidden = false;
+    addScanButton();
 
-    const controlHeading = document.querySelector(
-      '.control-panel .section-heading h2'
-    );
-    if (controlHeading) controlHeading.textContent = 'Quick selected-pair analysis';
-
-    const controlDescription = document.querySelector(
-      '.control-panel .section-heading p'
-    );
-    if (controlDescription) {
-      controlDescription.textContent =
-        'Analyse one forex pair first. The full 24-pair scan can run separately in the background.';
+    if (el.analyzeBtn) {
+      el.analyzeBtn.textContent = 'Analyze selected pair';
+      el.analyzeBtn.addEventListener(
+        'click',
+        analyzeSelectedPair
+      );
     }
 
-    if (elements.analyzeBtn) {
-      elements.analyzeBtn.textContent = 'Analyse selected pair';
-      elements.analyzeBtn.addEventListener('click', analyzeMarket);
+    if (el.selectedPair) {
+      el.selectedPair.addEventListener('change', () => {
+        setText('summaryPair', el.selectedPair.value);
+        setText(
+          'scanInfo',
+          `Selected ${el.selectedPair.value}. Press Analyze selected pair to refresh its analysis.`
+        );
+      });
     }
 
-    const controlPanel = document.querySelector('.control-panel');
-
-    if (controlPanel && !document.getElementById('backgroundScanBtn')) {
-      const button = document.createElement('button');
-      button.id = 'backgroundScanBtn';
-      button.type = 'button';
-      button.textContent = 'Scan all 24 pairs in background';
-      button.style.marginTop = '12px';
-      button.addEventListener('click', startBackgroundScan);
-
-      controlPanel.appendChild(button);
-      state.scanButton = button;
+    if (el.timeframe) {
+      el.timeframe.addEventListener('change', () => {
+        setText(
+          'scanInfo',
+          `Selected timeframe: ${el.timeframe.value} minute(s). Press Analyze selected pair to refresh.`
+        );
+      });
     }
-
-    const scannerPanel = document.querySelector('.scanner-panel');
-    if (scannerPanel) scannerPanel.hidden = false;
   }
 
   async function initialize() {
@@ -757,22 +954,58 @@
       const scanner = obj(current.scanner);
 
       if (scanner.running === true) {
-        text('scanInfo', 'A background scan is already running. You can analyse a selected pair now.');
-        state.scanTimer = setInterval(pollBackgroundScan, SCAN_POLL_INTERVAL_MS);
-      } else if (scanner.lastScanAt) {
-        text('scanInfo', `Previous full scan: ${date(scanner.lastScanAt)}. Select a pair to analyse it now.`);
-      } else {
-        text('scanInfo', 'Ready. Select a pair and press Analyse selected pair.');
+        state.scanBusy = true;
+
+        setBusy(
+          $('backgroundScanBtn'),
+          true,
+          'Background scan running…',
+          'Scan all 24 pairs in background'
+        );
+
+        state.scanTimer = setInterval(
+          pollBackgroundScan,
+          SCAN_POLL_INTERVAL_MS
+        );
       }
-    } catch {
-      text('scanInfo', 'API status could not be loaded. Check the backend connection.');
+
+      const market = marketFrom(current);
+
+      if (
+        market.pair &&
+        market.pair !== 'NO MARKET' &&
+        market.freshness
+      ) {
+        renderMarket(current);
+      } else {
+        setText(
+          'scanInfo',
+          'Ready. Choose a pair and press Analyze selected pair. Start the 24-pair scan separately if needed.'
+        );
+      }
+    } catch (error) {
+      setText(
+        'scanInfo',
+        `API data could not be loaded: ${String(error.message || error)}`
+      );
     }
 
-    setInterval(checkHealth, HEALTH_INTERVAL_MS);
+    if (state.healthTimer) {
+      clearInterval(state.healthTimer);
+    }
+
+    state.healthTimer = setInterval(
+      checkHealth,
+      HEALTH_INTERVAL_MS
+    );
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initialize, { once: true });
+    document.addEventListener(
+      'DOMContentLoaded',
+      initialize,
+      { once: true }
+    );
   } else {
     initialize();
   }
