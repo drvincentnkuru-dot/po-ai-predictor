@@ -8,8 +8,9 @@
   ).replace(/\/+$/, '');
 
   const HEALTH_INTERVAL_MS = 60000;
-  const SCAN_POLL_INTERVAL_MS = 2000;
-  const REQUEST_TIMEOUT_MS = 12000;
+  const SCAN_POLL_INTERVAL_MS = 2500;
+  const REQUEST_TIMEOUT_MS = 30000;
+  const HEALTH_TIMEOUT_MS = 12000;
   const MAX_DATA_AGE_SECONDS = 150;
   const MAX_REASONS = 10;
   const PAIR_COUNT = 24;
@@ -24,8 +25,7 @@
     healthTimer: null,
     lastMarket: null,
     lastHealth: null,
-    requestId: 0,
-    lastScanRequestAt: 0
+    requestId: 0
   };
 
   const el = {
@@ -93,30 +93,28 @@
   }
 
   function first(...values) {
-    return values.find(
-      value =>
-        value !== undefined &&
-        value !== null &&
-        value !== ''
+    return values.find(value =>
+      value !== undefined &&
+      value !== null &&
+      value !== ''
     );
   }
 
   function num(value) {
-    if (
-      value === null ||
-      value === undefined ||
-      value === ''
-    ) return null;
+    if (value === null || value === undefined || value === '') {
+      return null;
+    }
 
-    const n = Number(value);
-    return Number.isFinite(n) ? n : null;
+    const result = Number(value);
+    return Number.isFinite(result) ? result : null;
   }
 
   function fmt(value, digits = 5) {
-    const n = num(value);
-    if (n === null) return '—';
+    const valueNumber = num(value);
 
-    return n.toLocaleString(undefined, {
+    if (valueNumber === null) return '—';
+
+    return valueNumber.toLocaleString(undefined, {
       maximumFractionDigits: digits
     });
   }
@@ -124,11 +122,11 @@
   function date(value) {
     if (!value) return '—';
 
-    const d = new Date(value);
+    const parsed = new Date(value);
 
-    return Number.isNaN(d.getTime())
+    return Number.isNaN(parsed.getTime())
       ? String(value)
-      : d.toLocaleString();
+      : parsed.toLocaleString();
   }
 
   function setText(id, value, fallback = '—') {
@@ -164,7 +162,8 @@
 
   async function requestJson(path, options = {}) {
     const controller = new AbortController();
-    const timer = setTimeout(
+
+    const timeout = setTimeout(
       () => controller.abort(),
       options.timeout || REQUEST_TIMEOUT_MS
     );
@@ -175,11 +174,11 @@
         cache: 'no-store',
         headers: {
           Accept: 'application/json',
-          ...(options.body
+          ...(options.body !== undefined
             ? { 'Content-Type': 'application/json' }
             : {})
         },
-        ...(options.body
+        ...(options.body !== undefined
           ? { body: JSON.stringify(options.body) }
           : {}),
         signal: controller.signal
@@ -213,14 +212,17 @@
       return payload;
     } catch (error) {
       if (error.name === 'AbortError') {
-        throw new Error(
-          'Request timed out. No new signal was confirmed.'
+        const timeoutError = new Error(
+          'API request timed out. No new signal was confirmed.'
         );
+
+        timeoutError.code = 'REQUEST_TIMEOUT';
+        throw timeoutError;
       }
 
       throw error;
     } finally {
-      clearTimeout(timer);
+      clearTimeout(timeout);
     }
   }
 
@@ -241,12 +243,14 @@
   }
 
   function getSignal(market) {
+    const signalObject = obj(market.signal);
+
     const raw = String(
       typeof market.signal === 'string'
         ? market.signal
         : first(
-            obj(market.signal).action,
-            obj(market.signal).direction,
+            signalObject.action,
+            signalObject.direction,
             market.action,
             market.direction,
             'NO TRADE'
@@ -256,35 +260,63 @@
     if (
       market.noTrade === true ||
       market.tradeAllowed === false ||
-      obj(market.signal).noTrade === true ||
-      obj(market.signal).tradeAllowed === false
+      signalObject.noTrade === true ||
+      signalObject.tradeAllowed === false
     ) {
       return 'NO TRADE';
     }
 
-    if (['CALL', 'BUY', 'UP', 'BULLISH'].includes(raw)) {
+    if (['BUY', 'CALL', 'UP', 'BULLISH'].includes(raw)) {
       return 'BUY';
     }
 
-    if (['PUT', 'SELL', 'DOWN', 'BEARISH'].includes(raw)) {
+    if (['SELL', 'PUT', 'DOWN', 'BEARISH'].includes(raw)) {
       return 'SELL';
     }
 
     return 'NO TRADE';
   }
 
-  function isUnsafe(market) {
+  function isFreshMarket(market) {
     const age = num(market.dataAgeSeconds);
     const freshness = String(
       first(market.freshness, 'UNKNOWN')
     ).toUpperCase();
 
+    const currentPrice = num(market.currentPrice);
+    const entryPrice = num(market.entryPrice);
+
     return (
-      freshness !== 'FRESH' ||
-      age === null ||
-      age < 0 ||
-      age > MAX_DATA_AGE_SECONDS ||
-      market.insufficientData === true
+      freshness === 'FRESH' &&
+      age !== null &&
+      age >= 0 &&
+      age <= MAX_DATA_AGE_SECONDS &&
+      currentPrice !== null &&
+      currentPrice > 0 &&
+      entryPrice !== null &&
+      entryPrice > 0 &&
+      market.insufficientData !== true &&
+      market.tradeAllowed !== false &&
+      market.noTrade !== true
+    );
+  }
+
+  function isQualifiedCandidate(candidate) {
+    const signal = getSignal(candidate);
+
+    const age = num(candidate.dataAgeSeconds);
+    const freshness = String(
+      first(candidate.freshness, 'UNKNOWN')
+    ).toUpperCase();
+
+    return (
+      (signal === 'BUY' || signal === 'SELL') &&
+      freshness === 'FRESH' &&
+      age !== null &&
+      age >= 0 &&
+      age <= MAX_DATA_AGE_SECONDS &&
+      candidate.noTrade !== true &&
+      candidate.tradeAllowed !== false
     );
   }
 
@@ -356,9 +388,9 @@
     }
 
     for (const reason of items) {
-      const li = document.createElement('li');
-      li.textContent = String(reason);
-      el.reasons.appendChild(li);
+      const item = document.createElement('li');
+      item.textContent = String(reason);
+      el.reasons.appendChild(item);
     }
   }
 
@@ -388,7 +420,8 @@
     state.lastHealth = health;
 
     const online =
-      health.ok === true &&
+      root.ok !== false &&
+      health.ok !== false &&
       health.configured === true;
 
     setBadge(
@@ -409,6 +442,7 @@
   function renderMarket(payload) {
     const root = obj(payload);
     const market = marketFrom(root);
+
     const indicators = indicatorsFrom(market);
     const macd = obj(indicators.macd);
     const stochastic = obj(indicators.stochastic);
@@ -435,13 +469,11 @@
       first(market.freshness, 'UNKNOWN')
     ).toUpperCase();
 
-    const unsafe = isUnsafe(market);
+    const safe = isFreshMarket(market);
 
     setText(
       'freshness',
-      unsafe && freshness === 'FRESH'
-        ? 'CHECK DATA'
-        : freshness
+      safe ? freshness : `NOT VERIFIED · ${freshness}`
     );
 
     setText(
@@ -455,23 +487,21 @@
 
     setBadge(
       el.marketStatus,
-      unsafe
-        ? 'Market status: verify data'
-        : 'Market status: fresh provider data',
-      unsafe
-        ? 'status-badge status-unknown'
-        : 'status-badge status-online'
+      safe
+        ? 'Market status: fresh provider data'
+        : 'Market status: verify data',
+      safe
+        ? 'status-badge status-online'
+        : 'status-badge status-unknown'
     );
 
     renderTrend(first(
-      market.trendLine?.direction,
+      obj(market.trendLine).direction,
       market.priceAction,
       'UNKNOWN'
     ));
 
-    let signal = getSignal(market);
-
-    if (unsafe) signal = 'NO TRADE';
+    const signal = safe ? getSignal(market) : 'NO TRADE';
 
     renderSignal(signal);
 
@@ -497,6 +527,7 @@
       'rsi',
       fmt(first(indicators.rsi14, indicators.rsi), 2)
     );
+
     setText(
       'rsiCross',
       `RSI 14: ${first(indicators.rsiZone, '—')}`
@@ -504,10 +535,12 @@
 
     setText('macdLine', fmt(macd.line, 6));
     setText('macdSignal', fmt(macd.signal, 6));
+
     setText(
       'macdHistogram',
       `Histogram: ${fmt(macd.histogram, 6)}`
     );
+
     setText(
       'macdCross',
       `MACD: ${first(macd.crossover, '—')}`
@@ -515,6 +548,7 @@
 
     setText('stochK', fmt(stochastic.k, 2));
     setText('stochD', fmt(stochastic.d, 2));
+
     setText(
       'stochasticCross',
       `Stochastic: ${first(stochastic.crossover, '—')}`
@@ -549,7 +583,7 @@
     setText(
       'priceAction',
       first(
-        market.trendLine?.description,
+        obj(market.trendLine).description,
         market.priceAction,
         'Trend-line analysis unavailable.'
       )
@@ -563,13 +597,13 @@
       )
     );
 
-    let reasons = Array.isArray(market.reasons)
+    const reasons = Array.isArray(market.reasons)
       ? market.reasons.slice()
       : [];
 
-    if (unsafe) {
+    if (!safe) {
       reasons.unshift(
-        'NO TRADE: data freshness or sufficiency could not be verified.'
+        'NO TRADE: data freshness, price validity, or sufficiency could not be verified.'
       );
     }
 
@@ -583,13 +617,13 @@
 
     setText(
       'signalReason',
-      unsafe
+      !safe
         ? 'NO TRADE — data freshness or sufficiency has not been confirmed.'
         : first(
             obj(market.signal).reason,
             market.reason,
             reasons[0],
-            'Evidence score, not win probability.'
+            'Evidence score, not win probability. No guaranteed outcomes.'
           )
     );
 
@@ -601,45 +635,14 @@
     );
   }
 
-  async function checkHealth() {
-    if (state.healthBusy) return;
+  function getQualifiedCandidates(payload) {
+    const root = obj(payload);
 
-    state.healthBusy = true;
+    const candidates = Array.isArray(root.rankedCandidates)
+      ? root.rankedCandidates
+      : [];
 
-    try {
-      renderHealth(await requestJson('/api/health'));
-    } catch {
-      setBadge(
-        el.backendStatus,
-        'API offline / unavailable',
-        'status-badge status-offline'
-      );
-    } finally {
-      state.healthBusy = false;
-    }
-  }
-
-  function setBusy(button, busy, busyText, normalText) {
-    if (!button) return;
-
-    button.disabled = busy;
-    button.textContent = busy ? busyText : normalText;
-  }
-
-  function ensureScanButton() {
-    let button = $('backgroundScanBtn');
-
-    if (!button) {
-      button = document.createElement('button');
-      button.id = 'backgroundScanBtn';
-      button.type = 'button';
-      button.textContent = 'Scan all 24 pairs';
-      button.style.marginTop = '10px';
-
-      el.analyzeBtn?.insertAdjacentElement('afterend', button);
-    }
-
-    button.addEventListener('click', analyzeAllPairs);
+    return candidates.filter(isQualifiedCandidate);
   }
 
   function renderScanner(payload) {
@@ -647,19 +650,18 @@
     const scanner = obj(root.scanner);
     const progress = obj(scanner.progress);
 
-    const candidates = Array.isArray(root.rankedCandidates)
+    const allCandidates = Array.isArray(root.rankedCandidates)
       ? root.rankedCandidates
       : [];
+
+    const qualified = getQualifiedCandidates(root);
 
     const panel = document.querySelector('.scanner-panel');
     const scannerNode = $('scanner');
 
     if (panel) panel.hidden = false;
 
-    setText(
-      'candidateCount',
-      candidates.length
-    );
+    setText('candidateCount', qualified.length);
 
     setText(
       'lastScanAt',
@@ -674,58 +676,106 @@
       el.scannerStatus,
       running
         ? `Scanning ${completed}/${total}`
-        : candidates.length
-          ? `${candidates.length} candidate(s)`
-          : 'No qualified candidate',
+        : qualified.length
+          ? `${qualified.length} qualified signal(s)`
+          : 'No qualified signal',
       running
         ? 'status-badge status-unknown'
-        : 'status-badge status-online'
+        : qualified.length
+          ? 'status-badge status-online'
+          : 'status-badge status-unknown'
     );
 
     if (!scannerNode) return;
 
     scannerNode.replaceChildren();
 
-    if (!candidates.length) {
-      const p = document.createElement('p');
-      p.className = 'muted-text';
-      p.textContent = running
-        ? `Scanning in background: ${completed}/${total} pairs.`
-        : 'No candidate passed the evidence and freshness checks. NO TRADE.';
+    if (!qualified.length) {
+      const paragraph = document.createElement('p');
+      paragraph.className = 'muted-text';
 
-      scannerNode.appendChild(p);
+      paragraph.textContent = running
+        ? `Scan in progress: ${completed}/${total} pairs checked. No qualified BUY/SELL signal is confirmed yet.`
+        : allCandidates.length
+          ? 'No candidate passed the signal and freshness checks. NO TRADE.'
+          : 'No market results are available yet. Press Analyze to request a scan.';
+
+      scannerNode.appendChild(paragraph);
       return;
     }
 
     const list = document.createElement('ol');
     list.className = 'candidate-list';
 
-    for (const candidate of candidates.slice(0, 10)) {
-      const li = document.createElement('li');
+    for (const candidate of qualified.slice(0, 10)) {
+      const item = document.createElement('li');
       const title = document.createElement('strong');
       const detail = document.createElement('p');
 
-      const signal = String(candidate.signal || '').toUpperCase();
-      const safeSignal =
-        signal === 'CALL' || signal === 'BUY'
-          ? 'BUY'
-          : signal === 'PUT' || signal === 'SELL'
-            ? 'SELL'
-            : 'NO TRADE';
+      const signal = getSignal(candidate);
 
       title.textContent =
-        `${candidate.pair} · 1m · ${safeSignal}`;
+        `${candidate.pair || 'Unknown pair'} · 1m · ${signal}`;
 
       detail.textContent =
         `Evidence score: ${fmt(candidate.confidence, 0)}/100 · ` +
         `Data age: ${fmt(candidate.dataAgeSeconds, 0)} sec · ` +
         String(candidate.reason || 'Evidence review.');
 
-      li.append(title, detail);
-      list.appendChild(li);
+      item.append(title, detail);
+      list.appendChild(item);
     }
 
     scannerNode.appendChild(list);
+  }
+
+  function setBusy(button, busy, busyText, normalText) {
+    if (!button) return;
+
+    button.disabled = busy;
+    button.textContent = busy ? busyText : normalText;
+  }
+
+  function setScanBusy(busy) {
+    state.scanBusy = busy;
+
+    setBusy(
+      $('backgroundScanBtn'),
+      busy,
+      'Scan running…',
+      'Scan all 24 pairs'
+    );
+  }
+
+  function stopPolling() {
+    if (state.scanTimer) {
+      clearInterval(state.scanTimer);
+      state.scanTimer = null;
+    }
+
+    setScanBusy(false);
+  }
+
+  async function checkHealth() {
+    if (state.healthBusy) return;
+
+    state.healthBusy = true;
+
+    try {
+      const payload = await requestJson('/api/health', {
+        timeout: HEALTH_TIMEOUT_MS
+      });
+
+      renderHealth(payload);
+    } catch {
+      setBadge(
+        el.backendStatus,
+        'API offline / unavailable',
+        'status-badge status-offline'
+      );
+    } finally {
+      state.healthBusy = false;
+    }
   }
 
   async function pollScan() {
@@ -733,6 +783,7 @@
 
     try {
       const payload = await requestJson('/api/best');
+
       renderScanner(payload);
 
       const scanner = obj(payload.scanner);
@@ -741,39 +792,61 @@
       if (scanner.running === true) {
         setText(
           'scanInfo',
-          `Scanning ${num(progress.completed) || 0}/${num(progress.total) || PAIR_COUNT} pairs. Waiting for completed results.`
+          `Scanning ${num(progress.completed) || 0}/${num(progress.total) || PAIR_COUNT} pairs. Results update as data becomes available.`
         );
+
         return;
       }
 
-      if (state.scanTimer) {
-        clearInterval(state.scanTimer);
-        state.scanTimer = null;
-      }
+      stopPolling();
 
-      state.scanBusy = false;
-
-      setBusy(
-        $('backgroundScanBtn'),
-        false,
-        '',
-        'Scan all 24 pairs'
-      );
+      const diagnostic = obj(payload.diagnostic);
 
       setText(
         'scanInfo',
-        'Scan stopped or completed. Check candidate freshness before acting.'
+        diagnostic.lastScanError
+          ? `Scan ended with provider errors: ${diagnostic.lastScanError}`
+          : 'Scan stopped or completed. Only fresh, qualified signals are shown.'
       );
     } catch (error) {
       setText(
         'scanInfo',
-        `Could not refresh scan status: ${String(error.message || error)}`
+        `Scan status temporarily unavailable: ${String(error.message || error)}`
       );
     }
   }
 
+  function startPolling() {
+    if (state.scanTimer) {
+      clearInterval(state.scanTimer);
+    }
+
+    setScanBusy(true);
+
+    state.scanTimer = setInterval(
+      pollScan,
+      SCAN_POLL_INTERVAL_MS
+    );
+
+    pollScan();
+  }
+
+  async function loadLatestResults() {
+    const payload = await requestJson('/api/best');
+
+    renderScanner(payload);
+
+    const market = marketFrom(payload);
+
+    if (market.pair && market.pair !== 'NO MARKET') {
+      renderMarket(payload);
+    }
+
+    return payload;
+  }
+
   async function analyzeAllPairs() {
-    if (state.analysisBusy || state.scanBusy) return;
+    if (state.analysisBusy) return;
 
     state.analysisBusy = true;
     const requestId = ++state.requestId;
@@ -783,38 +856,34 @@
     setBusy(
       el.analyzeBtn,
       true,
-      'Analyzing 24 pairs…',
+      'Analyzing…',
       'Analyze all 24 pairs'
-    );
-
-    setBusy(
-      $('backgroundScanBtn'),
-      true,
-      'Scan running…',
-      'Scan all 24 pairs'
     );
 
     setText(
       'scanInfo',
-      'Loading the latest available candidates and starting the 24-pair scan if permitted.'
+      'Loading the latest available results before requesting a scan.'
     );
 
     try {
-      // Display the latest stored analysis immediately when available.
+      // First show cached results without waiting for a full scan.
       try {
-        const current = await requestJson('/api/best');
+        const current = await loadLatestResults();
 
         if (requestId !== state.requestId) return;
 
-        renderScanner(current);
+        if (obj(current.scanner).running === true) {
+          startPolling();
 
-        const market = marketFrom(current);
+          setText(
+            'scanInfo',
+            'A scan is already running. Showing available results while it continues.'
+          );
 
-        if (market.pair && market.pair !== 'NO MARKET') {
-          renderMarket(current);
+          return;
         }
       } catch {
-        // Continue and attempt to start a scan.
+        // Continue and attempt to request a scan.
       }
 
       try {
@@ -824,55 +893,53 @@
           timeout: REQUEST_TIMEOUT_MS
         });
 
-        state.scanBusy = true;
-        state.lastScanRequestAt = Date.now();
+        if (requestId !== state.requestId) return;
 
-        setText(
-          'scanInfo',
-          first(
-            started.message,
-            'The 24-pair scan has started in the background.'
-          )
-        );
-      } catch (error) {
-        // HTTP 409 means a scan is already running.
-        if (error.status === 409) {
-          state.scanBusy = true;
+        if (started.ok === true) {
+          startPolling();
+
           setText(
             'scanInfo',
-            'A 24-pair scan is already running. Monitoring its progress.'
+            first(
+              started.message,
+              'The 24-pair scan started in the background.'
+            )
           );
         } else {
-          // A cooldown response may still leave usable previous candidates.
-          if (error.status === 429) {
-            const current = await requestJson('/api/best');
-            renderScanner(current);
-
-            const market = marketFrom(current);
-
-            if (market.pair && market.pair !== 'NO MARKET') {
-              renderMarket(current);
-            }
-
-            setText(
-              'scanInfo',
-              'A new scan is not available yet. Showing the latest stored results; they may not be new.'
-            );
-          } else {
-            throw error;
-          }
+          setText(
+            'scanInfo',
+            first(
+              started.message,
+              'A new scan could not be started.'
+            )
+          );
         }
-      }
+      } catch (error) {
+        if (error.status === 409) {
+          startPolling();
 
-      if (state.scanBusy) {
-        if (state.scanTimer) clearInterval(state.scanTimer);
+          setText(
+            'scanInfo',
+            'A full scan is already running. Monitoring its progress.'
+          );
+        } else if (error.status === 429) {
+          // Cooldown or daily credits: keep the latest results visible.
+          try {
+            await loadLatestResults();
+          } catch {
+            // Preserve the original cooldown message.
+          }
 
-        state.scanTimer = setInterval(
-          pollScan,
-          SCAN_POLL_INTERVAL_MS
-        );
-
-        await pollScan();
+          setText(
+            'scanInfo',
+            first(
+              error.message,
+              'A new scan is not available yet. Stored results may not be new.'
+            )
+          );
+        } else {
+          throw error;
+        }
       }
     } catch (error) {
       showError(String(error.message || error));
@@ -892,37 +959,52 @@
         '',
         'Analyze all 24 pairs'
       );
+    }
+  }
 
-      if (!state.scanBusy) {
-        setBusy(
-          $('backgroundScanBtn'),
-          false,
-          '',
-          'Scan all 24 pairs'
-        );
-      }
+  function ensureScanButton() {
+    let button = $('backgroundScanBtn');
+
+    if (!button) {
+      button = document.createElement('button');
+      button.id = 'backgroundScanBtn';
+      button.type = 'button';
+      button.textContent = 'Scan all 24 pairs';
+      button.style.marginTop = '10px';
+
+      el.analyzeBtn?.insertAdjacentElement('afterend', button);
+    }
+
+    if (button.dataset.listenerAttached !== 'true') {
+      button.addEventListener('click', analyzeAllPairs);
+      button.dataset.listenerAttached = 'true';
     }
   }
 
   function bindEvents() {
     ensureScanButton();
 
-    if (el.analyzeBtn) {
+    if (el.analyzeBtn &&
+        el.analyzeBtn.dataset.listenerAttached !== 'true') {
       el.analyzeBtn.textContent = 'Analyze all 24 pairs';
       el.analyzeBtn.addEventListener('click', analyzeAllPairs);
+      el.analyzeBtn.dataset.listenerAttached = 'true';
     }
 
-    if (el.selectedPair) {
+    if (el.selectedPair &&
+        el.selectedPair.dataset.listenerAttached !== 'true') {
       el.selectedPair.addEventListener('change', () => {
         setText(
           'scanInfo',
-          `Selected pair: ${el.selectedPair.value}. The Analyze button scans all 24 pairs.`
+          `Selected pair: ${el.selectedPair.value}. Analyze reviews the available 24-pair results.`
         );
       });
+
+      el.selectedPair.dataset.listenerAttached = 'true';
     }
 
     if (el.timeframe) {
-      // This strategy uses 1-minute candles only.
+      // This strategy uses completed 1-minute candles only.
       el.timeframe.value = '1';
       el.timeframe.disabled = true;
     }
@@ -934,40 +1016,20 @@
     await checkHealth();
 
     try {
-      const current = await requestJson('/api/best');
-
-      renderScanner(current);
-
+      const current = await loadLatestResults();
       const scanner = obj(current.scanner);
 
       if (scanner.running === true) {
-        state.scanBusy = true;
+        startPolling();
 
-        setBusy(
-          $('backgroundScanBtn'),
-          true,
-          'Scan running…',
-          'Scan all 24 pairs'
+        setText(
+          'scanInfo',
+          'A scan is already running. Showing results as they update.'
         );
-
-        state.scanTimer = setInterval(
-          pollScan,
-          SCAN_POLL_INTERVAL_MS
-        );
-      }
-
-      const market = marketFrom(current);
-
-      if (
-        market.pair &&
-        market.pair !== 'NO MARKET' &&
-        market.freshness
-      ) {
-        renderMarket(current);
       } else {
         setText(
           'scanInfo',
-          'Ready. Press Analyze all 24 pairs to review available results and start a scan.'
+          'Ready. Press Analyze all 24 pairs to review available results and request a scan.'
         );
       }
     } catch (error) {
