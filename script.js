@@ -8,10 +8,11 @@
   ).replace(/\/+$/, '');
 
   const HEALTH_INTERVAL_MS = 60000;
-  const SCAN_POLL_INTERVAL_MS = 5000;
-  const REQUEST_TIMEOUT_MS = 90000;
-  const MAX_DATA_AGE_SECONDS = 300;
+  const SCAN_POLL_INTERVAL_MS = 2000;
+  const REQUEST_TIMEOUT_MS = 12000;
+  const MAX_DATA_AGE_SECONDS = 150;
   const MAX_REASONS = 10;
+  const PAIR_COUNT = 24;
 
   const $ = id => document.getElementById(id);
 
@@ -23,7 +24,8 @@
     healthTimer: null,
     lastMarket: null,
     lastHealth: null,
-    requestId: 0
+    requestId: 0,
+    lastScanRequestAt: 0
   };
 
   const el = {
@@ -51,10 +53,8 @@
     ema9: $('ema9'),
     ema21: $('ema21'),
     emaCross: $('emaCross'),
-    trend5m: $('trend5m'),
     rsi: $('rsi'),
     rsiCross: $('rsiCross'),
-    adx: $('adx'),
     macdLine: $('macdLine'),
     macdSignal: $('macdSignal'),
     macdHistogram: $('macdHistogram'),
@@ -62,11 +62,9 @@
     stochK: $('stochK'),
     stochD: $('stochD'),
     stochasticCross: $('stochasticCross'),
-    atr: $('atr'),
     bollingerUpper: $('bollingerUpper'),
     bollingerMiddle: $('bollingerMiddle'),
     bollingerLower: $('bollingerLower'),
-    ema21_5m: $('ema21_5m'),
     support: $('support'),
     resistance: $('resistance'),
     volatility: $('volatility'),
@@ -131,15 +129,6 @@
     return Number.isNaN(d.getTime())
       ? String(value)
       : d.toLocaleString();
-  }
-
-  function ageLabel(value) {
-    const n = num(value);
-
-    if (n === null || n < 0) return 'Age: unavailable';
-    if (n < 60) return `Age: ${Math.round(n)} sec`;
-
-    return `Age: ${Math.floor(n / 60)} min ${Math.round(n % 60)} sec`;
   }
 
   function setText(id, value, fallback = '—') {
@@ -208,20 +197,24 @@
       }
 
       if (!response.ok || payload.ok === false) {
-        throw new Error(
+        const error = new Error(
           first(
             payload.error,
             payload.message,
             `Request failed (HTTP ${response.status}).`
           )
         );
+
+        error.status = response.status;
+        error.payload = payload;
+        throw error;
       }
 
       return payload;
     } catch (error) {
       if (error.name === 'AbortError') {
         throw new Error(
-          'The request timed out. No new signal was confirmed.'
+          'Request timed out. No new signal was confirmed.'
         );
       }
 
@@ -248,34 +241,33 @@
   }
 
   function getSignal(market) {
-    const signalObject = obj(market.signal);
+    const raw = String(
+      typeof market.signal === 'string'
+        ? market.signal
+        : first(
+            obj(market.signal).action,
+            obj(market.signal).direction,
+            market.action,
+            market.direction,
+            'NO TRADE'
+          )
+    ).toUpperCase().trim();
 
     if (
       market.noTrade === true ||
       market.tradeAllowed === false ||
-      signalObject.noTrade === true ||
-      signalObject.tradeAllowed === false
+      obj(market.signal).noTrade === true ||
+      obj(market.signal).tradeAllowed === false
     ) {
       return 'NO TRADE';
     }
 
-    const raw = String(first(
-      typeof market.signal === 'string'
-        ? market.signal
-        : null,
-      signalObject.action,
-      signalObject.direction,
-      market.action,
-      market.direction,
-      'NO TRADE'
-    )).toUpperCase().trim();
-
     if (['CALL', 'BUY', 'UP', 'BULLISH'].includes(raw)) {
-      return 'CALL';
+      return 'BUY';
     }
 
     if (['PUT', 'SELL', 'DOWN', 'BEARISH'].includes(raw)) {
-      return 'PUT';
+      return 'SELL';
     }
 
     return 'NO TRADE';
@@ -297,16 +289,16 @@
   }
 
   function renderSignal(signal) {
-    if (signal === 'CALL') {
+    if (signal === 'BUY') {
       setBadge(
         el.signalBadge,
-        'CALL',
+        'BUY',
         'signal-badge signal-call'
       );
-    } else if (signal === 'PUT') {
+    } else if (signal === 'SELL') {
       setBadge(
         el.signalBadge,
-        'PUT',
+        'SELL',
         'signal-badge signal-put'
       );
     } else {
@@ -321,13 +313,21 @@
   function renderTrend(value) {
     const trend = String(value || 'UNKNOWN').toUpperCase();
 
-    if (trend.includes('BULL') || trend === 'UP') {
+    if (
+      trend.includes('BULL') ||
+      trend.includes('BUYER') ||
+      trend === 'UP'
+    ) {
       setBadge(
         el.trendBadge,
         'Trend: BULLISH',
         'trend-badge trend-up'
       );
-    } else if (trend.includes('BEAR') || trend === 'DOWN') {
+    } else if (
+      trend.includes('BEAR') ||
+      trend.includes('SELLER') ||
+      trend === 'DOWN'
+    ) {
       setBadge(
         el.trendBadge,
         'Trend: BEARISH',
@@ -369,6 +369,7 @@
       'providerName',
       first(meta.provider, 'Twelve Data LIVE')
     );
+
     setText('providerRequests', meta.providerRequests);
     setText('dailyCreditsUsed', meta.dailyCreditsUsed);
     setText('dailyCreditsRemaining', meta.dailyCreditsRemaining);
@@ -386,7 +387,9 @@
 
     state.lastHealth = health;
 
-    const online = health.ok === true && health.configured === true;
+    const online =
+      health.ok === true &&
+      health.configured === true;
 
     setBadge(
       el.backendStatus,
@@ -411,6 +414,7 @@
     const stochastic = obj(indicators.stochastic);
     const bands = obj(indicators.bollinger);
     const levels = obj(market.supportResistance);
+    const pattern = market.candlePattern;
 
     state.lastMarket = market;
 
@@ -419,12 +423,6 @@
       el.selectedPair?.value,
       'NO MARKET'
     ));
-
-    const timeframe = first(
-      market.timeframe,
-      el.timeframe?.value,
-      '—'
-    );
 
     setText('summaryPair', pair);
     setText('currentPrice', fmt(market.currentPrice));
@@ -446,7 +444,14 @@
         : freshness
     );
 
-    setText('dataAge', ageLabel(age));
+    setText(
+      'dataAge',
+      age === null
+        ? 'Age: unavailable'
+        : age < 60
+          ? `Age: ${Math.round(age)} sec`
+          : `Age: ${Math.floor(age / 60)} min ${Math.round(age % 60)} sec`
+    );
 
     setBadge(
       el.marketStatus,
@@ -458,7 +463,11 @@
         : 'status-badge status-online'
     );
 
-    renderTrend(first(indicators.trend5m, 'UNKNOWN'));
+    renderTrend(first(
+      market.trendLine?.direction,
+      market.priceAction,
+      'UNKNOWN'
+    ));
 
     let signal = getSignal(market);
 
@@ -470,7 +479,7 @@
       'confidence',
       signal === 'NO TRADE'
         ? '—'
-        : fmt(market.confidence, 0)
+        : `${fmt(market.confidence, 0)}/100`
     );
 
     setText('callScore', fmt(market.callScore, 0));
@@ -481,24 +490,16 @@
     setText('ema21', fmt(indicators.ema21));
     setText(
       'emaCross',
-      `Crossover: ${first(indicators.emaCross, '—')}`
-    );
-    setText(
-      'trend5m',
-      `5m trend: ${first(indicators.trend5m, '—')}`
+      `EMA crossover: ${first(indicators.emaCross, '—')}`
     );
 
     setText(
       'rsi',
-      fmt(first(indicators.rsi9, indicators.rsi), 2)
+      fmt(first(indicators.rsi14, indicators.rsi), 2)
     );
     setText(
       'rsiCross',
-      `RSI cross: ${first(indicators.rsiCross, '—')}`
-    );
-    setText(
-      'adx',
-      fmt(first(indicators.adx14, indicators.adx), 2)
+      `RSI 14: ${first(indicators.rsiZone, '—')}`
     );
 
     setText('macdLine', fmt(macd.line, 6));
@@ -509,33 +510,27 @@
     );
     setText(
       'macdCross',
-      `MACD cross: ${first(macd.crossover, '—')}`
+      `MACD: ${first(macd.crossover, '—')}`
     );
 
     setText('stochK', fmt(stochastic.k, 2));
     setText('stochD', fmt(stochastic.d, 2));
     setText(
       'stochasticCross',
-      `Stochastic cross: ${first(stochastic.crossover, '—')}`
+      `Stochastic: ${first(stochastic.crossover, '—')}`
     );
 
-    setText('atr', fmt(first(indicators.atr14, indicators.atr)));
     setText('bollingerUpper', fmt(bands.upper));
-    setText(
-      'bollingerMiddle',
-      fmt(first(bands.middle, bands.mid))
-    );
+    setText('bollingerMiddle', fmt(bands.middle));
     setText('bollingerLower', fmt(bands.lower));
-    setText('ema21_5m', fmt(indicators.ema21_5m));
 
     setText('support', fmt(levels.support));
     setText('resistance', fmt(levels.resistance));
+
     setText(
       'volatility',
-      first(market.volatility, 'UNKNOWN')
+      first(market.volatility, 'NOT USED')
     );
-
-    const pattern = market.candlePattern;
 
     setText(
       'candlePattern',
@@ -554,8 +549,9 @@
     setText(
       'priceAction',
       first(
+        market.trendLine?.description,
         market.priceAction,
-        'Price-action interpretation unavailable.'
+        'Trend-line analysis unavailable.'
       )
     );
 
@@ -573,7 +569,7 @@
 
     if (unsafe) {
       reasons.unshift(
-        'NO TRADE: freshness or data sufficiency could not be verified.'
+        'NO TRADE: data freshness or sufficiency could not be verified.'
       );
     }
 
@@ -593,7 +589,7 @@
             obj(market.signal).reason,
             market.reason,
             reasons[0],
-            'Review all indicators before making a decision.'
+            'Evidence score, not win probability.'
           )
     );
 
@@ -601,7 +597,7 @@
 
     setText(
       'scanInfo',
-      `${pair} · ${timeframe}m · individual analysis completed`
+      `${pair} · 1m · latest available analysis`
     );
   }
 
@@ -623,25 +619,6 @@
     }
   }
 
-  function addScanButton() {
-    if ($('backgroundScanBtn')) return;
-
-    const button = document.createElement('button');
-    button.id = 'backgroundScanBtn';
-    button.type = 'button';
-    button.textContent = 'Scan all 24 pairs in background';
-    button.style.marginTop = '10px';
-
-    button.addEventListener('click', startBackgroundScan);
-
-    if (el.analyzeBtn?.parentElement) {
-      el.analyzeBtn.insertAdjacentElement('afterend', button);
-    } else {
-      document.querySelector('.control-panel')
-        ?.appendChild(button);
-    }
-  }
-
   function setBusy(button, busy, busyText, normalText) {
     if (!button) return;
 
@@ -649,77 +626,20 @@
     button.textContent = busy ? busyText : normalText;
   }
 
-  async function analyzeSelectedPair() {
-    if (state.analysisBusy) return;
+  function ensureScanButton() {
+    let button = $('backgroundScanBtn');
 
-    const pair = String(
-      el.selectedPair?.value || ''
-    ).trim().toUpperCase();
+    if (!button) {
+      button = document.createElement('button');
+      button.id = 'backgroundScanBtn';
+      button.type = 'button';
+      button.textContent = 'Scan all 24 pairs';
+      button.style.marginTop = '10px';
 
-    const timeframe = String(
-      el.timeframe?.value || '1'
-    );
-
-    if (!pair || !['1', '2', '3'].includes(timeframe)) {
-      showError('Choose a valid currency pair and timeframe.');
-      return;
+      el.analyzeBtn?.insertAdjacentElement('afterend', button);
     }
 
-    state.analysisBusy = true;
-    const requestId = ++state.requestId;
-
-    clearError();
-    setBusy(
-      el.analyzeBtn,
-      true,
-      'Analyzing selected pair…',
-      'Analyze selected pair'
-    );
-
-    setText(
-      'scanInfo',
-      `Requesting ${pair} · ${timeframe}m analysis. The 24-pair scan is separate.`
-    );
-
-    try {
-      const query = new URLSearchParams({
-        pair,
-        timeframe
-      });
-
-      const payload = await requestJson(
-        `/api/analyze?${query.toString()}`
-      );
-
-      if (requestId !== state.requestId) return;
-
-      const market = marketFrom(payload);
-
-      if (!market.pair) {
-        throw new Error(
-          'The API response did not include the selected market.'
-        );
-      }
-
-      renderMarket(payload);
-    } catch (error) {
-      if (requestId === state.requestId) {
-        showError(String(error.message || error));
-        setText(
-          'signalReason',
-          'Analysis failed. Do not infer a CALL or PUT from an error.'
-        );
-        renderSignal('NO TRADE');
-      }
-    } finally {
-      state.analysisBusy = false;
-      setBusy(
-        el.analyzeBtn,
-        false,
-        '',
-        'Analyze selected pair'
-      );
-    }
+    button.addEventListener('click', analyzeAllPairs);
   }
 
   function renderScanner(payload) {
@@ -737,10 +657,10 @@
     if (panel) panel.hidden = false;
 
     setText(
-      'cachedPairs',
-      first(obj(root.metadata).cachedPairs, 0)
+      'candidateCount',
+      candidates.length
     );
-    setText('candidateCount', candidates.length);
+
     setText(
       'lastScanAt',
       date(first(scanner.lastScanAt, root.lastScanAt))
@@ -748,7 +668,7 @@
 
     const running = scanner.running === true;
     const completed = num(progress.completed) || 0;
-    const total = num(progress.total) || num(scanner.pairs) || 24;
+    const total = num(progress.total) || num(scanner.pairs) || PAIR_COUNT;
 
     setBadge(
       el.scannerStatus,
@@ -770,7 +690,7 @@
       const p = document.createElement('p');
       p.className = 'muted-text';
       p.textContent = running
-        ? `Scan in progress: ${completed}/${total} pairs checked.`
+        ? `Scanning in background: ${completed}/${total} pairs.`
         : 'No candidate passed the evidence and freshness checks. NO TRADE.';
 
       scannerNode.appendChild(p);
@@ -785,8 +705,16 @@
       const title = document.createElement('strong');
       const detail = document.createElement('p');
 
+      const signal = String(candidate.signal || '').toUpperCase();
+      const safeSignal =
+        signal === 'CALL' || signal === 'BUY'
+          ? 'BUY'
+          : signal === 'PUT' || signal === 'SELL'
+            ? 'SELL'
+            : 'NO TRADE';
+
       title.textContent =
-        `${candidate.pair} · ${candidate.timeframe}m · ${candidate.signal}`;
+        `${candidate.pair} · 1m · ${safeSignal}`;
 
       detail.textContent =
         `Evidence score: ${fmt(candidate.confidence, 0)}/100 · ` +
@@ -800,7 +728,7 @@
     scannerNode.appendChild(list);
   }
 
-  async function pollBackgroundScan() {
+  async function pollScan() {
     if (!state.scanBusy) return;
 
     try {
@@ -808,11 +736,12 @@
       renderScanner(payload);
 
       const scanner = obj(payload.scanner);
+      const progress = obj(scanner.progress);
 
       if (scanner.running === true) {
         setText(
           'scanInfo',
-          `Background scan running: ${num(obj(scanner.progress).completed) || 0}/24 pairs. You can continue analyzing a selected pair.`
+          `Scanning ${num(progress.completed) || 0}/${num(progress.total) || PAIR_COUNT} pairs. Waiting for completed results.`
         );
         return;
       }
@@ -828,117 +757,174 @@
         $('backgroundScanBtn'),
         false,
         '',
-        'Scan all 24 pairs in background'
+        'Scan all 24 pairs'
       );
 
       setText(
         'scanInfo',
-        'Background scan stopped or completed. Review the candidate list and freshness.'
+        'Scan stopped or completed. Check candidate freshness before acting.'
       );
-
-      if (scanner.lastScanAt || payload.lastScanAt) {
-        renderScanner(payload);
-      }
     } catch (error) {
       setText(
         'scanInfo',
-        `Could not refresh scanner status: ${String(error.message || error)}`
+        `Could not refresh scan status: ${String(error.message || error)}`
       );
     }
   }
 
-  async function startBackgroundScan() {
-    if (state.scanBusy) {
-      showError('A background scan is already running.');
-      return;
-    }
+  async function analyzeAllPairs() {
+    if (state.analysisBusy || state.scanBusy) return;
+
+    state.analysisBusy = true;
+    const requestId = ++state.requestId;
 
     clearError();
 
+    setBusy(
+      el.analyzeBtn,
+      true,
+      'Analyzing 24 pairs…',
+      'Analyze all 24 pairs'
+    );
+
+    setBusy(
+      $('backgroundScanBtn'),
+      true,
+      'Scan running…',
+      'Scan all 24 pairs'
+    );
+
+    setText(
+      'scanInfo',
+      'Loading the latest available candidates and starting the 24-pair scan if permitted.'
+    );
+
     try {
-      const current = await requestJson('/api/best');
-      const scanner = obj(current.scanner);
+      // Display the latest stored analysis immediately when available.
+      try {
+        const current = await requestJson('/api/best');
 
-      if (scanner.running === true) {
-        state.scanBusy = true;
-        showError(
-          'A scan is already running on the backend. Monitoring its progress.'
-        );
-      } else {
-        const started = await requestJson('/api/scan', {
-          method: 'POST',
-          body: {}
-        });
+        if (requestId !== state.requestId) return;
 
-        if (started.ok !== true) {
-          throw new Error(
-            first(started.error, 'The scan could not be started.')
-          );
+        renderScanner(current);
+
+        const market = marketFrom(current);
+
+        if (market.pair && market.pair !== 'NO MARKET') {
+          renderMarket(current);
         }
-
-        state.scanBusy = true;
-        setText(
-          'scanInfo',
-          'Background scan started. Selected-pair analysis remains available separately.'
-        );
+      } catch {
+        // Continue and attempt to start a scan.
       }
 
-      setBusy(
-        $('backgroundScanBtn'),
-        true,
-        'Background scan running…',
-        'Scan all 24 pairs in background'
-      );
+      try {
+        const started = await requestJson('/api/scan', {
+          method: 'POST',
+          body: {},
+          timeout: REQUEST_TIMEOUT_MS
+        });
 
-      if (state.scanTimer) clearInterval(state.scanTimer);
+        state.scanBusy = true;
+        state.lastScanRequestAt = Date.now();
 
-      state.scanTimer = setInterval(
-        pollBackgroundScan,
-        SCAN_POLL_INTERVAL_MS
-      );
+        setText(
+          'scanInfo',
+          first(
+            started.message,
+            'The 24-pair scan has started in the background.'
+          )
+        );
+      } catch (error) {
+        // HTTP 409 means a scan is already running.
+        if (error.status === 409) {
+          state.scanBusy = true;
+          setText(
+            'scanInfo',
+            'A 24-pair scan is already running. Monitoring its progress.'
+          );
+        } else {
+          // A cooldown response may still leave usable previous candidates.
+          if (error.status === 429) {
+            const current = await requestJson('/api/best');
+            renderScanner(current);
 
-      await pollBackgroundScan();
+            const market = marketFrom(current);
+
+            if (market.pair && market.pair !== 'NO MARKET') {
+              renderMarket(current);
+            }
+
+            setText(
+              'scanInfo',
+              'A new scan is not available yet. Showing the latest stored results; they may not be new.'
+            );
+          } else {
+            throw error;
+          }
+        }
+      }
+
+      if (state.scanBusy) {
+        if (state.scanTimer) clearInterval(state.scanTimer);
+
+        state.scanTimer = setInterval(
+          pollScan,
+          SCAN_POLL_INTERVAL_MS
+        );
+
+        await pollScan();
+      }
     } catch (error) {
       showError(String(error.message || error));
-      state.scanBusy = false;
+
+      setText(
+        'signalReason',
+        'Analysis could not be confirmed. Do not infer BUY or SELL from an error.'
+      );
+
+      renderSignal('NO TRADE');
+    } finally {
+      state.analysisBusy = false;
 
       setBusy(
-        $('backgroundScanBtn'),
+        el.analyzeBtn,
         false,
         '',
-        'Scan all 24 pairs in background'
+        'Analyze all 24 pairs'
       );
+
+      if (!state.scanBusy) {
+        setBusy(
+          $('backgroundScanBtn'),
+          false,
+          '',
+          'Scan all 24 pairs'
+        );
+      }
     }
   }
 
   function bindEvents() {
-    addScanButton();
+    ensureScanButton();
 
     if (el.analyzeBtn) {
-      el.analyzeBtn.textContent = 'Analyze selected pair';
-      el.analyzeBtn.addEventListener(
-        'click',
-        analyzeSelectedPair
-      );
+      el.analyzeBtn.textContent = 'Analyze all 24 pairs';
+      el.analyzeBtn.addEventListener('click', analyzeAllPairs);
     }
 
     if (el.selectedPair) {
       el.selectedPair.addEventListener('change', () => {
-        setText('summaryPair', el.selectedPair.value);
         setText(
           'scanInfo',
-          `Selected ${el.selectedPair.value}. Press Analyze selected pair to refresh its analysis.`
+          `Selected pair: ${el.selectedPair.value}. The Analyze button scans all 24 pairs.`
         );
       });
     }
 
     if (el.timeframe) {
-      el.timeframe.addEventListener('change', () => {
-        setText(
-          'scanInfo',
-          `Selected timeframe: ${el.timeframe.value} minute(s). Press Analyze selected pair to refresh.`
-        );
-      });
+      // This strategy uses 1-minute candles only.
+      el.timeframe.value = '1';
+      el.timeframe.disabled = true;
     }
   }
 
@@ -949,6 +935,7 @@
 
     try {
       const current = await requestJson('/api/best');
+
       renderScanner(current);
 
       const scanner = obj(current.scanner);
@@ -959,12 +946,12 @@
         setBusy(
           $('backgroundScanBtn'),
           true,
-          'Background scan running…',
-          'Scan all 24 pairs in background'
+          'Scan running…',
+          'Scan all 24 pairs'
         );
 
         state.scanTimer = setInterval(
-          pollBackgroundScan,
+          pollScan,
           SCAN_POLL_INTERVAL_MS
         );
       }
@@ -980,7 +967,7 @@
       } else {
         setText(
           'scanInfo',
-          'Ready. Choose a pair and press Analyze selected pair. Start the 24-pair scan separately if needed.'
+          'Ready. Press Analyze all 24 pairs to review available results and start a scan.'
         );
       }
     } catch (error) {
