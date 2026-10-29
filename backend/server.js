@@ -1,3 +1,4 @@
+
 'use strict';
 
 const express = require('express');
@@ -7,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '32kb' }));
 
-const VERSION = 'V9.4.1';
+const VERSION = 'V9.5.0';
 const PORT = Number(process.env.PORT || 10000);
 const API_KEY =
   process.env.TWELVE_DATA_API_KEY ||
@@ -23,7 +24,7 @@ const PAIRS = [
   'GBP/CHF', 'NZD/JPY', 'NZD/CAD', 'AUD/CAD', 'AUD/CHF', 'CAD/CHF'
 ];
 
-const TIMEFRAMES = [1, 2, 3];
+const TIMEFRAMES = [1];
 
 const DAILY_REQUEST_LIMIT = 768;
 const DAILY_RESERVE = 32;
@@ -31,11 +32,11 @@ const DAILY_USABLE_LIMIT = DAILY_REQUEST_LIMIT - DAILY_RESERVE;
 
 const REQUESTS_PER_MINUTE = 6;
 const REQUEST_SPACING_MS = 10000;
-const PROVIDER_TIMEOUT_MS = 15000;
+const PROVIDER_TIMEOUT_MS = 12000;
 
-const PAIR_CACHE_MS = 120 * 1000;
-const FRESHNESS_SECONDS = { 1: 150, 2: 210, 3: 270 };
-const HARD_STALE_SECONDS = 360;
+const PAIR_CACHE_MS = 120000;
+const FRESHNESS_SECONDS = { 1: 150 };
+const HARD_STALE_SECONDS = 300;
 
 const SCAN_COOLDOWN_MS = 240000;
 const SCAN_BATCH_SIZE = PAIRS.length;
@@ -70,14 +71,16 @@ const finite = v =>
   v !== '' &&
   Number.isFinite(Number(v));
 
-const avg = a =>
-  a.length ? a.reduce((s, v) => s + v, 0) / a.length : null;
+const avg = values =>
+  values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null;
 
-const round = (v, d = 6) =>
-  finite(v) ? Number(Number(v).toFixed(d)) : null;
+const round = (value, decimals = 6) =>
+  finite(value) ? Number(Number(value).toFixed(decimals)) : null;
 
-const iso = v =>
-  Number.isFinite(v) ? new Date(v).toISOString() : null;
+const iso = value =>
+  Number.isFinite(value) ? new Date(value).toISOString() : null;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -155,7 +158,6 @@ async function providerFetch(pair) {
     }
 
     const url = new URL(PROVIDER_URL);
-
     url.searchParams.set('symbol', pair);
     url.searchParams.set('interval', '1min');
     url.searchParams.set('outputsize', '180');
@@ -163,7 +165,6 @@ async function providerFetch(pair) {
     url.searchParams.set('apikey', API_KEY);
 
     const sentAt = Date.now();
-
     lastProviderRequestAt = sentAt;
     requestTimes.push(sentAt);
     providerRequests++;
@@ -227,9 +228,7 @@ function normalizeCandles(rows) {
 
   for (const row of rows) {
     const rawTime = String(row.datetime || row.time || '').trim();
-
-    const hasTimezone =
-      /(?:Z|[+-]\d{2}:?\d{2})$/i.test(rawTime);
+    const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(rawTime);
 
     const time = Date.parse(
       rawTime && !hasTimezone
@@ -288,60 +287,12 @@ async function getPairData(pair, forceRefresh = false) {
   return promise;
 }
 
-function closedCandles(candles, minutes, now = Date.now()) {
-  const duration = minutes * 60000;
-
-  return candles.filter(c => c.time + duration <= now);
-}
-
-function aggregateCandles(candles, minutes, now = Date.now()) {
-  const duration = minutes * 60000;
-  const buckets = new Map();
-
-  for (const c of candles) {
-    const start = Math.floor(c.time / duration) * duration;
-
-    if (start + duration > now) continue;
-
-    if (!buckets.has(start)) buckets.set(start, []);
-    buckets.get(start).push(c);
-  }
-
-  const out = [];
-
-  for (
-    const [time, rows] of
-    [...buckets.entries()].sort((a, b) => a[0] - b[0])
-  ) {
-    rows.sort((a, b) => a.time - b.time);
-
-    if (rows.length !== minutes) continue;
-
-    if (
-      rows.some(
-        (c, i) =>
-          i > 0 &&
-          c.time - rows[i - 1].time !== 60000
-      )
-    ) {
-      continue;
-    }
-
-    out.push({
-      time,
-      open: rows[0].open,
-      high: Math.max(...rows.map(c => c.high)),
-      low: Math.min(...rows.map(c => c.low)),
-      close: rows[rows.length - 1].close
-    });
-  }
-
-  return out;
+function closedCandles(candles, now = Date.now()) {
+  return candles.filter(c => c.time + 60000 <= now);
 }
 
 function ema(values, period) {
   const out = Array(values.length).fill(null);
-
   if (values.length < period) return out;
 
   let value = avg(values.slice(0, period));
@@ -357,166 +308,51 @@ function ema(values, period) {
   return out;
 }
 
-function rsi(values, period = 9) {
+function rsi(values, period = 14) {
   const out = Array(values.length).fill(null);
-
   if (values.length <= period) return out;
 
   let gain = 0;
   let loss = 0;
 
   for (let i = 1; i <= period; i++) {
-    const ch = values[i] - values[i - 1];
-    gain += Math.max(ch, 0);
-    loss += Math.max(-ch, 0);
+    const change = values[i] - values[i - 1];
+    gain += Math.max(change, 0);
+    loss += Math.max(-change, 0);
   }
 
-  let ag = gain / period;
-  let al = loss / period;
+  let averageGain = gain / period;
+  let averageLoss = loss / period;
 
-  const calc = () =>
-    al === 0
-      ? (ag === 0 ? 50 : 100)
-      : 100 - 100 / (1 + ag / al);
+  const calculate = () =>
+    averageLoss === 0
+      ? (averageGain === 0 ? 50 : 100)
+      : 100 - 100 / (1 + averageGain / averageLoss);
 
-  out[period] = calc();
+  out[period] = calculate();
 
   for (let i = period + 1; i < values.length; i++) {
-    const ch = values[i] - values[i - 1];
+    const change = values[i] - values[i - 1];
 
-    ag =
-      (ag * (period - 1) + Math.max(ch, 0)) /
-      period;
+    averageGain =
+      (averageGain * (period - 1) + Math.max(change, 0)) / period;
 
-    al =
-      (al * (period - 1) + Math.max(-ch, 0)) /
-      period;
+    averageLoss =
+      (averageLoss * (period - 1) + Math.max(-change, 0)) / period;
 
-    out[i] = calc();
+    out[i] = calculate();
   }
 
   return out;
-}
-
-function trueRanges(c) {
-  return c.map((x, i) =>
-    i === 0
-      ? x.high - x.low
-      : Math.max(
-          x.high - x.low,
-          Math.abs(x.high - c[i - 1].close),
-          Math.abs(x.low - c[i - 1].close)
-        )
-  );
-}
-
-function adx(candles, period = 14) {
-  const n = candles.length;
-  const tr = trueRanges(candles);
-  const plus = Array(n).fill(0);
-  const minus = Array(n).fill(0);
-
-  for (let i = 1; i < n; i++) {
-    const up = candles[i].high - candles[i - 1].high;
-    const down = candles[i - 1].low - candles[i].low;
-
-    plus[i] = up > down && up > 0 ? up : 0;
-    minus[i] = down > up && down > 0 ? down : 0;
-  }
-
-  function smooth(a) {
-    const o = Array(n).fill(null);
-
-    if (n < period) return o;
-
-    let v = a.slice(0, period).reduce((s, x) => s + x, 0);
-    o[period - 1] = v;
-
-    for (let i = period; i < n; i++) {
-      v = v - v / period + a[i];
-      o[i] = v;
-    }
-
-    return o;
-  }
-
-  const st = smooth(tr);
-  const sp = smooth(plus);
-  const sm = smooth(minus);
-  const dx = Array(n).fill(null);
-
-  for (let i = 0; i < n; i++) {
-    if (
-      !finite(st[i]) ||
-      st[i] === 0 ||
-      !finite(sp[i]) ||
-      !finite(sm[i])
-    ) {
-      continue;
-    }
-
-    const p = 100 * sp[i] / st[i];
-    const m = 100 * sm[i] / st[i];
-
-    dx[i] = p + m === 0
-      ? 0
-      : 100 * Math.abs(p - m) / (p + m);
-  }
-
-  const first = dx.findIndex(finite);
-  const out = Array(n).fill(null);
-
-  if (first < 0 || first + period > n) return out;
-
-  const seed = dx.slice(first, first + period);
-
-  if (seed.some(v => !finite(v))) return out;
-
-  let v = avg(seed);
-  const start = first + period - 1;
-
-  out[start] = v;
-
-  for (let i = start + 1; i < n; i++) {
-    if (finite(dx[i])) {
-      v = (v * (period - 1) + dx[i]) / period;
-      out[i] = v;
-    }
-  }
-
-  return out;
-}
-
-function stochastic(c, kp = 14, dp = 3) {
-  const k = Array(c.length).fill(null);
-  const d = Array(c.length).fill(null);
-
-  for (let i = kp - 1; i < c.length; i++) {
-    const s = c.slice(i - kp + 1, i + 1);
-    const hi = Math.max(...s.map(x => x.high));
-    const lo = Math.min(...s.map(x => x.low));
-
-    k[i] = hi === lo
-      ? 50
-      : 100 * (c[i].close - lo) / (hi - lo);
-
-    const vals = k.slice(i - dp + 1, i + 1);
-
-    if (vals.length === dp && vals.every(finite)) {
-      d[i] = avg(vals);
-    }
-  }
-
-  return { k, d };
 }
 
 function macd(values) {
-  const a = ema(values, 12);
-  const b = ema(values, 26);
+  const fast = ema(values, 12);
+  const slow = ema(values, 26);
 
   const line = values.map((_, i) =>
-    finite(a[i]) && finite(b[i])
-      ? a[i] - b[i]
+    finite(fast[i]) && finite(slow[i])
+      ? fast[i] - slow[i]
       : null
   );
 
@@ -530,41 +366,69 @@ function macd(values) {
     if (finite(line[i])) signal[i] = compactSignal[j++];
   }
 
-  const histogram = line.map((v, i) =>
-    finite(v) && finite(signal[i])
-      ? v - signal[i]
+  const histogram = line.map((value, i) =>
+    finite(value) && finite(signal[i])
+      ? value - signal[i]
       : null
   );
 
   return { line, signal, histogram };
 }
 
-function cross(pa, pb, ca, cb) {
-  if (![pa, pb, ca, cb].every(finite)) {
+function stochastic(candles, period = 14, signalPeriod = 3) {
+  const k = Array(candles.length).fill(null);
+  const d = Array(candles.length).fill(null);
+
+  for (let i = period - 1; i < candles.length; i++) {
+    const sample = candles.slice(i - period + 1, i + 1);
+    const high = Math.max(...sample.map(c => c.high));
+    const low = Math.min(...sample.map(c => c.low));
+
+    k[i] = high === low
+      ? 50
+      : 100 * (candles[i].close - low) / (high - low);
+
+    const values = k.slice(i - signalPeriod + 1, i + 1);
+
+    if (
+      values.length === signalPeriod &&
+      values.every(finite)
+    ) {
+      d[i] = avg(values);
+    }
+  }
+
+  return { k, d };
+}
+
+function crossover(previousA, previousB, currentA, currentB) {
+  if (![previousA, previousB, currentA, currentB].every(finite)) {
     return 'UNAVAILABLE';
   }
 
-  if (pa <= pb && ca > cb) return 'BULLISH_CROSSOVER';
-  if (pa >= pb && ca < cb) return 'BEARISH_CROSSOVER';
+  if (previousA <= previousB && currentA > currentB) {
+    return 'BULLISH_CROSSOVER';
+  }
+
+  if (previousA >= previousB && currentA < currentB) {
+    return 'BEARISH_CROSSOVER';
+  }
 
   return 'NO_CROSSOVER';
 }
 
-function candlePattern(c) {
-  if (c.length < 2) {
-    return {
-      name: 'INSUFFICIENT CANDLES',
-      direction: 'NEUTRAL'
-    };
+function candlePattern(candles) {
+  if (candles.length < 2) {
+    return { name: 'INSUFFICIENT CANDLES', direction: 'NEUTRAL' };
   }
 
-  const x = c[c.length - 1];
-  const p = c[c.length - 2];
+  const current = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
 
-  const body = Math.abs(x.close - x.open);
-  const range = Math.max(x.high - x.low, Number.EPSILON);
-  const upper = x.high - Math.max(x.open, x.close);
-  const lower = Math.min(x.open, x.close) - x.low;
+  const body = Math.abs(current.close - current.open);
+  const range = Math.max(current.high - current.low, Number.EPSILON);
+  const upperWick = current.high - Math.max(current.open, current.close);
+  const lowerWick = Math.min(current.open, current.close) - current.low;
 
   if (body / range <= 0.1) {
     return { name: 'DOJI', direction: 'NEUTRAL' };
@@ -572,34 +436,34 @@ function candlePattern(c) {
 
   if (
     body / range <= 0.35 &&
-    lower >= body * 2 &&
-    upper <= body * 0.7
+    lowerWick >= body * 2 &&
+    upperWick <= body * 0.7
   ) {
     return { name: 'HAMMER', direction: 'BULLISH' };
   }
 
   if (
     body / range <= 0.35 &&
-    upper >= body * 2 &&
-    lower <= body * 0.7
+    upperWick >= body * 2 &&
+    lowerWick <= body * 0.7
   ) {
     return { name: 'SHOOTING STAR', direction: 'BEARISH' };
   }
 
   if (
-    p.close < p.open &&
-    x.close > x.open &&
-    x.open <= p.close &&
-    x.close >= p.open
+    previous.close < previous.open &&
+    current.close > current.open &&
+    current.open <= previous.close &&
+    current.close >= previous.open
   ) {
     return { name: 'BULLISH ENGULFING', direction: 'BULLISH' };
   }
 
   if (
-    p.close > p.open &&
-    x.close < x.open &&
-    x.open >= p.close &&
-    x.close <= p.open
+    previous.close > previous.open &&
+    current.close < current.open &&
+    current.open >= previous.close &&
+    current.close <= previous.open
   ) {
     return { name: 'BEARISH ENGULFING', direction: 'BEARISH' };
   }
@@ -607,16 +471,18 @@ function candlePattern(c) {
   return { name: 'NO CLEAR PATTERN', direction: 'NEUTRAL' };
 }
 
-function marketContext(c) {
-  if (c.length < 10) {
+function marketPsychology(candles) {
+  if (candles.length < 10) {
     return {
       psychology: 'INSUFFICIENT PRICE EVIDENCE',
-      priceAction: 'INSUFFICIENT HISTORY'
+      direction: 'NEUTRAL',
+      buyerPressure: 0,
+      sellerPressure: 0
     };
   }
 
-  const last = c[c.length - 1];
-  const recent = c.slice(-6);
+  const recent = candles.slice(-6);
+  const last = recent[recent.length - 1];
 
   let up = 0;
   let down = 0;
@@ -627,56 +493,142 @@ function marketContext(c) {
   }
 
   const range = Math.max(last.high - last.low, Number.EPSILON);
-  const loc = (last.close - last.low) / range;
+  const closeLocation = (last.close - last.low) / range;
 
   let psychology = 'MIXED BUYER/SELLER PRESSURE';
+  let direction = 'NEUTRAL';
 
-  if (up >= 4 && loc >= 0.65) {
+  if (up >= 4 && closeLocation >= 0.65) {
     psychology = 'BUYERS SHOWING RECENT CONTROL';
-  } else if (down >= 4 && loc <= 0.35) {
+    direction = 'BULLISH';
+  } else if (down >= 4 && closeLocation <= 0.35) {
     psychology = 'SELLERS SHOWING RECENT CONTROL';
+    direction = 'BEARISH';
   } else if (Math.abs(last.close - last.open) / range < 0.15) {
     psychology = 'INDECISION / SMALL REAL BODY';
   }
 
-  const prior = c.slice(-21, -1);
-  let priceAction = 'RANGE / MIXED STRUCTURE';
+  return {
+    psychology,
+    direction,
+    buyerPressure: up,
+    sellerPressure: down
+  };
+}
 
-  if (
-    recent[5].high > recent[0].high &&
-    recent[5].low > recent[0].low &&
-    up >= 3
-  ) {
-    priceAction = 'SHORT-TERM HIGHER HIGHS / HIGHER LOWS';
-  } else if (
-    recent[5].high < recent[0].high &&
-    recent[5].low < recent[0].low &&
-    down >= 3
-  ) {
-    priceAction = 'SHORT-TERM LOWER HIGHS / LOWER LOWS';
-  } else if (
-    prior.length &&
-    last.close > Math.max(...prior.map(x => x.high))
-  ) {
-    priceAction = 'CLOSED-CANDLE UPSIDE BREAKOUT';
-  } else if (
-    prior.length &&
-    last.close < Math.min(...prior.map(x => x.low))
-  ) {
-    priceAction = 'CLOSED-CANDLE DOWNSIDE BREAKOUT';
+function trendLine(candles) {
+  const sample = candles.slice(-20);
+
+  if (sample.length < 10) {
+    return {
+      direction: 'UNAVAILABLE',
+      slopePercent: null,
+      aboveLine: null,
+      belowLine: null
+    };
   }
 
-  return { psychology, priceAction };
+  const n = sample.length;
+  const xs = sample.map((_, i) => i);
+  const ys = sample.map(c => c.close);
+  const meanX = avg(xs);
+  const meanY = avg(ys);
+
+  let numerator = 0;
+  let denominator = 0;
+
+  for (let i = 0; i < n; i++) {
+    numerator += (xs[i] - meanX) * (ys[i] - meanY);
+    denominator += (xs[i] - meanX) ** 2;
+  }
+
+  const slope = denominator ? numerator / denominator : 0;
+  const intercept = meanY - slope * meanX;
+  const projected = intercept + slope * (n - 1);
+  const lastPrice = ys[n - 1];
+  const slopePercent = meanY
+    ? (slope / meanY) * 100
+    : 0;
+
+  let direction = 'SIDEWAYS';
+
+  if (slopePercent > 0.003) direction = 'BULLISH';
+  if (slopePercent < -0.003) direction = 'BEARISH';
+
+  return {
+    direction,
+    slopePercent: round(slopePercent, 5),
+    projectedPrice: round(projected),
+    aboveLine: lastPrice > projected,
+    belowLine: lastPrice < projected
+  };
+}
+
+function supportResistance(candles) {
+  const previous = candles.slice(-31, -1);
+
+  if (previous.length < 10) {
+    return {
+      support: null,
+      resistance: null,
+      position: 'UNAVAILABLE',
+      direction: 'NEUTRAL',
+      distanceToSupportPercent: null,
+      distanceToResistancePercent: null
+    };
+  }
+
+  const support = Math.min(...previous.map(c => c.low));
+  const resistance = Math.max(...previous.map(c => c.high));
+  const last = candles[candles.length - 1];
+  const range = Math.max(last.high - last.low, Number.EPSILON);
+
+  const distanceToSupportPercent =
+    last.close ? ((last.close - support) / last.close) * 100 : null;
+
+  const distanceToResistancePercent =
+    last.close ? ((resistance - last.close) / last.close) * 100 : null;
+
+  let position = 'BETWEEN LEVELS';
+  let direction = 'NEUTRAL';
+
+  if (last.close > resistance) {
+    position = 'CLOSED-CANDLE RESISTANCE BREAKOUT';
+    direction = 'BULLISH';
+  } else if (last.close < support) {
+    position = 'CLOSED-CANDLE SUPPORT BREAKDOWN';
+    direction = 'BEARISH';
+  } else if (
+    last.low <= support + range * 0.15 &&
+    last.close > last.open
+  ) {
+    position = 'POSSIBLE SUPPORT REJECTION';
+    direction = 'BULLISH';
+  } else if (
+    last.high >= resistance - range * 0.15 &&
+    last.close < last.open
+  ) {
+    position = 'POSSIBLE RESISTANCE REJECTION';
+    direction = 'BEARISH';
+  }
+
+  return {
+    support: round(support),
+    resistance: round(resistance),
+    position,
+    direction,
+    distanceToSupportPercent: round(distanceToSupportPercent, 4),
+    distanceToResistancePercent: round(distanceToResistancePercent, 4)
+  };
 }
 
 function emptyMarket(
   pair = 'NO MARKET',
-  timeframe = null,
   reason = 'No usable market data.'
 ) {
   return {
     pair,
-    timeframe,
+    timeframe: 1,
     signal: 'NO TRADE',
     confidence: null,
     callScore: 0,
@@ -688,7 +640,9 @@ function emptyMarket(
     entryPrice: null,
     freshness: 'NO DATA',
     dataAgeSeconds: null,
-    supportResistance: { support: null, resistance: null },
+    lastCandle: null,
+    supportResistance: {},
+    trendLine: {},
     marketPsychology: 'NO PRICE EVIDENCE',
     priceAction: 'NO DATA',
     candlePattern: { name: 'UNAVAILABLE', direction: 'NEUTRAL' },
@@ -699,342 +653,217 @@ function emptyMarket(
   };
 }
 
-function scoreMarket(raw, pair, timeframe, fetchedAt) {
+function scoreMarket(rawCandles, pair, fetchedAt) {
   const now = Date.now();
-
-  const one = closedCandles(raw, 1, now);
-  const candles = aggregateCandles(one, timeframe, now);
-  const five = aggregateCandles(one, 5, now);
+  const candles = closedCandles(rawCandles, now);
   const last = candles[candles.length - 1];
 
   if (!last) {
-    return emptyMarket(
-      pair,
-      timeframe,
-      'No completed candles are available.'
-    );
+    return emptyMarket(pair, 'No completed 1-minute candles are available.');
   }
 
-  const age = Math.max(
-    0,
-    (now - (last.time + timeframe * 60000)) / 1000
-  );
+  const age = Math.max(0, (now - (last.time + 60000)) / 1000);
 
   const freshness =
-    age <= FRESHNESS_SECONDS[timeframe]
+    age <= FRESHNESS_SECONDS[1]
       ? 'FRESH'
       : age <= HARD_STALE_SECONDS
         ? 'STALE'
         : 'HARD STALE';
 
   const closes = candles.map(c => c.close);
-  const e9 = ema(closes, 9);
-  const e21 = ema(closes, 21);
-  const rs = rsi(closes, 9);
-  const dx = adx(candles, 14);
-  const mc = macd(closes);
-  const st = stochastic(candles);
-
-  const trs = trueRanges(candles);
-  let atr = null;
-
-  if (trs.length >= 14) {
-    atr = avg(trs.slice(0, 14));
-
-    for (let j = 14; j < trs.length; j++) {
-      atr = ((atr * 13) + trs[j]) / 14;
-    }
-  }
-
-  const fiveCloses = five.map(c => c.close);
-  const e5 = ema(fiveCloses, 21);
-
   const i = candles.length - 1;
   const p = i - 1;
 
-  const emaCross = cross(e9[p], e21[p], e9[i], e21[i]);
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
+  const rsi14 = rsi(closes, 14);
+  const mc = macd(closes);
+  const st = stochastic(candles);
 
-  const rsiCross =
-    finite(rs[p]) && finite(rs[i])
-      ? rs[p] <= 30 && rs[i] > 30
-        ? 'CROSSED_UP_30'
-        : rs[p] >= 70 && rs[i] < 70
-          ? 'CROSSED_DOWN_70'
-          : 'NO_CROSSOVER'
-      : 'UNAVAILABLE';
-
-  const macdCross = cross(
-    mc.line[p],
-    mc.signal[p],
-    mc.line[i],
-    mc.signal[i]
+  const emaCross = crossover(ema9[p], ema21[p], ema9[i], ema21[i]);
+  const macdCross = crossover(
+    mc.line[p], mc.signal[p], mc.line[i], mc.signal[i]
   );
-
-  const stochCross = cross(st.k[p], st.d[p], st.k[i], st.d[i]);
-
-  const ema21_5m = e5[e5.length - 1];
-  const last5 = five[five.length - 1];
-
-  const trend5m =
-    finite(ema21_5m) && last5
-      ? last5.close > ema21_5m
-        ? 'BULLISH'
-        : last5.close < ema21_5m
-          ? 'BEARISH'
-          : 'NEUTRAL'
-      : 'UNAVAILABLE';
-
-  const ind = {
-    ema9: e9[i],
-    ema21: e21[i],
-    emaCross,
-    rsi9: rs[i],
-    rsi9Previous: rs[p],
-    rsiCross,
-    adx14: dx[i],
-    macd: {
-      line: mc.line[i],
-      signal: mc.signal[i],
-      histogram: mc.histogram[i],
-      crossover: macdCross
-    },
-    stochastic: {
-      k: st.k[i],
-      d: st.d[i],
-      crossover: stochCross
-    },
-    atr14: atr,
-    bollinger: null,
-    ema21_5m,
-    trend5m
-  };
-
-  if (candles.length >= 20) {
-    const vals = closes.slice(-20);
-    const mid = avg(vals);
-    const sd = Math.sqrt(avg(vals.map(v => (v - mid) ** 2)));
-
-    ind.bollinger = {
-      upper: mid + 2 * sd,
-      middle: mid,
-      lower: mid - 2 * sd
-    };
-  }
+  const stochCross = crossover(st.k[p], st.d[p], st.k[i], st.d[i]);
 
   const pattern = candlePattern(candles);
-  const context = marketContext(candles);
-  const prior = candles.slice(-31, -1);
-
-  const support =
-    prior.length >= 10
-      ? Math.min(...prior.map(c => c.low))
-      : null;
-
-  const resistance =
-    prior.length >= 10
-      ? Math.max(...prior.map(c => c.high))
-      : null;
+  const psychology = marketPsychology(candles);
+  const levels = supportResistance(candles);
+  const line = trendLine(candles);
 
   let callScore = 0;
   let putScore = 0;
   const reasons = [];
 
-  const add = (dir, points, reason) => {
-    if (dir === 'BULLISH') callScore += points;
-    if (dir === 'BEARISH') putScore += points;
+  function add(direction, points, reason) {
+    if (direction === 'BULLISH') callScore += points;
+    if (direction === 'BEARISH') putScore += points;
 
-    if (dir !== 'NEUTRAL') reasons.push(reason);
+    if (direction !== 'NEUTRAL') reasons.push(reason);
+  }
+
+  // Primary evidence: candle patterns.
+  const patternPoints = {
+    'BULLISH ENGULFING': 24,
+    'BEARISH ENGULFING': 24,
+    'HAMMER': 18,
+    'SHOOTING STAR': 18
   };
-
-  if (emaCross === 'BULLISH_CROSSOVER') {
-    add('BULLISH', 18, 'EMA9 crossed above EMA21.');
-  } else if (emaCross === 'BEARISH_CROSSOVER') {
-    add('BEARISH', 18, 'EMA9 crossed below EMA21.');
-  } else {
-    reasons.push(
-      'No new EMA9/EMA21 crossover on the latest completed candle.'
-    );
-  }
-
-  if (rsiCross === 'CROSSED_UP_30') {
-    add('BULLISH', 14, 'RSI9 crossed above 30.');
-  }
-
-  if (rsiCross === 'CROSSED_DOWN_70') {
-    add('BEARISH', 14, 'RSI9 crossed below 70.');
-  }
-
-  if (trend5m === 'BULLISH') {
-    add('BULLISH', 12, 'Completed 5m close is above EMA21.');
-  }
-
-  if (trend5m === 'BEARISH') {
-    add('BEARISH', 12, 'Completed 5m close is below EMA21.');
-  }
-
-  if (macdCross === 'BULLISH_CROSSOVER') {
-    add('BULLISH', 12, 'MACD bullish crossover.');
-  }
-
-  if (macdCross === 'BEARISH_CROSSOVER') {
-    add('BEARISH', 12, 'MACD bearish crossover.');
-  }
-
-  if (stochCross === 'BULLISH_CROSSOVER' && st.k[i] < 35) {
-    add('BULLISH', 8, 'Stochastic bullish crossover in lower zone.');
-  }
-
-  if (stochCross === 'BEARISH_CROSSOVER' && st.k[i] > 65) {
-    add('BEARISH', 8, 'Stochastic bearish crossover in upper zone.');
-  }
-
-  if (
-    finite(dx[i]) &&
-    dx[i] >= 20 &&
-    finite(e9[i]) &&
-    finite(e21[i])
-  ) {
-    if (e9[i] > e21[i]) {
-      add(
-        'BULLISH',
-        6,
-        'ADX14 shows trend strength with EMA9 above EMA21.'
-      );
-    }
-
-    if (e9[i] < e21[i]) {
-      add(
-        'BEARISH',
-        6,
-        'ADX14 shows trend strength with EMA9 below EMA21.'
-      );
-    }
-  }
 
   add(
     pattern.direction,
-    8,
-    `Latest completed candle pattern: ${pattern.name}.`
+    patternPoints[pattern.name] || 0,
+    `Candlestick pattern: ${pattern.name}.`
   );
 
-  if (context.psychology.includes('BUYERS')) {
-    add('BULLISH', 4, 'Recent closed candles show buyer pressure.');
+  // Primary evidence: market psychology.
+  add(
+    psychology.direction,
+    18,
+    `Market psychology: ${psychology.psychology}.`
+  );
+
+  // Primary evidence: support and resistance.
+  if (levels.position === 'CLOSED-CANDLE RESISTANCE BREAKOUT') {
+    add('BULLISH', 20, 'Latest completed candle closed above resistance.');
+  } else if (levels.position === 'CLOSED-CANDLE SUPPORT BREAKDOWN') {
+    add('BEARISH', 20, 'Latest completed candle closed below support.');
+  } else if (levels.position === 'POSSIBLE SUPPORT REJECTION') {
+    add('BULLISH', 14, 'Price action suggests possible support rejection.');
+  } else if (levels.position === 'POSSIBLE RESISTANCE REJECTION') {
+    add('BEARISH', 14, 'Price action suggests possible resistance rejection.');
   }
 
-  if (context.psychology.includes('SELLERS')) {
-    add('BEARISH', 4, 'Recent closed candles show seller pressure.');
+  // Primary evidence: trend line.
+  add(
+    line.direction,
+    16,
+    `20-candle trend-line direction: ${line.direction}.`
+  );
+
+  // Secondary indicators: supportive, never the sole reason for a trade.
+  if (emaCross === 'BULLISH_CROSSOVER') {
+    add('BULLISH', 6, 'EMA9 crossed above EMA21.');
+  } else if (emaCross === 'BEARISH_CROSSOVER') {
+    add('BEARISH', 6, 'EMA9 crossed below EMA21.');
+  }
+
+  if (finite(rsi14[i]) && finite(rsi14[p])) {
+    if (rsi14[p] < 30 && rsi14[i] >= 30) {
+      add('BULLISH', 5, 'RSI14 recovered above 30.');
+    } else if (rsi14[p] > 70 && rsi14[i] <= 70) {
+      add('BEARISH', 5, 'RSI14 fell below 70.');
+    } else if (rsi14[i] > 50 && rsi14[i] < 70) {
+      add('BULLISH', 2, 'RSI14 supports positive momentum.');
+    } else if (rsi14[i] < 50 && rsi14[i] > 30) {
+      add('BEARISH', 2, 'RSI14 supports negative momentum.');
+    }
+  }
+
+  if (macdCross === 'BULLISH_CROSSOVER') {
+    add('BULLISH', 5, 'MACD bullish crossover.');
+  } else if (macdCross === 'BEARISH_CROSSOVER') {
+    add('BEARISH', 5, 'MACD bearish crossover.');
+  }
+
+  if (stochCross === 'BULLISH_CROSSOVER' && st.k[i] < 35) {
+    add('BULLISH', 3, 'Stochastic bullish crossover in lower zone.');
+  } else if (stochCross === 'BEARISH_CROSSOVER' && st.k[i] > 65) {
+    add('BEARISH', 3, 'Stochastic bearish crossover in upper zone.');
   }
 
   callScore = Math.min(100, callScore);
   putScore = Math.min(100, putScore);
 
   const gap = Math.abs(callScore - putScore);
-
   const direction =
-    callScore > putScore
-      ? 'CALL'
-      : putScore > callScore
-        ? 'PUT'
-        : 'NONE';
+    callScore > putScore ? 'CALL' :
+    putScore > callScore ? 'PUT' : 'NONE';
 
   const winning = Math.max(callScore, putScore);
-
-  const opposing =
-    direction === 'CALL'
-      ? putScore
-      : direction === 'PUT'
-        ? callScore
-        : 0;
+  const opposing = direction === 'CALL'
+    ? putScore
+    : direction === 'PUT'
+      ? callScore
+      : 0;
 
   const guards = [];
 
-  if (
-    candles.length < Math.ceil(80 / timeframe) ||
-    five.length < 30
-  ) {
-    guards.push('Insufficient completed 1m/5m candle history.');
+  if (candles.length < 40) {
+    guards.push('Fewer than 40 completed 1-minute candles are available.');
   }
 
-  if (freshness !== 'FRESH' || age > HARD_STALE_SECONDS) {
-    guards.push('Market data is stale.');
+  if (freshness !== 'FRESH') {
+    guards.push('Market data is not fresh enough.');
   }
 
   if (
-    [
-      emaCross,
-      rsiCross,
-      macdCross,
-      stochCross
-    ].includes('UNAVAILABLE') ||
-    trend5m === 'UNAVAILABLE' ||
-    !finite(dx[i])
+    !finite(rsi14[i]) ||
+    !finite(ema9[i]) ||
+    !finite(ema21[i]) ||
+    line.direction === 'UNAVAILABLE' ||
+    levels.position === 'UNAVAILABLE'
   ) {
-    guards.push('One or more required indicators are unavailable.');
+    guards.push('Required price-history evidence is unavailable.');
   }
 
-  if (direction === 'NONE' || gap < 18) {
-    guards.push(
-      'Directional evidence conflicts or the score gap is too small.'
-    );
+  if (direction === 'NONE' || gap < 12) {
+    guards.push('Directional evidence conflicts or the score gap is too small.');
   }
 
-  if (winning < 58) {
-    guards.push('Evidence score is below the research threshold.');
+  if (winning < 35) {
+    guards.push('Evidence score is below the minimum research threshold.');
   }
 
-  if (direction === 'CALL' && trend5m !== 'BULLISH') {
-    guards.push('CALL conflicts with the 5m EMA21 trend filter.');
-  }
-
-  if (direction === 'PUT' && trend5m !== 'BEARISH') {
-    guards.push('PUT conflicts with the 5m EMA21 trend filter.');
-  }
-
-  if (direction === 'CALL' && emaCross !== 'BULLISH_CROSSOVER') {
-    guards.push('CALL requires a new bullish EMA crossover.');
-  }
-
-  if (direction === 'PUT' && emaCross !== 'BEARISH_CROSSOVER') {
-    guards.push('PUT requires a new bearish EMA crossover.');
-  }
-
-  if (opposing >= 18) {
+  if (opposing >= 28) {
     guards.push('Opposing evidence is material.');
   }
 
-  const signal = guards.length ? 'NO TRADE' : direction;
+  if (
+    direction === 'CALL' &&
+    pattern.direction === 'BEARISH' &&
+    levels.direction === 'BEARISH'
+  ) {
+    guards.push('Candlestick and support/resistance evidence oppose BUY.');
+  }
 
-  reasons.push(...guards.map(x => `NO TRADE: ${x}`));
+  if (
+    direction === 'PUT' &&
+    pattern.direction === 'BULLISH' &&
+    levels.direction === 'BULLISH'
+  ) {
+    guards.push('Candlestick and support/resistance evidence oppose SELL.');
+  }
 
-  const nowSec = Math.floor(now / 1000);
+  const signal = guards.length
+    ? 'NO TRADE'
+    : direction === 'CALL'
+      ? 'BUY'
+      : 'SELL';
 
-  const boundary =
-    (Math.floor(nowSec / (timeframe * 60)) + 1) *
-    timeframe *
-    60;
+  reasons.push(...guards.map(reason => `NO TRADE: ${reason}`));
 
-  const entry = Math.max(boundary, nowSec + 30);
+  const nowSeconds = Math.floor(now / 1000);
+  const nextBoundary = (Math.floor(nowSeconds / 60) + 1) * 60;
+  const entrySeconds = Math.max(nextBoundary, nowSeconds + 10);
 
   return {
     pair,
-    timeframe,
+    timeframe: 1,
     signal,
     confidence: signal === 'NO TRADE' ? null : winning,
     callScore,
     putScore,
     gap,
 
-    entryTime:
-      signal === 'NO TRADE'
-        ? null
-        : new Date(entry * 1000).toISOString(),
+    entryTime: signal === 'NO TRADE'
+      ? null
+      : new Date(entrySeconds * 1000).toISOString(),
 
-    expiryTime:
-      signal === 'NO TRADE'
-        ? null
-        : new Date(
-            (entry + timeframe * 60) * 1000
-          ).toISOString(),
+    expiryTime: signal === 'NO TRADE'
+      ? null
+      : new Date((entrySeconds + 60) * 1000).toISOString(),
 
     currentPrice: last.close,
     entryPrice: last.close,
@@ -1042,58 +871,35 @@ function scoreMarket(raw, pair, timeframe, fetchedAt) {
     dataAgeSeconds: round(age, 1),
     lastCandle: iso(last.time),
 
-    volatility:
-      finite(atr) && last.close
-        ? atr / last.close > 0.003
-          ? 'HIGH'
-          : atr / last.close > 0.001
-            ? 'MEDIUM'
-            : 'LOW'
-        : 'UNKNOWN',
-
     supportResistance: {
-      support: round(support),
-      resistance: round(resistance)
+      support: levels.support,
+      resistance: levels.resistance,
+      position: levels.position,
+      distanceToSupportPercent: levels.distanceToSupportPercent,
+      distanceToResistancePercent: levels.distanceToResistancePercent
     },
 
-    marketPsychology: context.psychology,
-    priceAction: context.priceAction,
+    trendLine: line,
+    marketPsychology: psychology.psychology,
+    priceAction: levels.position,
     candlePattern: pattern,
 
     indicators: {
-      ema9: round(ind.ema9),
-      ema21: round(ind.ema21),
-      emaCross: ind.emaCross,
-      rsi9: round(ind.rsi9, 2),
-      rsi9Previous: round(ind.rsi9Previous, 2),
-      rsiCross: ind.rsiCross,
-      adx14: round(ind.adx14, 2),
-
+      ema9: round(ema9[i]),
+      ema21: round(ema21[i]),
+      emaCross,
+      rsi14: round(rsi14[i], 2),
       macd: {
-        line: round(ind.macd.line),
-        signal: round(ind.macd.signal),
-        histogram: round(ind.macd.histogram),
-        crossover: ind.macd.crossover
+        line: round(mc.line[i]),
+        signal: round(mc.signal[i]),
+        histogram: round(mc.histogram[i]),
+        crossover: macdCross
       },
-
       stochastic: {
-        k: round(ind.stochastic.k, 2),
-        d: round(ind.stochastic.d, 2),
-        crossover: ind.stochastic.crossover
-      },
-
-      atr14: round(ind.atr14),
-
-      bollinger: ind.bollinger
-        ? {
-            upper: round(ind.bollinger.upper),
-            middle: round(ind.bollinger.middle),
-            lower: round(ind.bollinger.lower)
-          }
-        : null,
-
-      ema21_5m: round(ind.ema21_5m),
-      trend5m: ind.trend5m
+        k: round(st.k[i], 2),
+        d: round(st.d[i], 2),
+        crossover: stochCross
+      }
     },
 
     reasons,
@@ -1103,45 +909,21 @@ function scoreMarket(raw, pair, timeframe, fetchedAt) {
   };
 }
 
-function makeResponse(
-  selectedMarket,
-  rankedCandidates = [],
-  scanner = {}
-) {
-  return {
-    ok: true,
-    version: VERSION,
-    selectedMarket,
-    rankedCandidates,
-
-    scanner: {
-      running: scannerRunning,
-      startedAt: scannerStartedAt,
-      lastScanAt,
-      totalScanned,
-      batchSize: SCAN_BATCH_SIZE,
-      pairs: PAIRS.length,
-      ...scanner
-    },
-
-    metadata: metadata(),
-    source: 'Twelve Data LIVE',
-    diagnostic: { lastScanError }
-  };
-}
-
-function emptyResponse(pair, timeframe, reason) {
-  return makeResponse(emptyMarket(pair, timeframe, reason));
-}
-
-/**
- * Re-evaluate freshness at the moment a market is selected.
- * A market cannot remain FRESH simply because its old object said so.
- */
 function evaluateFreshness(market, now = Date.now()) {
-  if (!market || !TIMEFRAMES.includes(Number(market.timeframe))) {
+  if (!market || Number(market.timeframe) !== 1) {
     return {
       ...(market || emptyMarket()),
+      freshness: 'NO DATA',
+      signal: 'NO TRADE',
+      confidence: null
+    };
+  }
+
+  const candleOpen = Date.parse(market.lastCandle || '');
+
+  if (!Number.isFinite(candleOpen)) {
+    return {
+      ...market,
       freshness: 'NO DATA',
       dataAgeSeconds: null,
       signal: 'NO TRADE',
@@ -1149,127 +931,111 @@ function evaluateFreshness(market, now = Date.now()) {
     };
   }
 
-  const candleOpenMs = Date.parse(market.lastCandle || '');
-
-  if (!Number.isFinite(candleOpenMs)) {
-    return {
-      ...market,
-      freshness: 'NO DATA',
-      dataAgeSeconds: null,
-      signal: 'NO TRADE',
-      confidence: null,
-      reasons: [
-        ...(Array.isArray(market.reasons) ? market.reasons : []),
-        'Freshness could not be verified from the latest candle timestamp.'
-      ]
-    };
-  }
-
-  const candleCloseMs =
-    candleOpenMs + Number(market.timeframe) * 60000;
-
-  const ageSeconds = Math.max(
-    0,
-    (now - candleCloseMs) / 1000
-  );
-
-  const timeframe = Number(market.timeframe);
-
+  const age = Math.max(0, (now - (candleOpen + 60000)) / 1000);
   const freshness =
-    ageSeconds <= FRESHNESS_SECONDS[timeframe]
-      ? 'FRESH'
-      : ageSeconds <= HARD_STALE_SECONDS
-        ? 'STALE'
-        : 'HARD STALE';
+    age <= FRESHNESS_SECONDS[1] ? 'FRESH' :
+    age <= HARD_STALE_SECONDS ? 'STALE' : 'HARD STALE';
 
   if (freshness === 'FRESH') {
     return {
       ...market,
       freshness,
-      dataAgeSeconds: Math.round(ageSeconds)
+      dataAgeSeconds: Math.round(age)
     };
   }
 
   return {
     ...market,
     freshness,
-    dataAgeSeconds: Math.round(ageSeconds),
+    dataAgeSeconds: Math.round(age),
     signal: 'NO TRADE',
     confidence: null,
     reasons: [
       ...(Array.isArray(market.reasons) ? market.reasons : []),
-      'No trade: the latest completed candle is not fresh enough.'
+      'No trade: latest completed candle is not fresh enough.'
     ]
   };
 }
 
-/**
- * Rank only fresh CALL/PUT candidates.
- * When confidence is tied, use the score gap and then the fresher data.
- */
 function rankCandidates(markets) {
   return markets
-    .map(m => evaluateFreshness(m))
-    .filter(
-      m =>
-        m.freshness === 'FRESH' &&
-        (m.signal === 'CALL' || m.signal === 'PUT')
-    )
-    .sort((a, b) =>
-      (b.confidence || 0) - (a.confidence || 0) ||
-      (b.gap || 0) - (a.gap || 0) ||
-      (a.dataAgeSeconds || 0) - (b.dataAgeSeconds || 0)
-    )
-    .map((m, i) => ({
-      rank: i + 1,
-      pair: m.pair,
-      timeframe: m.timeframe,
-      signal: m.signal,
-      confidence: m.confidence,
-      callScore: m.callScore,
-      putScore: m.putScore,
-      gap: m.gap,
-      dataAgeSeconds: m.dataAgeSeconds,
-      entryTime: m.entryTime,
-      reason: m.reasons[0] || 'Evidence review.'
-    }));
-}
-
-function diagnosticMarket(results) {
-  if (!results.length) return emptyMarket();
-
-  return results
     .map(m => evaluateFreshness(m))
     .sort((a, b) =>
       (b.freshness === 'FRESH' ? 1 : 0) -
         (a.freshness === 'FRESH' ? 1 : 0) ||
       Math.max(b.callScore || 0, b.putScore || 0) -
         Math.max(a.callScore || 0, a.putScore || 0) ||
-      (a.dataAgeSeconds ?? Infinity) -
-        (b.dataAgeSeconds ?? Infinity)
+      (b.gap || 0) - (a.gap || 0) ||
+      (a.dataAgeSeconds ?? Infinity) - (b.dataAgeSeconds ?? Infinity)
+    )
+    .map((market, index) => ({
+      rank: index + 1,
+      pair: market.pair,
+      timeframe: 1,
+      signal: market.signal,
+      confidence: market.confidence,
+      callScore: market.callScore,
+      putScore: market.putScore,
+      gap: market.gap,
+      freshness: market.freshness,
+      dataAgeSeconds: market.dataAgeSeconds,
+      entryTime: market.entryTime,
+      reason: market.reasons?.[0] || 'Evidence review.'
+    }));
+}
+
+function makeResponse(selectedMarket, rankedCandidates = [], scanner = {}) {
+  return {
+    ok: true,
+    version: VERSION,
+    selectedMarket,
+    rankedCandidates,
+    scanner: {
+      running: scannerRunning,
+      startedAt: scannerStartedAt,
+      lastScanAt,
+      totalScanned,
+      batchSize: SCAN_BATCH_SIZE,
+      pairs: PAIRS.length,
+      progress: { ...scanProgress },
+      cooldownRemainingMs: Math.max(
+        0,
+        SCAN_COOLDOWN_MS - (Date.now() - lastScanStartedAtMs)
+      ),
+      ...scanner
+    },
+    metadata: metadata(),
+    source: 'Twelve Data LIVE',
+    diagnostic: { lastScanError }
+  };
+}
+
+function diagnosticMarket(markets) {
+  if (!markets.length) return emptyMarket();
+
+  return markets
+    .map(m => evaluateFreshness(m))
+    .sort((a, b) =>
+      (b.freshness === 'FRESH' ? 1 : 0) -
+        (a.freshness === 'FRESH' ? 1 : 0) ||
+      Math.max(b.callScore || 0, b.putScore || 0) -
+        Math.max(a.callScore || 0, a.putScore || 0)
     )[0];
 }
 
-/**
- * Refresh the response from latest scored markets.
- * Do not rescore every pair from pairCache here.
- */
 function refreshCandidates() {
-  const markets = [...latestMarkets.values()]
-    .map(m => evaluateFreshness(m));
+  const markets = [...latestMarkets.values()].map(evaluateFreshness);
+  const ranked = rankCandidates(markets);
+  const best = ranked.find(m => m.freshness === 'FRESH' &&
+    (m.signal === 'BUY' || m.signal === 'SELL'));
 
-  const rankedCandidates = rankCandidates(markets);
-  const top = rankedCandidates[0];
-
-  const bestCandidate = top
-    ? latestMarkets.get(`${top.pair}|${top.timeframe}`)
-    : null;
+  const selected = best
+    ? latestMarkets.get(best.pair)
+    : diagnosticMarket(markets);
 
   cachedResult = makeResponse(
-    bestCandidate
-      ? evaluateFreshness(bestCandidate)
-      : diagnosticMarket(markets),
-    rankedCandidates
+    selected ? evaluateFreshness(selected) : emptyMarket(),
+    ranked
   );
 }
 
@@ -1280,12 +1046,7 @@ async function scanBatch() {
   scannerStartedAt = iso(Date.now());
   lastScanStartedAtMs = Date.now();
   lastScanError = null;
-
-  scanProgress = {
-    completed: 0,
-    total: PAIRS.length,
-    pair: null
-  };
+  scanProgress = { completed: 0, total: PAIRS.length, pair: null };
 
   try {
     for (const pair of PAIRS) {
@@ -1293,18 +1054,15 @@ async function scanBatch() {
 
       try {
         const data = await getPairData(pair, true);
-
-        for (const tf of TIMEFRAMES) {
-          latestMarkets.set(
-            `${pair}|${tf}`,
-            scoreMarket(data.candles, pair, tf, data.fetchedAt)
-          );
-        }
+        latestMarkets.set(pair, scoreMarket(data.candles, pair, data.fetchedAt));
       } catch (error) {
-        lastScanError = String(error.message || error);
+        lastScanError = `${pair}: ${String(error.message || error)}`;
       } finally {
         scanProgress.completed++;
       }
+
+      // Keep the available results usable while the remaining pairs scan.
+      refreshCandidates();
     }
 
     totalScanned += scanProgress.completed;
@@ -1313,29 +1071,45 @@ async function scanBatch() {
   } finally {
     scannerRunning = false;
     scanProgress.pair = null;
-
-    if (cachedResult) {
-      cachedResult.scanner.running = false;
-      cachedResult.scanner.progress = { ...scanProgress };
-    }
+    refreshCandidates();
   }
 }
 
-app.get('/', (_req, res) =>
+function startScanIfPossible() {
+  if (!API_KEY || scannerRunning) return false;
+
+  const remaining = Math.max(
+    0,
+    SCAN_COOLDOWN_MS - (Date.now() - lastScanStartedAtMs)
+  );
+
+  if (lastScanStartedAtMs && remaining > 0) return false;
+
+  resetDailyCounter();
+
+  if (DAILY_USABLE_LIMIT - dailyCreditsUsed < PAIRS.length) {
+    lastScanError = 'Not enough safe daily credits for a full 24-pair scan.';
+    return false;
+  }
+
+  void scanBatch().catch(error => {
+    lastScanError = String(error.message || error);
+    scannerRunning = false;
+  });
+
+  return true;
+}
+
+app.get('/', (_req, res) => {
   res.json({
     ok: true,
     name: 'PO AI Predictor API',
     version: VERSION,
-    endpoints: [
-      '/api/best',
-      '/api/health',
-      '/api/scan',
-      '/api/analyze'
-    ]
-  })
-);
+    endpoints: ['/api/best', '/api/health', '/api/scan', '/api/analyze']
+  });
+});
 
-app.get('/api/health', (_req, res) =>
+app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     version: VERSION,
@@ -1352,17 +1126,15 @@ app.get('/api/health', (_req, res) =>
       SCAN_COOLDOWN_MS - (Date.now() - lastScanStartedAtMs)
     ),
     metadata: metadata()
-  })
-);
+  });
+});
 
 app.get('/api/best', (_req, res) => {
-  const response = cachedResult || emptyResponse(
-    'NO MARKET',
-    null,
-    API_KEY
-      ? 'No full scan has completed yet. Start a scan to review all pairs.'
-      : 'The Twelve Data API key is not configured.'
-  );
+  if (!cachedResult) {
+    refreshCandidates();
+  }
+
+  const response = cachedResult || makeResponse(emptyMarket());
 
   response.scanner = {
     ...(response.scanner || {}),
@@ -1384,8 +1156,6 @@ app.get('/api/best', (_req, res) => {
 });
 
 app.post('/api/scan', (_req, res) => {
-  resetDailyCounter();
-
   if (!API_KEY) {
     return res.status(503).json({
       ok: false,
@@ -1399,10 +1169,7 @@ app.post('/api/scan', (_req, res) => {
       ok: false,
       version: VERSION,
       error: 'A full scan is already running.',
-      scanner: {
-        running: true,
-        progress: { ...scanProgress }
-      }
+      scanner: { running: true, progress: { ...scanProgress } }
     });
   }
 
@@ -1415,16 +1182,18 @@ app.post('/api/scan', (_req, res) => {
     return res.status(429).json({
       ok: false,
       version: VERSION,
-      error: 'Please wait for the scan cooldown before starting another scan.',
+      error: 'Please wait for the scan cooldown.',
       cooldownRemainingMs: remaining
     });
   }
+
+  resetDailyCounter();
 
   if (DAILY_USABLE_LIMIT - dailyCreditsUsed < PAIRS.length) {
     return res.status(429).json({
       ok: false,
       version: VERSION,
-      error: 'Not enough safe daily API credits remain to begin a full 24-pair scan.',
+      error: 'Not enough safe daily API credits for a full scan.',
       dailyCreditsRemaining: Math.max(
         0,
         DAILY_USABLE_LIMIT - dailyCreditsUsed
@@ -1433,85 +1202,58 @@ app.post('/api/scan', (_req, res) => {
     });
   }
 
-  void scanBatch().catch(error => {
-    lastScanError = String(error.message || error);
-    scannerRunning = false;
-  });
+  const started = startScanIfPossible();
 
-  return res.status(202).json({
-    ok: true,
+  return res.status(started ? 202 : 429).json({
+    ok: started,
     version: VERSION,
-    message: 'Full market scan started.',
+    message: started
+      ? 'Full 24-pair scan started in the background.'
+      : 'Scan could not start; check cooldown and API credits.',
     scanner: {
-      running: true,
+      running: scannerRunning,
       progress: { ...scanProgress },
       totalPairs: PAIRS.length,
       timeframesPerPair: TIMEFRAMES
     },
-    note: 'The provider rate limit means a full scan may take about 4 minutes.'
+    note: 'The provider request limits mean a cold full scan takes longer than 10 seconds.'
   });
 });
 
-app.get('/api/analyze', async (req, res) => {
-  const pair = String(req.query.pair || '')
-    .trim()
-    .toUpperCase();
+app.get('/api/analyze', (_req, res) => {
+  // Respond quickly from the latest scored results, then refresh in background.
+  if (!cachedResult) refreshCandidates();
 
-  const timeframe = Number(req.query.timeframe || 1);
+  const markets = [...latestMarkets.values()].map(evaluateFreshness);
+  const rankedCandidates = rankCandidates(markets);
 
-  if (!PAIRS.includes(pair)) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Unsupported pair.',
-      allowedPairs: PAIRS
-    });
-  }
+  const best = rankedCandidates.find(m =>
+    m.freshness === 'FRESH' &&
+    (m.signal === 'BUY' || m.signal === 'SELL')
+  );
 
-  if (!TIMEFRAMES.includes(timeframe)) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Unsupported timeframe; use 1, 2, or 3.'
-    });
-  }
+  const selected = best
+    ? latestMarkets.get(best.pair)
+    : diagnosticMarket(markets);
 
-  try {
-    const data = await getPairData(pair);
-
-    const market = scoreMarket(
-      data.candles,
-      pair,
-      timeframe,
-      data.fetchedAt
-    );
-
-    for (const tf of TIMEFRAMES) {
-      latestMarkets.set(
-        `${pair}|${tf}`,
-        scoreMarket(data.candles, pair, tf, data.fetchedAt)
+  const selectedMarket = selected
+    ? evaluateFreshness(selected)
+    : emptyMarket(
+        'NO MARKET',
+        API_KEY
+          ? 'No scored pair data is available yet. The first scan must collect data.'
+          : 'The Twelve Data API key is not configured.'
       );
-    }
 
-    const allCachedMarkets = [...latestMarkets.values()]
-      .map(m => evaluateFreshness(m));
+  const scanStarted = startScanIfPossible();
 
-    const rankedCandidates = rankCandidates(allCachedMarkets);
-    const selectedMarket = evaluateFreshness(market);
-
-    cachedResult = makeResponse(selectedMarket, rankedCandidates);
-
-    return res.json(cachedResult);
-  } catch (error) {
-    return res.status(503).json({
-      ok: false,
-      version: VERSION,
-      error: String(error.message || error),
-      selectedMarket: emptyMarket(
-        pair,
-        timeframe,
-        'Analysis failed; do not infer a trade.'
-      )
-    });
-  }
+  return res.json(
+    makeResponse(selectedMarket, rankedCandidates, {
+      analysisMode: 'ALL 24 PAIRS / 1-MINUTE',
+      scanStarted,
+      note: 'Results are based on available scored data; pairs not yet scanned are not represented as fresh.'
+    })
+  );
 });
 
 if (require.main === module) {
