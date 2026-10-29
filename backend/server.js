@@ -7,7 +7,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '32kb' }));
 
-const VERSION = 'V9.4.0';
+const VERSION = 'V9.4.1';
 const PORT = Number(process.env.PORT || 10000);
 const API_KEY =
   process.env.TWELVE_DATA_API_KEY ||
@@ -1134,41 +1134,92 @@ function emptyResponse(pair, timeframe, reason) {
   return makeResponse(emptyMarket(pair, timeframe, reason));
 }
 
-function diagnosticMarket(results) {
-  if (!results.length) return emptyMarket();
-
-  return results.slice().sort((a, b) =>
-    (b.freshness === 'FRESH' ? 1 : 0) -
-      (a.freshness === 'FRESH' ? 1 : 0) ||
-    Math.max(b.callScore || 0, b.putScore || 0) -
-      Math.max(a.callScore || 0, a.putScore || 0)
-  )[0];
-}
-
-function refreshCandidates() {
-  const markets = [];
-
-  for (const [pair, data] of pairCache.entries()) {
-    for (const tf of TIMEFRAMES) {
-      const market = scoreMarket(
-        data.candles,
-        pair,
-        tf,
-        data.fetchedAt
-      );
-
-      latestMarkets.set(`${pair}|${tf}`, market);
-      markets.push(market);
-    }
+/**
+ * Re-evaluate freshness at the moment a market is selected.
+ * A market cannot remain FRESH simply because its old object said so.
+ */
+function evaluateFreshness(market, now = Date.now()) {
+  if (!market || !TIMEFRAMES.includes(Number(market.timeframe))) {
+    return {
+      ...(market || emptyMarket()),
+      freshness: 'NO DATA',
+      dataAgeSeconds: null,
+      signal: 'NO TRADE',
+      confidence: null
+    };
   }
 
-  const rankedCandidates = markets
+  const candleOpenMs = Date.parse(market.lastCandle || '');
+
+  if (!Number.isFinite(candleOpenMs)) {
+    return {
+      ...market,
+      freshness: 'NO DATA',
+      dataAgeSeconds: null,
+      signal: 'NO TRADE',
+      confidence: null,
+      reasons: [
+        ...(Array.isArray(market.reasons) ? market.reasons : []),
+        'Freshness could not be verified from the latest candle timestamp.'
+      ]
+    };
+  }
+
+  const candleCloseMs =
+    candleOpenMs + Number(market.timeframe) * 60000;
+
+  const ageSeconds = Math.max(
+    0,
+    (now - candleCloseMs) / 1000
+  );
+
+  const timeframe = Number(market.timeframe);
+
+  const freshness =
+    ageSeconds <= FRESHNESS_SECONDS[timeframe]
+      ? 'FRESH'
+      : ageSeconds <= HARD_STALE_SECONDS
+        ? 'STALE'
+        : 'HARD STALE';
+
+  if (freshness === 'FRESH') {
+    return {
+      ...market,
+      freshness,
+      dataAgeSeconds: Math.round(ageSeconds)
+    };
+  }
+
+  return {
+    ...market,
+    freshness,
+    dataAgeSeconds: Math.round(ageSeconds),
+    signal: 'NO TRADE',
+    confidence: null,
+    reasons: [
+      ...(Array.isArray(market.reasons) ? market.reasons : []),
+      'No trade: the latest completed candle is not fresh enough.'
+    ]
+  };
+}
+
+/**
+ * Rank only fresh CALL/PUT candidates.
+ * When confidence is tied, use the score gap and then the fresher data.
+ */
+function rankCandidates(markets) {
+  return markets
+    .map(m => evaluateFreshness(m))
     .filter(
       m =>
         m.freshness === 'FRESH' &&
         (m.signal === 'CALL' || m.signal === 'PUT')
     )
-    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+    .sort((a, b) =>
+      (b.confidence || 0) - (a.confidence || 0) ||
+      (b.gap || 0) - (a.gap || 0) ||
+      (a.dataAgeSeconds || 0) - (b.dataAgeSeconds || 0)
+    )
     .map((m, i) => ({
       rank: i + 1,
       pair: m.pair,
@@ -1177,18 +1228,47 @@ function refreshCandidates() {
       confidence: m.confidence,
       callScore: m.callScore,
       putScore: m.putScore,
+      gap: m.gap,
+      dataAgeSeconds: m.dataAgeSeconds,
       entryTime: m.entryTime,
       reason: m.reasons[0] || 'Evidence review.'
     }));
+}
 
-  const bestCandidate =
-    rankedCandidates[0] &&
-    latestMarkets.get(
-      `${rankedCandidates[0].pair}|${rankedCandidates[0].timeframe}`
-    );
+function diagnosticMarket(results) {
+  if (!results.length) return emptyMarket();
+
+  return results
+    .map(m => evaluateFreshness(m))
+    .sort((a, b) =>
+      (b.freshness === 'FRESH' ? 1 : 0) -
+        (a.freshness === 'FRESH' ? 1 : 0) ||
+      Math.max(b.callScore || 0, b.putScore || 0) -
+        Math.max(a.callScore || 0, a.putScore || 0) ||
+      (a.dataAgeSeconds ?? Infinity) -
+        (b.dataAgeSeconds ?? Infinity)
+    )[0];
+}
+
+/**
+ * Refresh the response from latest scored markets.
+ * Do not rescore every pair from pairCache here.
+ */
+function refreshCandidates() {
+  const markets = [...latestMarkets.values()]
+    .map(m => evaluateFreshness(m));
+
+  const rankedCandidates = rankCandidates(markets);
+  const top = rankedCandidates[0];
+
+  const bestCandidate = top
+    ? latestMarkets.get(`${top.pair}|${top.timeframe}`)
+    : null;
 
   cachedResult = makeResponse(
-    bestCandidate || diagnosticMarket(markets),
+    bestCandidate
+      ? evaluateFreshness(bestCandidate)
+      : diagnosticMarket(markets),
     rankedCandidates
   );
 }
@@ -1411,28 +1491,13 @@ app.get('/api/analyze', async (req, res) => {
       );
     }
 
-    const allCachedMarkets = [...latestMarkets.values()];
+    const allCachedMarkets = [...latestMarkets.values()]
+      .map(m => evaluateFreshness(m));
 
-    const rankedCandidates = allCachedMarkets
-      .filter(
-        m =>
-          m.freshness === 'FRESH' &&
-          (m.signal === 'CALL' || m.signal === 'PUT')
-      )
-      .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
-      .map((m, i) => ({
-        rank: i + 1,
-        pair: m.pair,
-        timeframe: m.timeframe,
-        signal: m.signal,
-        confidence: m.confidence,
-        callScore: m.callScore,
-        putScore: m.putScore,
-        entryTime: m.entryTime,
-        reason: m.reasons[0] || 'Evidence review.'
-      }));
+    const rankedCandidates = rankCandidates(allCachedMarkets);
+    const selectedMarket = evaluateFreshness(market);
 
-    cachedResult = makeResponse(market, rankedCandidates);
+    cachedResult = makeResponse(selectedMarket, rankedCandidates);
 
     return res.json(cachedResult);
   } catch (error) {
