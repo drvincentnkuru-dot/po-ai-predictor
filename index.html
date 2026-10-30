@@ -5,32 +5,44 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#101827">
-  <meta name="description" content="PO AI Predictor V9.5.0 — live forex research using one-minute candles and evidence-gated signals.">
-  <title>PO AI Predictor V9.5.0</title>
+  <meta name="description" content="PO AI Predictor V9.6.0 — live forex research using one-minute candles, priority pair scanning and evidence-gated signals.">
+  <title>PO AI Predictor V9.6.0</title>
   <link rel="stylesheet" href="style.css">
   <script src="script.js" defer></script>
 </head>
+
 <body>
   <div class="app-shell">
+
     <header class="app-header">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">PO</div>
+
         <div>
           <h1>PO AI PREDICTOR</h1>
-          <p class="version">V9.5.0 · LIVE FOREX RESEARCH</p>
-          <p class="muted-text">1-minute candles · 24-pair research scanner</p>
+          <p class="version">V9.6.0 · FAST PRIORITY SCANNER</p>
+          <p class="muted-text">
+            1-minute candles · 6 priority pairs · 18 background pairs
+          </p>
         </div>
       </div>
 
       <div class="header-status">
-        <span id="backendStatus" class="status-badge status-unknown">Checking API…</span>
-        <span id="marketStatus" class="status-badge status-unknown">Market status: checking</span>
+        <span id="backendStatus" class="status-badge status-unknown">
+          Checking API…
+        </span>
+
+        <span id="marketStatus" class="status-badge status-unknown">
+          Market status: checking
+        </span>
       </div>
     </header>
 
     <main>
+
       <section class="notice-panel" aria-label="Research disclaimer">
         <strong>Research and analysis tool</strong>
+
         <p>
           Evidence score, not win probability. No guaranteed outcomes.
           Signals can be wrong. BUY and SELL are research directions, not
@@ -39,21 +51,30 @@
         </p>
       </section>
 
+      <!-- ANALYSIS CONTROLS -->
       <section class="control-panel panel">
+
         <div class="section-heading">
           <div>
-            <h2>24-pair market analysis</h2>
+            <h2>Forex market analysis</h2>
+
             <p>
-              Analyze available results and request a background scan.
-              The strategy uses completed 1-minute candles only.
+              Analyze available fresh results immediately, then allow the
+              backend to continue scanning in the background.
+              Completed 1-minute candles only.
             </p>
           </div>
-          <button id="analyzeBtn" type="button">Analyze all 24 pairs</button>
+
+          <button id="analyzeBtn" type="button">
+            Analyze priority pairs
+          </button>
         </div>
 
         <div class="control-grid">
+
           <div class="field">
             <label for="selectedPair">Reference currency pair</label>
+
             <select id="selectedPair">
               <option value="EUR/USD">EUR/USD</option>
               <option value="GBP/USD">GBP/USD</option>
@@ -84,247 +105,374 @@
 
           <div class="field">
             <label for="timeframe">Candle interval</label>
+
             <select id="timeframe" disabled>
               <option value="1" selected>1 minute only</option>
             </select>
           </div>
+
         </div>
 
         <div id="errorBox" class="error-box" role="alert" hidden></div>
+
         <p id="scanInfo" class="muted-text" aria-live="polite">
-          Checking the API and available market results…
+          Checking API and available market results…
         </p>
+
       </section>
 
-      <section class="signal-panel panel" aria-label="Current analysis">
-        <div class="section-heading">
-          <div>
-            <h2>Current evidence review</h2>
-            <p id="provider">Provider: Twelve Data LIVE</p>
-          </div>
-          <span id="signalBadge" class="signal-badge signal-wait">NO TRADE</span>
-        </div>
-
-        <div class="signal-summary">
-          <div class="score-card">
-            <span class="metric-label">Evidence score</span>
-            <div class="score-value">
-              <span id="confidence">—</span>
-              <span class="score-out-of">/100</span>
-            </div>
-            <p>Not a probability of winning</p>
-          </div>
-
-          <div class="summary-card">
-            <span class="metric-label">Selected candidate</span>
-            <strong id="summaryPair">—</strong>
-            <span id="trendBadge" class="trend-badge">Trend: UNKNOWN</span>
-          </div>
-
-          <div class="summary-card">
-            <span class="metric-label">Data freshness</span>
-            <strong id="freshness">Checking…</strong>
-            <span id="dataAge">Age: unavailable</span>
-          </div>
-        </div>
-
-        <div class="decision-details">
-          <div class="detail-item">
-            <span class="metric-label">Reference time</span>
-            <strong id="entryTime">—</strong>
-          </div>
-          <div class="detail-item">
-            <span class="metric-label">Expiry time</span>
-            <strong id="expiryTime">—</strong>
-          </div>
-          <div class="detail-item">
-            <span class="metric-label">Current price</span>
-            <strong id="currentPrice">—</strong>
-          </div>
-          <div class="detail-item">
-            <span class="metric-label">Reference price</span>
-            <strong id="entryPrice">—</strong>
-          </div>
-        </div>
-
-        <div class="score-comparison">
-          <div class="direction-score">
-            <span>BUY evidence</span>
-            <strong id="callScore">—</strong>
-          </div>
-          <div class="direction-score">
-            <span>SELL evidence</span>
-            <strong id="putScore">—</strong>
-          </div>
-          <div class="direction-score">
-            <span>Evidence gap</span>
-            <strong id="gap">—</strong>
-          </div>
-        </div>
-
-        <p id="signalReason" class="signal-reason">
-          Waiting for sufficient, fresh and consistent evidence.
-        </p>
-      </section>
-
+      <!-- PRIORITY SCANNER OVERVIEW -->
       <section class="panel">
+
         <div class="section-heading">
           <div>
-            <h2>Primary evidence</h2>
+            <h2>Scanner configuration</h2>
+
             <p>
-              Price-action evidence is prioritized over secondary technical
-              indicators.
+              Priority pairs are reviewed first. The remaining pairs are
+              evaluated in the background.
             </p>
           </div>
         </div>
 
         <div class="analysis-grid">
+
+          <article class="analysis-card">
+            <h3>Priority group · 6 pairs</h3>
+
+            <strong>First evaluation</strong>
+
+            <ul>
+              <li>EUR/USD</li>
+              <li>GBP/USD</li>
+              <li>USD/JPY</li>
+              <li>USD/CHF</li>
+              <li>AUD/USD</li>
+              <li>USD/CAD</li>
+            </ul>
+          </article>
+
+          <article class="analysis-card">
+            <h3>Background group · 18 pairs</h3>
+
+            <strong>Continuous research</strong>
+
+            <ul>
+              <li>NZD/USD</li>
+              <li>EUR/GBP</li>
+              <li>EUR/JPY</li>
+              <li>GBP/JPY</li>
+              <li>AUD/JPY</li>
+              <li>CAD/JPY</li>
+              <li>CHF/JPY</li>
+              <li>EUR/AUD</li>
+              <li>EUR/CAD</li>
+              <li>EUR/CHF</li>
+              <li>GBP/AUD</li>
+              <li>GBP/CAD</li>
+              <li>GBP/CHF</li>
+              <li>NZD/JPY</li>
+              <li>NZD/CAD</li>
+              <li>AUD/CAD</li>
+              <li>AUD/CHF</li>
+              <li>CAD/CHF</li>
+            </ul>
+          </article>
+
+        </div>
+
+        <p class="muted-text">
+          Scanner groups describe the backend configuration.
+          Actual scan speed depends on fresh cached data and provider
+          request limits.
+        </p>
+
+      </section>
+
+      <!-- CURRENT SIGNAL -->
+      <section class="signal-panel panel" aria-label="Current analysis">
+
+        <div class="section-heading">
+          <div>
+            <h2>Current evidence review</h2>
+            <p id="provider">Provider: Twelve Data LIVE</p>
+          </div>
+
+          <span id="signalBadge" class="signal-badge signal-wait">
+            NO TRADE
+          </span>
+        </div>
+
+        <div class="signal-summary">
+
+          <div class="score-card">
+            <span class="metric-label">Evidence score</span>
+
+            <div class="score-value">
+              <span id="confidence">—</span>
+              <span class="score-out-of">/100</span>
+            </div>
+
+            <p>Not a probability of winning</p>
+          </div>
+
+          <div class="summary-card">
+            <span class="metric-label">Selected candidate</span>
+
+            <strong id="summaryPair">—</strong>
+
+            <span id="trendBadge" class="trend-badge">
+              Trend: UNKNOWN
+            </span>
+          </div>
+
+          <div class="summary-card">
+            <span class="metric-label">Data freshness</span>
+
+            <strong id="freshness">Checking…</strong>
+
+            <span id="dataAge">Age: unavailable</span>
+          </div>
+
+        </div>
+
+        <div class="decision-details">
+
+          <div class="detail-item">
+            <span class="metric-label">Reference time</span>
+            <strong id="entryTime">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Expiry time</span>
+            <strong id="expiryTime">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Current price</span>
+            <strong id="currentPrice">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Reference price</span>
+            <strong id="entryPrice">—</strong>
+          </div>
+
+        </div>
+
+        <div class="score-comparison">
+
+          <div class="direction-score">
+            <span>BUY evidence</span>
+            <strong id="callScore">—</strong>
+          </div>
+
+          <div class="direction-score">
+            <span>SELL evidence</span>
+            <strong id="putScore">—</strong>
+          </div>
+
+          <div class="direction-score">
+            <span>Evidence gap</span>
+            <strong id="gap">—</strong>
+          </div>
+
+        </div>
+
+        <p id="signalReason" class="signal-reason">
+          Waiting for sufficient, fresh and consistent evidence.
+        </p>
+
+      </section>
+
+      <!-- PRIMARY EVIDENCE -->
+      <section class="panel">
+
+        <div class="section-heading">
+          <div>
+            <h2>Primary evidence</h2>
+
+            <p>
+              Candlestick patterns, market psychology, support/resistance
+              and trend-line analysis receive priority in the research model.
+            </p>
+          </div>
+        </div>
+
+        <div class="analysis-grid">
+
           <article class="analysis-card">
             <h3>Candlestick pattern</h3>
+
             <strong id="candlePattern">—</strong>
-            <p id="lastCandle">Latest completed candle: —</p>
+
+            <p id="lastCandle">
+              Latest completed candle: —
+            </p>
           </article>
 
           <article class="analysis-card">
             <h3>Trend line and price action</h3>
-            <p id="priceAction">Waiting for completed-candle analysis.</p>
+
+            <p id="priceAction">
+              Waiting for completed-candle analysis.
+            </p>
           </article>
 
           <article class="analysis-card">
             <h3>Market psychology</h3>
-            <p id="psychology">Waiting for observable price behaviour.</p>
+
+            <p id="psychology">
+              Waiting for observable price behaviour.
+            </p>
           </article>
+
         </div>
 
         <div class="metrics-grid">
+
           <article class="metric-card">
             <span class="metric-label">Support</span>
+
             <strong id="support">—</strong>
+
             <small>Prior completed candles</small>
           </article>
 
           <article class="metric-card">
             <span class="metric-label">Resistance</span>
+
             <strong id="resistance">—</strong>
+
             <small>Prior completed candles</small>
           </article>
+
         </div>
 
         <div class="reasons-panel">
+
           <h3>Evidence and decision reasons</h3>
+
           <ul id="reasons">
             <li>Waiting for analysis.</li>
           </ul>
+
         </div>
+
       </section>
 
+      <!-- SECONDARY INDICATORS -->
       <section class="panel">
+
         <div class="section-heading">
           <div>
             <h2>Secondary technical indicators</h2>
+
             <p>
               EMA 9/21, RSI 14, MACD and Stochastic provide supporting
-              evidence. They do not guarantee a direction.
+              evidence. They do not independently guarantee a direction.
             </p>
           </div>
         </div>
 
         <div class="metrics-grid">
+
           <article class="metric-card">
             <span class="metric-label">EMA 9</span>
+
             <strong id="ema9">—</strong>
+
             <small id="emaCross">EMA crossover: —</small>
           </article>
 
           <article class="metric-card">
             <span class="metric-label">EMA 21</span>
+
             <strong id="ema21">—</strong>
+
             <small>1-minute candles</small>
           </article>
 
           <article class="metric-card">
             <span class="metric-label">RSI 14</span>
+
             <strong id="rsi">—</strong>
+
             <small id="rsiCross">RSI 14: —</small>
           </article>
 
           <article class="metric-card">
             <span class="metric-label">MACD line</span>
+
             <strong id="macdLine">—</strong>
+
             <small id="macdCross">MACD: —</small>
           </article>
 
           <article class="metric-card">
             <span class="metric-label">MACD signal</span>
+
             <strong id="macdSignal">—</strong>
+
             <small id="macdHistogram">Histogram: —</small>
           </article>
 
           <article class="metric-card">
             <span class="metric-label">Stochastic %K</span>
+
             <strong id="stochK">—</strong>
+
             <small id="stochasticCross">Stochastic: —</small>
           </article>
 
           <article class="metric-card">
             <span class="metric-label">Stochastic %D</span>
+
             <strong id="stochD">—</strong>
+
             <small>Signal line</small>
           </article>
 
-          <article class="metric-card">
-            <span class="metric-label">Bollinger upper</span>
-            <strong id="bollingerUpper">—</strong>
-            <small>Upper band</small>
-          </article>
-
-          <article class="metric-card">
-            <span class="metric-label">Bollinger middle</span>
-            <strong id="bollingerMiddle">—</strong>
-            <small>Middle band</small>
-          </article>
-
-          <article class="metric-card">
-            <span class="metric-label">Bollinger lower</span>
-            <strong id="bollingerLower">—</strong>
-            <small>Lower band</small>
-          </article>
-
-          <article class="metric-card">
-            <span class="metric-label">Volatility</span>
-            <strong id="volatility">—</strong>
-            <small>Backend assessment if available</small>
-          </article>
         </div>
+
       </section>
 
+      <!-- BACKGROUND SCANNER -->
       <section class="panel scanner-panel" hidden>
+
         <div class="section-heading">
           <div>
-            <h2>24-pair research scanner</h2>
+            <h2>Priority and background scanner</h2>
+
             <p>
-              Candidates are ranked using available evidence. Only sufficiently
-              fresh and qualified candidates should receive a directional signal.
+              Fresh candidates are ranked using available evidence.
+              Only sufficiently fresh and qualified candidates receive
+              a directional research signal.
             </p>
           </div>
+
           <span id="scannerStatus" class="status-badge status-unknown">
             Waiting
           </span>
         </div>
 
         <div class="scanner-stats">
+
           <div class="mini-stat">
             <span>Pairs cached</span>
             <strong id="cachedPairs">0</strong>
           </div>
+
           <div class="mini-stat">
             <span>Qualified candidates</span>
             <strong id="candidateCount">0</strong>
           </div>
+
           <div class="mini-stat">
             <span>Last scan</span>
             <strong id="lastScanAt">—</strong>
           </div>
+
         </div>
 
         <div id="scanner" class="scanner" aria-live="polite">
@@ -332,17 +480,24 @@
             Waiting for the backend scanner.
           </p>
         </div>
+
       </section>
 
+      <!-- PROVIDER USAGE -->
       <section class="panel provider-panel">
+
         <div class="section-heading">
           <div>
             <h2>Provider and API usage</h2>
-            <p>Usage information reported by the backend.</p>
+
+            <p>
+              Usage information reported by the backend.
+            </p>
           </div>
         </div>
 
         <div class="provider-grid">
+
           <div class="detail-item">
             <span class="metric-label">Provider</span>
             <strong id="providerName">Twelve Data LIVE</strong>
@@ -362,23 +517,40 @@
             <span class="metric-label">Daily credits remaining</span>
             <strong id="dailyCreditsRemaining">—</strong>
           </div>
+
         </div>
 
         <p class="muted-text">
-          Twelve Data limits may prevent all 24 pairs from receiving fresh
-          candles simultaneously. Cached results are not automatically fresh.
-          No signal is guaranteed.
+          Twelve Data request limits may prevent all 24 pairs from receiving
+          fresh candles simultaneously. Cached results are not automatically
+          fresh. Stale or insufficient data must never produce a confirmed
+          BUY or SELL signal.
         </p>
+
       </section>
+
     </main>
 
     <footer class="app-footer">
-      <p>PO AI Predictor V9.5.0 · Live forex research</p>
+
+      <p>
+        PO AI Predictor V9.6.0 · Live forex research
+      </p>
+
       <p>
         Evidence score, not win probability. No guaranteed outcomes.
         NO TRADE when evidence is insufficient.
       </p>
+
     </footer>
+
   </div>
+
+  <noscript>
+    <p>
+      JavaScript is required to load live market data and analyze signals.
+    </p>
+  </noscript>
+
 </body>
 </html>
