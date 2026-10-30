@@ -7,13 +7,22 @@
       'https://po-ai-predictor-api.onrender.com'
   ).replace(/\/+$/, '');
 
+  const VERSION_LABEL = 'V9.6.0';
   const HEALTH_INTERVAL_MS = 60000;
   const SCAN_POLL_INTERVAL_MS = 2500;
   const REQUEST_TIMEOUT_MS = 30000;
   const HEALTH_TIMEOUT_MS = 12000;
   const MAX_DATA_AGE_SECONDS = 150;
   const MAX_REASONS = 10;
-  const PAIR_COUNT = 24;
+
+  const PRIORITY_PAIRS = [
+    'EUR/USD',
+    'GBP/USD',
+    'USD/JPY',
+    'USD/CHF',
+    'AUD/USD',
+    'USD/CAD'
+  ];
 
   const $ = id => document.getElementById(id);
 
@@ -260,6 +269,7 @@
     if (
       market.noTrade === true ||
       market.tradeAllowed === false ||
+      market.insufficientData === true ||
       signalObject.noTrade === true ||
       signalObject.tradeAllowed === false
     ) {
@@ -303,8 +313,8 @@
 
   function isQualifiedCandidate(candidate) {
     const signal = getSignal(candidate);
-
     const age = num(candidate.dataAgeSeconds);
+
     const freshness = String(
       first(candidate.freshness, 'UNKNOWN')
     ).toUpperCase();
@@ -316,7 +326,8 @@
       age >= 0 &&
       age <= MAX_DATA_AGE_SECONDS &&
       candidate.noTrade !== true &&
-      candidate.tradeAllowed !== false
+      candidate.tradeAllowed !== false &&
+      candidate.insufficientData !== true
     );
   }
 
@@ -409,7 +420,7 @@
 
     setText(
       'provider',
-      `${first(meta.provider, 'Twelve Data LIVE')} · API ${first(meta.version, '—')}`
+      `${first(meta.provider, 'Twelve Data LIVE')} · API ${first(meta.version, VERSION_LABEL)}`
     );
   }
 
@@ -427,7 +438,7 @@
     setBadge(
       el.backendStatus,
       online
-        ? `API online · ${first(health.version, 'version unknown')}`
+        ? `API online · ${first(health.version, VERSION_LABEL)}`
         : health.configured === false
           ? 'API key not configured'
           : 'API status unavailable',
@@ -437,16 +448,38 @@
     );
 
     renderUsage(first(health.metadata, health.meta, health));
+    renderHealthProgress(health);
+  }
+
+  function renderHealthProgress(health) {
+    const progress = obj(first(
+      health.progress,
+      health.scanProgress
+    ));
+
+    if (
+      progress.completed !== undefined ||
+      progress.priorityCompleted !== undefined
+    ) {
+      renderProgressText(
+        obj(health.scanner),
+        progress,
+        health.scannerRunning === true
+      );
+    }
   }
 
   function renderMarket(payload) {
     const root = obj(payload);
     const market = marketFrom(root);
 
+    if (!market || !Object.keys(market).length) {
+      return;
+    }
+
     const indicators = indicatorsFrom(market);
     const macd = obj(indicators.macd);
     const stochastic = obj(indicators.stochastic);
-    const bands = obj(indicators.bollinger);
     const levels = obj(market.supportResistance);
     const pattern = market.candlePattern;
 
@@ -501,7 +534,9 @@
       'UNKNOWN'
     ));
 
-    const signal = safe ? getSignal(market) : 'NO TRADE';
+    // A BUY/SELL display requires both fresh data and a backend-approved signal.
+    const backendSignal = getSignal(market);
+    const signal = safe ? backendSignal : 'NO TRADE';
 
     renderSignal(signal);
 
@@ -518,6 +553,7 @@
 
     setText('ema9', fmt(indicators.ema9));
     setText('ema21', fmt(indicators.ema21));
+
     setText(
       'emaCross',
       `EMA crossover: ${first(indicators.emaCross, '—')}`
@@ -554,17 +590,14 @@
       `Stochastic: ${first(stochastic.crossover, '—')}`
     );
 
-    setText('bollingerUpper', fmt(bands.upper));
-    setText('bollingerMiddle', fmt(bands.middle));
-    setText('bollingerLower', fmt(bands.lower));
+    // These fields are not calculated by the supplied V9.5 server.
+    setText('bollingerUpper', 'NOT PROVIDED');
+    setText('bollingerMiddle', 'NOT PROVIDED');
+    setText('bollingerLower', 'NOT PROVIDED');
+    setText('volatility', 'NOT CALCULATED');
 
     setText('support', fmt(levels.support));
     setText('resistance', fmt(levels.resistance));
-
-    setText(
-      'volatility',
-      first(market.volatility, 'NOT USED')
-    );
 
     setText(
       'candlePattern',
@@ -645,6 +678,49 @@
     return candidates.filter(isQualifiedCandidate);
   }
 
+  function renderProgressText(scanner, progress, running) {
+    const priorityCompleted = num(
+      first(progress.priorityCompleted, scanner.priorityCompleted)
+    );
+
+    const priorityTotal = num(
+      first(progress.priorityTotal, scanner.priorityTotal)
+    );
+
+    const backgroundCompleted = num(
+      first(progress.backgroundCompleted, scanner.backgroundCompleted)
+    );
+
+    const backgroundTotal = num(
+      first(progress.backgroundTotal, scanner.backgroundTotal)
+    );
+
+    if (priorityTotal !== null && priorityTotal > 0) {
+      const priorityText =
+        `Priority ${priorityCompleted || 0}/${priorityTotal}`;
+
+      const backgroundText =
+        backgroundTotal !== null
+          ? ` · Background ${backgroundCompleted || 0}/${backgroundTotal}`
+          : '';
+
+      setText(
+        'scanInfo',
+        `${running ? 'Scanning' : 'Scan status'}: ${priorityText}${backgroundText}.`
+      );
+
+      return;
+    }
+
+    const completed = num(progress.completed) || 0;
+    const total = num(progress.total) || num(scanner.pairs) || 24;
+
+    setText(
+      'scanInfo',
+      `${running ? 'Scanning' : 'Scan status'}: ${completed}/${total} pairs checked.`
+    );
+  }
+
   function renderScanner(payload) {
     const root = obj(payload);
     const scanner = obj(root.scanner);
@@ -669,13 +745,11 @@
     );
 
     const running = scanner.running === true;
-    const completed = num(progress.completed) || 0;
-    const total = num(progress.total) || num(scanner.pairs) || PAIR_COUNT;
 
     setBadge(
       el.scannerStatus,
       running
-        ? `Scanning ${completed}/${total}`
+        ? 'Scanner running'
         : qualified.length
           ? `${qualified.length} qualified signal(s)`
           : 'No qualified signal',
@@ -686,6 +760,8 @@
           : 'status-badge status-unknown'
     );
 
+    renderProgressText(scanner, progress, running);
+
     if (!scannerNode) return;
 
     scannerNode.replaceChildren();
@@ -695,10 +771,10 @@
       paragraph.className = 'muted-text';
 
       paragraph.textContent = running
-        ? `Scan in progress: ${completed}/${total} pairs checked. No qualified BUY/SELL signal is confirmed yet.`
+        ? 'Scan in progress. No qualified BUY/SELL signal is confirmed yet.'
         : allCandidates.length
           ? 'No candidate passed the signal and freshness checks. NO TRADE.'
-          : 'No market results are available yet. Press Analyze to request a scan.';
+          : 'No market results are available yet. Press Analyze to request analysis.';
 
       scannerNode.appendChild(paragraph);
       return;
@@ -743,7 +819,7 @@
       $('backgroundScanBtn'),
       busy,
       'Scan running…',
-      'Scan all 24 pairs'
+      'Continue background scan'
     );
   }
 
@@ -786,13 +862,19 @@
 
       renderScanner(payload);
 
+      const market = marketFrom(payload);
+
+      if (market.pair && market.pair !== 'NO MARKET') {
+        renderMarket(payload);
+      }
+
       const scanner = obj(payload.scanner);
-      const progress = obj(scanner.progress);
 
       if (scanner.running === true) {
-        setText(
-          'scanInfo',
-          `Scanning ${num(progress.completed) || 0}/${num(progress.total) || PAIR_COUNT} pairs. Results update as data becomes available.`
+        renderProgressText(
+          scanner,
+          obj(scanner.progress),
+          true
         );
 
         return;
@@ -805,7 +887,7 @@
       setText(
         'scanInfo',
         diagnostic.lastScanError
-          ? `Scan ended with provider errors: ${diagnostic.lastScanError}`
+          ? `Scan stopped with provider errors: ${diagnostic.lastScanError}`
           : 'Scan stopped or completed. Only fresh, qualified signals are shown.'
       );
     } catch (error) {
@@ -857,91 +939,61 @@
       el.analyzeBtn,
       true,
       'Analyzing…',
-      'Analyze all 24 pairs'
+      'Analyze priority pairs'
     );
 
     setText(
       'scanInfo',
-      'Loading the latest available results before requesting a scan.'
+      'Reviewing available fresh data and requesting analysis.'
     );
 
     try {
-      // First show cached results without waiting for a full scan.
-      try {
-        const current = await loadLatestResults();
+      // The analyze endpoint returns available results immediately
+      // and lets the backend manage its background scan.
+      const payload = await requestJson('/api/analyze', {
+        timeout: REQUEST_TIMEOUT_MS
+      });
 
-        if (requestId !== state.requestId) return;
+      if (requestId !== state.requestId) return;
 
-        if (obj(current.scanner).running === true) {
-          startPolling();
+      renderScanner(payload);
 
-          setText(
-            'scanInfo',
-            'A scan is already running. Showing available results while it continues.'
-          );
+      const market = marketFrom(payload);
 
-          return;
-        }
-      } catch {
-        // Continue and attempt to request a scan.
+      if (market.pair && market.pair !== 'NO MARKET') {
+        renderMarket(payload);
+      } else {
+        renderSignal('NO TRADE');
+        setText(
+          'signalReason',
+          'No scored market data is available yet. No trade is confirmed.'
+        );
       }
 
-      try {
-        const started = await requestJson('/api/scan', {
-          method: 'POST',
-          body: {},
-          timeout: REQUEST_TIMEOUT_MS
-        });
+      const scanner = obj(payload.scanner);
 
-        if (requestId !== state.requestId) return;
+      if (scanner.running === true || payload.scanStarted === true) {
+        startPolling();
 
-        if (started.ok === true) {
-          startPolling();
-
-          setText(
-            'scanInfo',
-            first(
-              started.message,
-              'The 24-pair scan started in the background.'
-            )
-          );
-        } else {
-          setText(
-            'scanInfo',
-            first(
-              started.message,
-              'A new scan could not be started.'
-            )
-          );
-        }
-      } catch (error) {
-        if (error.status === 409) {
-          startPolling();
-
-          setText(
-            'scanInfo',
-            'A full scan is already running. Monitoring its progress.'
-          );
-        } else if (error.status === 429) {
-          // Cooldown or daily credits: keep the latest results visible.
-          try {
-            await loadLatestResults();
-          } catch {
-            // Preserve the original cooldown message.
-          }
-
-          setText(
-            'scanInfo',
-            first(
-              error.message,
-              'A new scan is not available yet. Stored results may not be new.'
-            )
-          );
-        } else {
-          throw error;
-        }
+        setText(
+          'scanInfo',
+          first(
+            payload.note,
+            'Analysis returned available results. Background scanning is continuing.'
+          )
+        );
+      } else {
+        setText(
+          'scanInfo',
+          first(
+            payload.note,
+            'Analysis complete. Only available fresh results are displayed.'
+          )
+        );
       }
     } catch (error) {
+      if (requestId !== state.requestId) return;
+
       showError(String(error.message || error));
 
       setText(
@@ -957,7 +1009,74 @@
         el.analyzeBtn,
         false,
         '',
-        'Analyze all 24 pairs'
+        'Analyze priority pairs'
+      );
+    }
+  }
+
+  async function startBackgroundScan() {
+    if (state.scanBusy || state.analysisBusy) return;
+
+    clearError();
+
+    try {
+      const payload = await requestJson('/api/scan', {
+        method: 'POST',
+        body: {},
+        timeout: REQUEST_TIMEOUT_MS
+      });
+
+      if (payload.ok === true) {
+        startPolling();
+
+        setText(
+          'scanInfo',
+          first(
+            payload.message,
+            'Background scan started.'
+          )
+        );
+      } else {
+        setText(
+          'scanInfo',
+          first(payload.message, 'Background scan could not start.')
+        );
+      }
+    } catch (error) {
+      if (error.status === 409) {
+        startPolling();
+
+        setText(
+          'scanInfo',
+          'A scan is already running. Monitoring its progress.'
+        );
+
+        return;
+      }
+
+      if (error.status === 429) {
+        setText(
+          'scanInfo',
+          first(
+            error.message,
+            'Scan is unavailable because of cooldown or API credit limits.'
+          )
+        );
+
+        try {
+          await loadLatestResults();
+        } catch {
+          // Keep the original scan error visible.
+        }
+
+        return;
+      }
+
+      showError(String(error.message || error));
+
+      setText(
+        'scanInfo',
+        'Background scan could not be confirmed.'
       );
     }
   }
@@ -969,14 +1088,14 @@
       button = document.createElement('button');
       button.id = 'backgroundScanBtn';
       button.type = 'button';
-      button.textContent = 'Scan all 24 pairs';
+      button.textContent = 'Continue background scan';
       button.style.marginTop = '10px';
 
       el.analyzeBtn?.insertAdjacentElement('afterend', button);
     }
 
     if (button.dataset.listenerAttached !== 'true') {
-      button.addEventListener('click', analyzeAllPairs);
+      button.addEventListener('click', startBackgroundScan);
       button.dataset.listenerAttached = 'true';
     }
   }
@@ -984,19 +1103,25 @@
   function bindEvents() {
     ensureScanButton();
 
-    if (el.analyzeBtn &&
-        el.analyzeBtn.dataset.listenerAttached !== 'true') {
-      el.analyzeBtn.textContent = 'Analyze all 24 pairs';
+    if (
+      el.analyzeBtn &&
+      el.analyzeBtn.dataset.listenerAttached !== 'true'
+    ) {
+      el.analyzeBtn.textContent = 'Analyze priority pairs';
       el.analyzeBtn.addEventListener('click', analyzeAllPairs);
       el.analyzeBtn.dataset.listenerAttached = 'true';
     }
 
-    if (el.selectedPair &&
-        el.selectedPair.dataset.listenerAttached !== 'true') {
+    if (
+      el.selectedPair &&
+      el.selectedPair.dataset.listenerAttached !== 'true'
+    ) {
       el.selectedPair.addEventListener('change', () => {
+        const selected = el.selectedPair.value;
+
         setText(
           'scanInfo',
-          `Selected pair: ${el.selectedPair.value}. Analyze reviews the available 24-pair results.`
+          `Selected pair: ${selected}. The scanner reviews market candidates independently.`
         );
       });
 
@@ -1004,7 +1129,7 @@
     }
 
     if (el.timeframe) {
-      // This strategy uses completed 1-minute candles only.
+      // The strategy uses completed 1-minute candles only.
       el.timeframe.value = '1';
       el.timeframe.disabled = true;
     }
@@ -1029,7 +1154,7 @@
       } else {
         setText(
           'scanInfo',
-          'Ready. Press Analyze all 24 pairs to review available results and request a scan.'
+          'Ready. Analyze reviews available fresh data and requests background analysis.'
         );
       }
     } catch (error) {
