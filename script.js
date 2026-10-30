@@ -1,4 +1,3 @@
-
 'use strict';
 
 (() => {
@@ -938,8 +937,8 @@
     setBusy(
       el.analyzeBtn,
       true,
-      'Analyzing…',
-      'Analyze priority pairs'
+      'ANALYZING…',
+      'ANALYZE MARKET'
     );
 
     setText(
@@ -1009,7 +1008,7 @@
         el.analyzeBtn,
         false,
         '',
-        'Analyze priority pairs'
+        'ANALYZE MARKET'
       );
     }
   }
@@ -1107,7 +1106,7 @@
       el.analyzeBtn &&
       el.analyzeBtn.dataset.listenerAttached !== 'true'
     ) {
-      el.analyzeBtn.textContent = 'Analyze priority pairs';
+      el.analyzeBtn.textContent = 'ANALYZE MARKET';
       el.analyzeBtn.addEventListener('click', analyzeAllPairs);
       el.analyzeBtn.dataset.listenerAttached = 'true';
     }
