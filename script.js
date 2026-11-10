@@ -7,13 +7,14 @@
     'https://po-ai-predictor-api.onrender.com'
   ).replace(/\/+$/, '');
 
-  const VERSION = 'V10.1.0';
+  const VERSION = 'V10.2.0';
   const HEALTH_INTERVAL_MS = 60000;
-  const SCAN_POLL_INTERVAL_MS = 5000;
+  const SCAN_POLL_INTERVAL_MS = 3000;
   const REQUEST_TIMEOUT_MS = 35000;
   const HEALTH_TIMEOUT_MS = 12000;
   const MAX_DATA_AGE_SECONDS = 150;
   const MAX_REASONS = 10;
+  const AUTO_PAIR = 'AI AUTO SELECT';
 
   const PAIRS = [
     'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF',
@@ -37,7 +38,8 @@
     lastMarket: null,
     lastScanner: null,
     lastHealth: null,
-    requestId: 0
+    requestId: 0,
+    autoSelecting: false
   };
 
   const dom = {
@@ -102,7 +104,11 @@
     const a = new Date(start).getTime();
     const b = new Date(end).getTime();
 
-    if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) {
+    if (
+      !Number.isFinite(a) ||
+      !Number.isFinite(b) ||
+      b <= a
+    ) {
       return '—';
     }
 
@@ -114,14 +120,11 @@
     if (!node) return;
 
     node.textContent =
-      value === null || value === undefined || value === ''
+      value === null ||
+      value === undefined ||
+      value === ''
         ? fallback
         : String(value);
-  }
-
-  function setClass(id, className) {
-    const node = $(id);
-    if (node) node.className = className;
   }
 
   function setStatusDot(online) {
@@ -212,18 +215,6 @@
     }
   }
 
-  function marketFrom(payload) {
-    const root = obj(payload);
-
-    return obj(first(
-      root.selectedMarket,
-      root.market,
-      root.result,
-      root.data,
-      root
-    ));
-  }
-
   function isFresh(market) {
     const age = number(market.dataAgeSeconds);
     const freshness = String(
@@ -235,7 +226,6 @@
       age !== null &&
       age >= 0 &&
       age <= MAX_DATA_AGE_SECONDS &&
-      number(market.currentPrice) !== null &&
       number(market.currentPrice) > 0 &&
       market.insufficientData !== true
     );
@@ -325,33 +315,31 @@
 
     setText(
       'providerStatus',
-      first(root.provider, 'TWELVE DATA')
+      first(root.provider, 'TWELVE DATA LIVE')
     );
 
     setText(
       'providerDetail',
       configured
-        ? 'Provider API key configured'
-        : 'Provider API key not configured'
+        ? 'Twelve Data API key configured'
+        : 'Twelve Data API key not configured'
     );
 
-    const metadata = obj(root.metadata);
+    setText('pairsTracked', PAIRS.length);
 
-    setText(
-      'pairsTracked',
-      PAIRS.length
-    );
+    const progress = obj(root.scanProgress);
+    const running = root.scannerRunning === true;
 
     setText(
       'marketFreshness',
-      root.scannerRunning ? 'SCANNING' : 'CHECKING'
+      running ? 'SCANNING' : 'WAITING'
     );
 
     setText(
       'marketFreshnessDetail',
-      root.scannerRunning
-        ? 'Market scanner is running'
-        : 'Waiting for selected-pair analysis'
+      running
+        ? 'AI priority scanner is checking the first six pairs'
+        : 'Waiting for market analysis'
     );
 
     if (!configured) {
@@ -361,16 +349,16 @@
       );
     }
 
-    if (metadata.databaseReady === true) {
-      setText('historySource', 'POSTGRESQL');
-    } else {
-      setText('historySource', 'MEMORY ONLY');
-    }
+    const metadata = obj(root.metadata);
 
-    renderScannerProgress(
-      obj(root.scanProgress),
-      root.scannerRunning === true
+    setText(
+      'historySource',
+      metadata.databaseReady === true
+        ? 'POSTGRESQL'
+        : 'MEMORY ONLY'
     );
+
+    renderScannerProgress(progress, running);
   }
 
   async function checkHealth() {
@@ -386,7 +374,6 @@
       renderHealth(payload);
     } catch (error) {
       renderApiStatus(false, 'API OFFLINE / UNAVAILABLE');
-      setText('apiStatusCard', 'OFFLINE');
       setText('apiStatusDetail', error.message);
       setText('providerDetail', 'Provider status unavailable');
     } finally {
@@ -395,28 +382,34 @@
   }
 
   function renderScannerProgress(progress, running) {
-    const completed = number(progress.completed) || 0;
-    const total = number(progress.total) || PAIRS.length;
+    const completed = number(
+      first(progress.priorityCompleted, progress.completed)
+    ) || 0;
+
+    const total = number(
+      first(progress.priorityTotal, progress.total)
+    ) || 6;
 
     const percent = total > 0
       ? Math.max(0, Math.min(100, completed / total * 100))
       : 0;
 
     const bar = $('scannerProgressBar');
-    if (bar) bar.style.width = `${percent}%`;
+
+    if (bar) {
+      bar.style.width = `${percent}%`;
+    }
 
     setText(
       'scannerProgress',
-      `${completed} / ${total} pairs`
+      `${completed} / ${total} priority pairs`
     );
 
     setText(
       'scannerStatus',
       running
-        ? `Scanning ${first(progress.pair, 'forex pairs')}...`
-        : progress.phase === 'IDLE'
-          ? 'Scanner idle'
-          : first(progress.phase, 'Scanner status unavailable')
+        ? `Scanning ${first(progress.pair, 'priority pairs')}...`
+        : first(progress.phase, 'Scanner idle')
     );
   }
 
@@ -448,13 +441,15 @@
       formatNumber(indicators.rsi14, 2)
     );
 
+    const rsi = number(indicators.rsi14);
+
     setText(
       'rsiSignal',
-      indicators.rsi14 === null || indicators.rsi14 === undefined
+      rsi === null
         ? 'RSI 14 unavailable'
-        : Number(indicators.rsi14) > 70
+        : rsi > 70
           ? 'Above 70 · elevated'
-          : Number(indicators.rsi14) < 30
+          : rsi < 30
             ? 'Below 30 · depressed'
             : 'Between 30 and 70'
     );
@@ -510,10 +505,7 @@
 
     setText(
       'bollingerSignal',
-      first(
-        bollinger.position,
-        'CALCULATED'
-      )
+      first(bollinger.position, 'CALCULATED')
     );
 
     setText(
@@ -523,7 +515,8 @@
 
     setText(
       'bollingerWidth',
-      bollinger.width === undefined || bollinger.width === null
+      bollinger.width === null ||
+      bollinger.width === undefined
         ? 'UNAVAILABLE'
         : `${formatNumber(bollinger.width, 5)}%`
     );
@@ -559,7 +552,10 @@
       'marketPsychology',
       typeof market.marketPsychology === 'string'
         ? market.marketPsychology
-        : first(psychology.psychology, 'UNAVAILABLE')
+        : first(
+            psychology.psychology,
+            'UNAVAILABLE'
+          )
     );
 
     setText(
@@ -577,7 +573,10 @@
 
     setText(
       'supportDetail',
-      first(levels.position, 'Support assessment unavailable')
+      first(
+        levels.position,
+        'Support assessment unavailable'
+      )
     );
 
     setText(
@@ -587,7 +586,10 @@
 
     setText(
       'resistanceDetail',
-      first(levels.position, 'Resistance assessment unavailable')
+      first(
+        levels.position,
+        'Resistance assessment unavailable'
+      )
     );
 
     setText(
@@ -616,7 +618,12 @@
       )
     );
 
-    const retest = String(first(breakout.status, '')).includes('RETEST');
+    const breakoutStatus = String(
+      first(breakout.status, '')
+    ).toUpperCase();
+
+    const retest = breakoutStatus.includes('RETEST');
+    const falseBreakout = breakoutStatus.includes('FALSE');
 
     setText(
       'retestSignal',
@@ -629,10 +636,6 @@
         ? first(breakout.description, 'Retest detected')
         : 'No confirmed retest supplied'
     );
-
-    const falseBreakout = String(
-      first(breakout.status, '')
-    ).includes('FALSE');
 
     setText(
       'falseBreakoutSignal',
@@ -647,69 +650,20 @@
     );
   }
 
-  function renderFundamentals(market) {
-    const news = String(
-      first(market.newsStatus, 'NOT_CONFIGURED')
-    ).toUpperCase();
-
-    const fundamentals = String(
-      first(market.fundamentalStatus, 'NOT_CONFIGURED')
-    ).toUpperCase();
-
-    setText('newsStatus', news);
-    setText('fundamentalStatus', fundamentals);
-
-    setText(
-      'newsDetail',
-      news === 'NOT_CONFIGURED'
-        ? 'No verified news feed is configured'
-        : 'News provider status returned by backend'
-    );
-
-    setText(
-      'fundamentalDetail',
-      fundamentals === 'NOT_CONFIGURED'
-        ? 'No verified fundamental feed is configured'
-        : 'Fundamental status returned by backend'
-    );
-
-    const unverified =
-      news === 'NOT_CONFIGURED' ||
-      news === 'UNVERIFIED' ||
-      fundamentals === 'NOT_CONFIGURED' ||
-      fundamentals === 'UNVERIFIED';
-
-    setText(
-      'economicEvents',
-      unverified ? 'UNVERIFIED' : 'PROVIDER STATUS'
-    );
-
-    setText(
-      'economicEventsDetail',
-      unverified
-        ? 'Economic calendar is not verified by the current backend'
-        : 'Economic event status returned by backend'
-    );
-
-    setText(
-      'newsRiskFilter',
-      unverified ? 'UNVERIFIED' : 'PROVIDER STATUS'
-    );
-
-    setText(
-      'newsRiskDetail',
-      unverified
-        ? 'Unknown news risk is not treated as confirmed safe'
-        : 'Risk status returned by backend'
-    );
-  }
-
   function renderMarket(payload, expectedPair) {
     const root = obj(payload);
-    const market = marketFrom(root);
+
+    const market = obj(first(
+      root.selectedMarket,
+      root.market,
+      root.result,
+      root.data
+    ));
 
     if (!Object.keys(market).length) {
-      throw new Error('The API did not return a selected market result.');
+      throw new Error(
+        'The API did not return a selected market result.'
+      );
     }
 
     state.lastMarket = market;
@@ -737,47 +691,48 @@
     const entryTime = market.entryTime;
     const expiryTime = market.expiryTime;
     const entryPrice = number(market.entryPrice);
+    const evidence = number(market.confidence);
 
     renderDirection(direction);
 
     setText('resultPair', pair);
-    setText('analysisTimestamp', formatDate(first(
-      market.fetchedAt,
-      market.lastCandle,
-      new Date().toISOString()
-    )));
 
-    const evidence = number(market.confidence);
+    setText(
+      'analysisTimestamp',
+      formatDate(first(
+        market.fetchedAt,
+        market.lastCandle
+      ))
+    );
 
     setText(
       'evidenceScore',
-      direction === 'NO TRADE' || evidence === null
-        ? '—'
-        : Math.round(evidence)
+      evidence === null ? '—' : Math.round(evidence)
     );
 
     const evidenceBar = $('evidenceBar');
 
     if (evidenceBar) {
-      const score = direction === 'NO TRADE' || evidence === null
+      const score = evidence === null
         ? 0
         : Math.max(0, Math.min(100, evidence));
 
       evidenceBar.style.width = `${score}%`;
     }
 
+    const reason = first(
+      Array.isArray(market.reasons)
+        ? market.reasons[0]
+        : null,
+      market.reason,
+      'Evidence is insufficient or conflicting.'
+    );
+
     setText(
       'signalReason',
       !fresh
         ? 'NO TRADE — market data is stale or its freshness cannot be verified.'
-        : first(
-            obj(market.signal).reason,
-            market.reason,
-            Array.isArray(market.reasons) ? market.reasons[0] : null,
-            direction === 'NO TRADE'
-              ? 'Evidence is insufficient or conflicting.'
-              : 'Backend research direction returned.'
-          )
+        : reason
     );
 
     setText('entryTime', formatDate(entryTime));
@@ -829,7 +784,6 @@
     }
 
     renderTechnical(market);
-    renderFundamentals(market);
     renderReasons(market.reasons);
 
     return market;
@@ -865,6 +819,7 @@
   function renderScanner(payload) {
     const root = obj(payload);
     const scanner = obj(root.scanner);
+    const progress = obj(scanner.progress);
 
     state.lastScanner = root;
 
@@ -884,7 +839,7 @@
       cell.colSpan = 8;
       cell.className = 'empty-state';
       cell.textContent = scanner.running
-        ? 'Scanner running. Waiting for pair results.'
+        ? 'AI scanner running. Waiting for priority pair results.'
         : 'No scanned pair results are available yet.';
 
       row.appendChild(cell);
@@ -901,9 +856,9 @@
         const values = [
           candidate.pair,
           '—',
-          '—',
-          '—',
-          '—',
+          first(candidate.oneMinuteTrend, '—'),
+          first(candidate.fiveMinuteConfirmation, '—'),
+          first(candidate.volatility, '—'),
           candidate.confidence === null ||
           candidate.confidence === undefined
             ? '—'
@@ -917,12 +872,16 @@
 
           if (i === 7) {
             const button = document.createElement('button');
+
             button.type = 'button';
             button.className = 'table-select-button';
             button.textContent = 'SELECT';
 
             button.addEventListener('click', () => {
-              if (PAIRS.includes(candidate.pair)) {
+              if (
+                PAIRS.includes(candidate.pair) &&
+                dom.pairSelect
+              ) {
                 dom.pairSelect.value = candidate.pair;
                 analyzeSelectedPair();
               }
@@ -930,7 +889,9 @@
 
             cell.appendChild(button);
           } else {
-            cell.textContent = String(first(values[i], '—'));
+            cell.textContent = String(
+              first(values[i], '—')
+            );
           }
 
           row.appendChild(cell);
@@ -941,53 +902,132 @@
     }
 
     renderScannerProgress(
-      obj(scanner.progress),
+      progress,
       scanner.running === true
     );
+  }
+
+  function showPendingAutoScan(payload) {
+    const scanner = obj(payload.scanner);
+    const running = scanner.running === true;
+
+    renderScanner(payload);
+
+    renderDirection('NO TRADE');
+
+    setText('resultPair', 'AI SELECTING...');
+    setText('evidenceScore', '—');
+    setText('signalStatus', 'SCANNING');
+
+    setText(
+      'signalReason',
+      running
+        ? 'AI is scanning the first six priority pairs. No signal is confirmed yet.'
+        : first(
+            payload.note,
+            'Waiting for a completed priority scan.'
+          )
+    );
+
+    const warning = $('signalWarning');
+
+    if (warning) {
+      warning.textContent =
+        'NO TRADE until the priority scan completes and the selected market passes all evidence and freshness checks.';
+    }
   }
 
   async function analyzeSelectedPair() {
     if (state.analysisBusy) return;
 
-    const pair = String(dom.pairSelect?.value || '').toUpperCase();
+    const selected = String(
+      dom.pairSelect?.value || AUTO_PAIR
+    ).toUpperCase();
 
-    if (!PAIRS.includes(pair)) {
-      showMessage('Please select a supported LIVE forex pair.', 'error');
+    const autoMode =
+      selected === AUTO_PAIR.toUpperCase() ||
+      selected === 'AUTO' ||
+      selected === '';
+
+    if (!autoMode && !PAIRS.includes(selected)) {
+      showMessage(
+        'Please select AI AUTO SELECT or a supported LIVE forex pair.',
+        'error'
+      );
       return;
     }
 
     state.analysisBusy = true;
+    state.autoSelecting = autoMode;
+
     const requestId = ++state.requestId;
 
     setButtonBusy(
       dom.analyzeButton,
       true,
-      'ANALYZING SELECTED PAIR...',
-      'ANALYZE SELECTED PAIR'
+      autoMode
+        ? 'AI SCANNING PRIORITY PAIRS...'
+        : 'ANALYZING SELECTED PAIR...',
+      'ANALYZE'
     );
 
-    showMessage(`Requesting analysis for ${pair}...`);
+    stopScannerPolling();
 
     renderDirection('NO TRADE');
     setText('evidenceScore', '—');
     setText('signalStatus', 'ANALYZING');
 
     try {
+      if (autoMode) {
+        showMessage(
+          'AI is starting its first-six-pair priority scan. Please wait for the best qualifying pair.'
+        );
+
+        const payload = await requestJson('/api/analyze');
+
+        if (requestId !== state.requestId) return;
+
+        const scanner = obj(payload.scanner);
+        const market = obj(payload.selectedMarket);
+
+        renderScanner(payload);
+
+        if (
+          scanner.running ||
+          !market.pair ||
+          market.pair === 'NO MARKET'
+        ) {
+          showPendingAutoScan(payload);
+          startScannerPolling(requestId);
+          return;
+        }
+
+        const selectedMarket = renderMarket(payload);
+
+        showMessage(
+          `AI selected ${selectedMarket.pair}. Review the evidence and signal status.`
+        );
+
+        await loadHistory();
+        return;
+      }
+
+      showMessage(
+        `Requesting direct analysis for ${selected}...`
+      );
+
       const payload = await requestJson(
-        `/api/analyze?pair=${encodeURIComponent(pair)}`
+        `/api/analyze?pair=${encodeURIComponent(selected)}`
       );
 
       if (requestId !== state.requestId) return;
 
-      const market = renderMarket(payload, pair);
+      const market = renderMarket(payload, selected);
 
       renderScanner(payload);
 
       showMessage(
-        market.signal === 'NO TRADE'
-          ? `Analysis completed for ${pair}. Current assessment: NO TRADE.`
-          : `Analysis completed for ${pair}. Research direction: ${getSignal(market)}. Entry price must still be verified.`,
-        'success'
+        `Selected-pair analysis completed for ${selected}. Assessment: ${getSignal(market)}.`
       );
 
       await loadHistory();
@@ -1004,9 +1044,10 @@
       setText('signalStatus', 'UNAVAILABLE');
 
       const warning = $('signalWarning');
+
       if (warning) {
         warning.textContent =
-          'NO TRADE: the selected-pair analysis failed or could not be verified.';
+          'NO TRADE: analysis failed or could not be verified.';
       }
 
       showMessage(error.message, 'error');
@@ -1017,8 +1058,109 @@
         dom.analyzeButton,
         false,
         '',
-        'ANALYZE SELECTED PAIR'
+        'ANALYZE'
       );
+    }
+  }
+
+  async function pollScanner(requestId = null) {
+    if (!state.scanTimer) return;
+
+    try {
+      const payload = await requestJson('/api/best');
+
+      if (
+        requestId !== null &&
+        requestId !== state.requestId
+      ) {
+        stopScannerPolling();
+        return;
+      }
+
+      renderScanner(payload);
+
+      const scanner = obj(payload.scanner);
+      const market = obj(payload.selectedMarket);
+
+      if (scanner.running) {
+        setText(
+          'scannerStatus',
+          `AI scanning ${first(
+            scanner.progress?.pair,
+            'priority pairs'
+          )}...`
+        );
+
+        return;
+      }
+
+      stopScannerPolling();
+
+      if (
+        requestId !== null &&
+        state.autoSelecting &&
+        market.pair &&
+        market.pair !== 'NO MARKET'
+      ) {
+        const selectedMarket = renderMarket(payload);
+
+        showMessage(
+          `AI priority scan completed. Selected pair: ${selectedMarket.pair}. Assessment: ${getSignal(selectedMarket)}.`,
+          'success'
+        );
+
+        state.autoSelecting = false;
+        await loadHistory();
+        return;
+      }
+
+      if (requestId !== null && state.autoSelecting) {
+        renderDirection('NO TRADE');
+        setText('resultPair', 'NO QUALIFIED PAIR');
+        setText('signalStatus', 'NO TRADE');
+
+        setText(
+          'signalReason',
+          first(
+            payload.diagnostic?.lastScanError,
+            'No qualifying market is currently available.'
+          )
+        );
+
+        showMessage(
+          'Priority scan completed, but no qualifying pair was confirmed. NO TRADE.',
+          'info'
+        );
+
+        state.autoSelecting = false;
+      } else {
+        showMessage(
+          'Priority scanner completed. Review the latest pair results.'
+        );
+      }
+    } catch (error) {
+      setText(
+        'scannerStatus',
+        `Scanner status unavailable: ${error.message}`
+      );
+    }
+  }
+
+  function startScannerPolling(requestId = null) {
+    stopScannerPolling();
+
+    state.scanTimer = setInterval(
+      () => pollScanner(requestId),
+      SCAN_POLL_INTERVAL_MS
+    );
+
+    pollScanner(requestId);
+  }
+
+  function stopScannerPolling() {
+    if (state.scanTimer) {
+      clearInterval(state.scanTimer);
+      state.scanTimer = null;
     }
   }
 
@@ -1041,16 +1183,31 @@
         timeout: REQUEST_TIMEOUT_MS
       });
 
+      renderScanner(payload);
+
       showMessage(
-        first(payload.message, 'Live forex scanner started.')
+        first(
+          payload.message,
+          'Live forex priority scanner started.'
+        )
       );
 
       startScannerPolling();
-      await loadBestResults();
     } catch (error) {
       if (error.status === 409) {
-        showMessage('A scanner is already running. Monitoring progress.');
+        showMessage(
+          'Priority scanner is already running. Monitoring progress.'
+        );
+
         startScannerPolling();
+      } else if (error.status === 429) {
+        showMessage(
+          first(
+            error.message,
+            'Please wait before starting another scan.'
+          ),
+          'info'
+        );
       } else {
         showMessage(error.message, 'error');
       }
@@ -1066,54 +1223,6 @@
     }
   }
 
-  async function loadBestResults() {
-    const payload = await requestJson('/api/best');
-
-    renderScanner(payload);
-
-    return payload;
-  }
-
-  async function pollScanner() {
-    if (!state.scanTimer) return;
-
-    try {
-      const payload = await loadBestResults();
-      const scanner = obj(payload.scanner);
-
-      if (!scanner.running) {
-        stopScannerPolling();
-
-        showMessage(
-          'Scanner finished or is currently idle. Review the latest pair results.'
-        );
-      }
-    } catch (error) {
-      setText(
-        'scannerStatus',
-        `Scanner status unavailable: ${error.message}`
-      );
-    }
-  }
-
-  function startScannerPolling() {
-    stopScannerPolling();
-
-    state.scanTimer = setInterval(
-      pollScanner,
-      SCAN_POLL_INTERVAL_MS
-    );
-
-    pollScanner();
-  }
-
-  function stopScannerPolling() {
-    if (state.scanTimer) {
-      clearInterval(state.scanTimer);
-      state.scanTimer = null;
-    }
-  }
-
   async function loadHistory() {
     if (state.historyBusy) return;
 
@@ -1121,13 +1230,14 @@
 
     try {
       const payload = await requestJson('/api/history?limit=100');
+
       const history = Array.isArray(payload.history)
         ? payload.history
         : [];
 
       renderHistory(history, payload);
     } catch (error) {
-      setText('historySource', `UNAVAILABLE`);
+      setText('historySource', 'UNAVAILABLE');
       setText('historyTotal', '—');
       setText('historyEvaluated', '—');
       setText('historyPending', '—');
@@ -1141,7 +1251,8 @@
         const cell = document.createElement('td');
 
         cell.colSpan = 7;
-        cell.textContent = `History unavailable: ${error.message}`;
+        cell.textContent =
+          `History unavailable: ${error.message}`;
 
         row.appendChild(cell);
         body.appendChild(row);
@@ -1153,7 +1264,9 @@
 
   function renderHistory(history, payload) {
     const evaluated = history.filter(record =>
-      String(first(record.outcome, 'PENDING')).toUpperCase() !== 'PENDING'
+      String(
+        first(record.outcome, 'PENDING')
+      ).toUpperCase() !== 'PENDING'
     );
 
     const pending = history.length - evaluated.length;
@@ -1164,7 +1277,9 @@
 
     setText(
       'historySource',
-      payload.persistent ? 'POSTGRESQL' : 'MEMORY ONLY'
+      payload.persistent
+        ? 'POSTGRESQL'
+        : 'MEMORY ONLY'
     );
 
     const body = $('historyTableBody');
@@ -1178,7 +1293,8 @@
 
       cell.colSpan = 7;
       cell.className = 'empty-state';
-      cell.textContent = 'No signal records are available yet.';
+      cell.textContent =
+        'No signal records are available yet.';
 
       row.appendChild(cell);
       body.appendChild(row);
@@ -1189,7 +1305,10 @@
       const row = document.createElement('tr');
 
       const values = [
-        formatDate(first(record.createdAt, record.entryTime)),
+        formatDate(first(
+          record.createdAt,
+          record.entryTime
+        )),
         record.pair,
         record.signal,
         record.evidenceScore === null ||
@@ -1200,7 +1319,10 @@
         record.referencePrice === undefined
           ? 'WAITING'
           : formatNumber(record.referencePrice),
-        formatDuration(record.entryTime, record.expiryTime),
+        formatDuration(
+          record.entryTime,
+          record.expiryTime
+        ),
         first(record.outcome, 'PENDING')
       ];
 
@@ -1221,10 +1343,18 @@
       dom.backtestPairSelect?.value || 'EUR/USD'
     ).toUpperCase();
 
-    const duration = Number(dom.backtestDuration?.value || 1);
+    const duration = Number(
+      dom.backtestDuration?.value || 1
+    );
 
-    if (!PAIRS.includes(pair) || ![1, 2, 3].includes(duration)) {
-      setText('backtestMessage', 'Invalid pair or expiry duration.');
+    if (
+      !PAIRS.includes(pair) ||
+      ![1, 2, 3].includes(duration)
+    ) {
+      setText(
+        'backtestMessage',
+        'Invalid pair or expiry duration.'
+      );
       return;
     }
 
@@ -1237,7 +1367,10 @@
       'RUN BACKTEST'
     );
 
-    setText('backtestMessage', `Testing ${pair} with ${duration}-minute expiry...`);
+    setText(
+      'backtestMessage',
+      `Testing ${pair} with ${duration}-minute expiry...`
+    );
 
     try {
       const query = new URLSearchParams({
@@ -1256,12 +1389,16 @@
         `Backtest unavailable: ${error.message}`
       );
 
-      setText('backtestSamples', '—');
-      setText('backtestWins', '—');
-      setText('backtestLosses', '—');
-      setText('backtestCoverage', '—');
-      setText('backtestWinRate', '—');
-      setText('backtestBaseline', '—');
+      for (const id of [
+        'backtestSamples',
+        'backtestWins',
+        'backtestLosses',
+        'backtestCoverage',
+        'backtestWinRate',
+        'backtestBaseline'
+      ]) {
+        setText(id, '—');
+      }
     } finally {
       state.backtestBusy = false;
 
@@ -1296,7 +1433,8 @@
 
     setText(
       'backtestWinRate',
-      holdout.hitRate === null || holdout.hitRate === undefined
+      holdout.hitRate === null ||
+      holdout.hitRate === undefined
         ? '—'
         : `${formatNumber(holdout.hitRate, 2)}%`
     );
@@ -1318,30 +1456,53 @@
       `Development signals: ${number(development.signals) || 0}. ` +
       `Holdout signals: ${samples}. ` +
       `Expiry: ${first(result.expiryMinutes, '—')} minute(s). ` +
-      (sufficient
-        ? 'Holdout sample threshold passed.'
-        : 'INSUFFICIENT HOLDOUT SAMPLE — no performance claim.')
+      (
+        sufficient
+          ? 'Holdout sample threshold passed.'
+          : 'INSUFFICIENT HOLDOUT SAMPLE — no performance claim.'
+      )
     );
   }
 
-  function populatePairOptions() {
-    for (const select of [
-      dom.pairSelect,
-      dom.backtestPairSelect
-    ]) {
-      if (!select) continue;
+  function addPairOption(select, value, label) {
+    if (!select) return;
 
-      const existing = new Set(
-        [...select.options].map(option => option.value)
+    const exists = [...select.options].some(
+      option => option.value === value
+    );
+
+    if (exists) return;
+
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+
+    select.appendChild(option);
+  }
+
+  function populatePairOptions() {
+    if (dom.pairSelect) {
+      addPairOption(
+        dom.pairSelect,
+        AUTO_PAIR,
+        'AI AUTO SELECT — BEST OF FIRST 6'
       );
 
       for (const pair of PAIRS) {
-        if (existing.has(pair)) continue;
+        addPairOption(dom.pairSelect, pair, pair);
+      }
 
-        const option = document.createElement('option');
-        option.value = pair;
-        option.textContent = pair;
-        select.appendChild(option);
+      if (
+        !PAIRS.includes(dom.pairSelect.value) &&
+        dom.pairSelect.value !== AUTO_PAIR
+      ) {
+        dom.pairSelect.value = AUTO_PAIR;
+      }
+    }
+
+    if (dom.backtestPairSelect) {
+      for (const pair of PAIRS) {
+        addPairOption(dom.backtestPairSelect, pair, pair);
       }
     }
   }
@@ -1349,13 +1510,13 @@
   function initialize() {
     populatePairOptions();
 
-    // The current backend generates a one-minute live expiry.
-    // 2m and 3m are evaluated through historical backtesting.
+    // Live signals are one-minute signals.
+    // 1/2/3-minute expiry options are for historical backtesting.
     if (dom.expirySelect) {
       dom.expirySelect.value = '1';
       dom.expirySelect.disabled = true;
       dom.expirySelect.title =
-        'Live signal expiry is currently fixed at one minute by the backend.';
+        'Live signal is fixed at one minute. Backtest supports 1, 2 and 3 minutes.';
     }
 
     dom.analyzeButton?.addEventListener(
@@ -1379,8 +1540,12 @@
     );
 
     dom.pairSelect?.addEventListener('change', () => {
+      const selected = dom.pairSelect.value;
+
       showMessage(
-        `Selected ${dom.pairSelect.value}. Press Analyze to inspect this pair.`
+        selected === AUTO_PAIR
+          ? 'AI AUTO SELECT is active. Press Analyze to scan the first six priority pairs.'
+          : `Selected ${selected}. Press Analyze to inspect this pair directly.`
       );
     });
 
@@ -1392,17 +1557,31 @@
       HEALTH_INTERVAL_MS
     );
 
-    setText('apiStatusDetail', 'Connecting to backend...');
-    setText('scannerStatus', 'Scanner idle');
-    setText('scannerProgress', `0 / ${PAIRS.length} pairs`);
+    setText(
+      'apiStatusDetail',
+      'Connecting to backend...'
+    );
+
+    setText(
+      'scannerStatus',
+      'Scanner idle'
+    );
+
+    setText(
+      'scannerProgress',
+      '0 / 6 priority pairs'
+    );
 
     showMessage(
-      'Select a LIVE forex pair, then press Analyze.'
+      'Choose AI AUTO SELECT to let AI find the best pair, or select a pair manually. Then press Analyze.'
     );
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initialize);
+    document.addEventListener(
+      'DOMContentLoaded',
+      initialize
+    );
   } else {
     initialize();
   }
@@ -1411,9 +1590,11 @@
     version: VERSION,
     apiBase: API_BASE,
     pairs: [...PAIRS],
+    autoPair: AUTO_PAIR,
     analyzeSelectedPair,
     refreshScanner,
     loadHistory,
-    runBacktest
+    runBacktest,
+    checkHealth
   });
 })();
