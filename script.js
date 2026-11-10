@@ -1,95 +1,54 @@
+
 'use strict';
 
 (() => {
   const API_BASE = String(
     window.PO_API_BASE ||
-      'https://po-ai-predictor-api.onrender.com'
+    'https://po-ai-predictor-api.onrender.com'
   ).replace(/\/+$/, '');
 
-  const VERSION_LABEL = 'V9.6.0';
+  const VERSION = 'V10.1.0';
   const HEALTH_INTERVAL_MS = 60000;
-  const SCAN_POLL_INTERVAL_MS = 2500;
-  const REQUEST_TIMEOUT_MS = 30000;
+  const SCAN_POLL_INTERVAL_MS = 5000;
+  const REQUEST_TIMEOUT_MS = 35000;
   const HEALTH_TIMEOUT_MS = 12000;
   const MAX_DATA_AGE_SECONDS = 150;
   const MAX_REASONS = 10;
 
-  const PRIORITY_PAIRS = [
-    'EUR/USD',
-    'GBP/USD',
-    'USD/JPY',
-    'USD/CHF',
-    'AUD/USD',
-    'USD/CAD'
+  const PAIRS = [
+    'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF',
+    'AUD/USD', 'USD/CAD', 'NZD/USD', 'EUR/GBP',
+    'EUR/JPY', 'GBP/JPY', 'EUR/CHF', 'EUR/AUD',
+    'EUR/CAD', 'GBP/CHF', 'GBP/AUD', 'GBP/CAD',
+    'AUD/JPY', 'AUD/CAD', 'AUD/NZD', 'CAD/JPY',
+    'CHF/JPY', 'NZD/JPY', 'NZD/CAD', 'EUR/NZD'
   ];
 
   const $ = id => document.getElementById(id);
 
   const state = {
     analysisBusy: false,
+    backtestBusy: false,
     scanBusy: false,
     healthBusy: false,
+    historyBusy: false,
     scanTimer: null,
     healthTimer: null,
     lastMarket: null,
+    lastScanner: null,
     lastHealth: null,
     requestId: 0
   };
 
-  const el = {
-    backendStatus: $('backendStatus'),
-    marketStatus: $('marketStatus'),
-    analyzeBtn: $('analyzeBtn'),
-    selectedPair: $('selectedPair'),
-    timeframe: $('timeframe'),
-    errorBox: $('errorBox'),
-    scanInfo: $('scanInfo'),
-    signalBadge: $('signalBadge'),
-    confidence: $('confidence'),
-    summaryPair: $('summaryPair'),
-    trendBadge: $('trendBadge'),
-    freshness: $('freshness'),
-    dataAge: $('dataAge'),
-    entryTime: $('entryTime'),
-    expiryTime: $('expiryTime'),
-    currentPrice: $('currentPrice'),
-    entryPrice: $('entryPrice'),
-    callScore: $('callScore'),
-    putScore: $('putScore'),
-    gap: $('gap'),
-    signalReason: $('signalReason'),
-    ema9: $('ema9'),
-    ema21: $('ema21'),
-    emaCross: $('emaCross'),
-    rsi: $('rsi'),
-    rsiCross: $('rsiCross'),
-    macdLine: $('macdLine'),
-    macdSignal: $('macdSignal'),
-    macdHistogram: $('macdHistogram'),
-    macdCross: $('macdCross'),
-    stochK: $('stochK'),
-    stochD: $('stochD'),
-    stochasticCross: $('stochasticCross'),
-    bollingerUpper: $('bollingerUpper'),
-    bollingerMiddle: $('bollingerMiddle'),
-    bollingerLower: $('bollingerLower'),
-    support: $('support'),
-    resistance: $('resistance'),
-    volatility: $('volatility'),
-    candlePattern: $('candlePattern'),
-    lastCandle: $('lastCandle'),
-    priceAction: $('priceAction'),
-    psychology: $('psychology'),
-    reasons: $('reasons'),
-    provider: $('provider'),
-    providerName: $('providerName'),
-    providerRequests: $('providerRequests'),
-    dailyCreditsUsed: $('dailyCreditsUsed'),
-    dailyCreditsRemaining: $('dailyCreditsRemaining'),
-    cachedPairs: $('cachedPairs'),
-    candidateCount: $('candidateCount'),
-    scannerStatus: $('scannerStatus'),
-    lastScanAt: $('lastScanAt')
+  const dom = {
+    analyzeButton: $('analyzeButton'),
+    refreshScannerButton: $('refreshScannerButton'),
+    runBacktestButton: $('runBacktestButton'),
+    refreshHistoryButton: $('refreshHistoryButton'),
+    pairSelect: $('pairSelect'),
+    expirySelect: $('expirySelect'),
+    backtestPairSelect: $('backtestPairSelect'),
+    backtestDuration: $('backtestDuration')
   };
 
   function obj(value) {
@@ -108,33 +67,46 @@
     );
   }
 
-  function num(value) {
+  function number(value) {
     if (value === null || value === undefined || value === '') {
       return null;
     }
 
-    const result = Number(value);
-    return Number.isFinite(result) ? result : null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
-  function fmt(value, digits = 5) {
-    const valueNumber = num(value);
+  function formatNumber(value, digits = 5) {
+    const parsed = number(value);
 
-    if (valueNumber === null) return '—';
+    if (parsed === null) return '—';
 
-    return valueNumber.toLocaleString(undefined, {
+    return parsed.toLocaleString(undefined, {
       maximumFractionDigits: digits
     });
   }
 
-  function date(value) {
+  function formatDate(value) {
     if (!value) return '—';
 
     const parsed = new Date(value);
 
-    return Number.isNaN(parsed.getTime())
-      ? String(value)
-      : parsed.toLocaleString();
+    if (Number.isNaN(parsed.getTime())) {
+      return String(value);
+    }
+
+    return parsed.toLocaleString();
+  }
+
+  function formatDuration(start, end) {
+    const a = new Date(start).getTime();
+    const b = new Date(end).getTime();
+
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) {
+      return '—';
+    }
+
+    return `${Math.round((b - a) / 60000)} minute(s)`;
   }
 
   function setText(id, value, fallback = '—') {
@@ -147,33 +119,42 @@
         : String(value);
   }
 
-  function setBadge(node, label, className) {
+  function setClass(id, className) {
+    const node = $(id);
+    if (node) node.className = className;
+  }
+
+  function setStatusDot(online) {
+    const dot = $('apiStatusDot');
+    if (!dot) return;
+
+    dot.className = online
+      ? 'status-indicator online'
+      : 'status-indicator offline';
+  }
+
+  function showMessage(message, type = 'info') {
+    const node = $('analysisMessage');
     if (!node) return;
 
-    node.textContent = label;
-    node.className = className;
+    node.textContent = String(message || '');
+    node.dataset.type = type;
   }
 
-  function showError(message) {
-    if (!el.errorBox) return;
+  function setButtonBusy(button, busy, busyText, normalText) {
+    if (!button) return;
 
-    el.errorBox.textContent = String(message);
-    el.errorBox.hidden = false;
-  }
-
-  function clearError() {
-    if (!el.errorBox) return;
-
-    el.errorBox.textContent = '';
-    el.errorBox.hidden = true;
+    button.disabled = busy;
+    button.textContent = busy ? busyText : normalText;
   }
 
   async function requestJson(path, options = {}) {
     const controller = new AbortController();
+    const timeoutMs = options.timeout || REQUEST_TIMEOUT_MS;
 
     const timeout = setTimeout(
       () => controller.abort(),
-      options.timeout || REQUEST_TIMEOUT_MS
+      timeoutMs
     );
 
     try {
@@ -193,13 +174,13 @@
       });
 
       const raw = await response.text();
-      let payload;
+      let payload = {};
 
       try {
         payload = raw ? JSON.parse(raw) : {};
       } catch {
         throw new Error(
-          `API returned invalid JSON (HTTP ${response.status}).`
+          `API returned invalid JSON. HTTP ${response.status}.`
         );
       }
 
@@ -208,7 +189,7 @@
           first(
             payload.error,
             payload.message,
-            `Request failed (HTTP ${response.status}).`
+            `Request failed. HTTP ${response.status}.`
           )
         );
 
@@ -220,12 +201,9 @@
       return payload;
     } catch (error) {
       if (error.name === 'AbortError') {
-        const timeoutError = new Error(
+        throw new Error(
           'API request timed out. No new signal was confirmed.'
         );
-
-        timeoutError.code = 'REQUEST_TIMEOUT';
-        throw timeoutError;
       }
 
       throw error;
@@ -246,8 +224,21 @@
     ));
   }
 
-  function indicatorsFrom(market) {
-    return obj(market.indicators);
+  function isFresh(market) {
+    const age = number(market.dataAgeSeconds);
+    const freshness = String(
+      first(market.freshness, 'UNKNOWN')
+    ).toUpperCase();
+
+    return (
+      freshness === 'FRESH' &&
+      age !== null &&
+      age >= 0 &&
+      age <= MAX_DATA_AGE_SECONDS &&
+      number(market.currentPrice) !== null &&
+      number(market.currentPrice) > 0 &&
+      market.insufficientData !== true
+    );
   }
 
   function getSignal(market) {
@@ -286,549 +277,100 @@
     return 'NO TRADE';
   }
 
-  function isFreshMarket(market) {
-    const age = num(market.dataAgeSeconds);
-    const freshness = String(
-      first(market.freshness, 'UNKNOWN')
-    ).toUpperCase();
+  function renderDirection(direction) {
+    const node = $('signalDirection');
+    if (!node) return;
 
-    const currentPrice = num(market.currentPrice);
-    const entryPrice = num(market.entryPrice);
+    node.textContent = direction;
 
-    return (
-      freshness === 'FRESH' &&
-      age !== null &&
-      age >= 0 &&
-      age <= MAX_DATA_AGE_SECONDS &&
-      currentPrice !== null &&
-      currentPrice > 0 &&
-      entryPrice !== null &&
-      entryPrice > 0 &&
-      market.insufficientData !== true &&
-      market.tradeAllowed !== false &&
-      market.noTrade !== true
-    );
+    node.className = 'signal-direction ' +
+      (direction === 'BUY'
+        ? 'buy'
+        : direction === 'SELL'
+          ? 'sell'
+          : 'no-trade');
   }
 
-  function isQualifiedCandidate(candidate) {
-    const signal = getSignal(candidate);
-    const age = num(candidate.dataAgeSeconds);
-
-    const freshness = String(
-      first(candidate.freshness, 'UNKNOWN')
-    ).toUpperCase();
-
-    return (
-      (signal === 'BUY' || signal === 'SELL') &&
-      freshness === 'FRESH' &&
-      age !== null &&
-      age >= 0 &&
-      age <= MAX_DATA_AGE_SECONDS &&
-      candidate.noTrade !== true &&
-      candidate.tradeAllowed !== false &&
-      candidate.insufficientData !== true
-    );
-  }
-
-  function renderSignal(signal) {
-    if (signal === 'BUY') {
-      setBadge(
-        el.signalBadge,
-        'BUY',
-        'signal-badge signal-call'
-      );
-    } else if (signal === 'SELL') {
-      setBadge(
-        el.signalBadge,
-        'SELL',
-        'signal-badge signal-put'
-      );
-    } else {
-      setBadge(
-        el.signalBadge,
-        'NO TRADE',
-        'signal-badge signal-wait'
-      );
-    }
-  }
-
-  function renderTrend(value) {
-    const trend = String(value || 'UNKNOWN').toUpperCase();
-
-    if (
-      trend.includes('BULL') ||
-      trend.includes('BUYER') ||
-      trend === 'UP'
-    ) {
-      setBadge(
-        el.trendBadge,
-        'Trend: BULLISH',
-        'trend-badge trend-up'
-      );
-    } else if (
-      trend.includes('BEAR') ||
-      trend.includes('SELLER') ||
-      trend === 'DOWN'
-    ) {
-      setBadge(
-        el.trendBadge,
-        'Trend: BEARISH',
-        'trend-badge trend-down'
-      );
-    } else {
-      setBadge(
-        el.trendBadge,
-        `Trend: ${trend}`,
-        'trend-badge'
-      );
-    }
-  }
-
-  function renderReasons(reasons) {
-    if (!el.reasons) return;
-
-    el.reasons.replaceChildren();
-
-    const items = (
-      Array.isArray(reasons) ? reasons : [reasons]
-    ).filter(Boolean).slice(0, MAX_REASONS);
-
-    if (!items.length) {
-      items.push('No additional decision reasons were supplied.');
-    }
-
-    for (const reason of items) {
-      const item = document.createElement('li');
-      item.textContent = String(reason);
-      el.reasons.appendChild(item);
-    }
-  }
-
-  function renderUsage(metadata) {
-    const meta = obj(metadata);
+  function renderApiStatus(online, message) {
+    setStatusDot(online);
 
     setText(
-      'providerName',
-      first(meta.provider, 'Twelve Data LIVE')
+      'apiStatusText',
+      message,
+      online ? 'API ONLINE' : 'API UNAVAILABLE'
     );
 
-    setText('providerRequests', meta.providerRequests);
-    setText('dailyCreditsUsed', meta.dailyCreditsUsed);
-    setText('dailyCreditsRemaining', meta.dailyCreditsRemaining);
-    setText('cachedPairs', first(meta.cachedPairs, 0));
-
     setText(
-      'provider',
-      `${first(meta.provider, 'Twelve Data LIVE')} · API ${first(meta.version, VERSION_LABEL)}`
+      'apiStatusCard',
+      online ? 'ONLINE' : 'OFFLINE'
     );
   }
 
   function renderHealth(payload) {
     const root = obj(payload);
-    const health = obj(first(root.health, root.data, root));
+    state.lastHealth = root;
 
-    state.lastHealth = health;
+    const configured = root.configured === true;
+    const online = root.ok !== false;
 
-    const online =
-      root.ok !== false &&
-      health.ok !== false &&
-      health.configured === true;
-
-    setBadge(
-      el.backendStatus,
-      online
-        ? `API online · ${first(health.version, VERSION_LABEL)}`
-        : health.configured === false
-          ? 'API key not configured'
-          : 'API status unavailable',
-      online
-        ? 'status-badge status-online'
-        : 'status-badge status-offline'
-    );
-
-    renderUsage(first(health.metadata, health.meta, health));
-    renderHealthProgress(health);
-  }
-
-  function renderHealthProgress(health) {
-    const progress = obj(first(
-      health.progress,
-      health.scanProgress
-    ));
-
-    if (
-      progress.completed !== undefined ||
-      progress.priorityCompleted !== undefined
-    ) {
-      renderProgressText(
-        obj(health.scanner),
-        progress,
-        health.scannerRunning === true
-      );
-    }
-  }
-
-  function renderMarket(payload) {
-    const root = obj(payload);
-    const market = marketFrom(root);
-
-    if (!market || !Object.keys(market).length) {
-      return;
-    }
-
-    const indicators = indicatorsFrom(market);
-    const macd = obj(indicators.macd);
-    const stochastic = obj(indicators.stochastic);
-    const levels = obj(market.supportResistance);
-    const pattern = market.candlePattern;
-
-    state.lastMarket = market;
-
-    const pair = String(first(
-      market.pair,
-      el.selectedPair?.value,
-      'NO MARKET'
-    ));
-
-    setText('summaryPair', pair);
-    setText('currentPrice', fmt(market.currentPrice));
-    setText('entryPrice', fmt(market.entryPrice));
-    setText('entryTime', date(market.entryTime));
-    setText('expiryTime', date(market.expiryTime));
-
-    const age = num(market.dataAgeSeconds);
-    const freshness = String(
-      first(market.freshness, 'UNKNOWN')
-    ).toUpperCase();
-
-    const safe = isFreshMarket(market);
-
-    setText(
-      'freshness',
-      safe ? freshness : `NOT VERIFIED · ${freshness}`
+    renderApiStatus(
+      online,
+      online ? 'API ONLINE' : 'API UNAVAILABLE'
     );
 
     setText(
-      'dataAge',
-      age === null
-        ? 'Age: unavailable'
-        : age < 60
-          ? `Age: ${Math.round(age)} sec`
-          : `Age: ${Math.floor(age / 60)} min ${Math.round(age % 60)} sec`
-    );
-
-    setBadge(
-      el.marketStatus,
-      safe
-        ? 'Market status: fresh provider data'
-        : 'Market status: verify data',
-      safe
-        ? 'status-badge status-online'
-        : 'status-badge status-unknown'
-    );
-
-    renderTrend(first(
-      obj(market.trendLine).direction,
-      market.priceAction,
-      'UNKNOWN'
-    ));
-
-    // A BUY/SELL display requires both fresh data and a backend-approved signal.
-    const backendSignal = getSignal(market);
-    const signal = safe ? backendSignal : 'NO TRADE';
-
-    renderSignal(signal);
-
-    setText(
-      'confidence',
-      signal === 'NO TRADE'
-        ? '—'
-        : `${fmt(market.confidence, 0)}/100`
-    );
-
-    setText('callScore', fmt(market.callScore, 0));
-    setText('putScore', fmt(market.putScore, 0));
-    setText('gap', fmt(market.gap, 0));
-
-    setText('ema9', fmt(indicators.ema9));
-    setText('ema21', fmt(indicators.ema21));
-
-    setText(
-      'emaCross',
-      `EMA crossover: ${first(indicators.emaCross, '—')}`
+      'apiStatusDetail',
+      `Backend ${first(root.version, VERSION)}`
     );
 
     setText(
-      'rsi',
-      fmt(first(indicators.rsi14, indicators.rsi), 2)
+      'providerStatus',
+      first(root.provider, 'TWELVE DATA')
     );
 
     setText(
-      'rsiCross',
-      `RSI 14: ${first(indicators.rsiZone, '—')}`
+      'providerDetail',
+      configured
+        ? 'Provider API key configured'
+        : 'Provider API key not configured'
     );
 
-    setText('macdLine', fmt(macd.line, 6));
-    setText('macdSignal', fmt(macd.signal, 6));
+    const metadata = obj(root.metadata);
 
     setText(
-      'macdHistogram',
-      `Histogram: ${fmt(macd.histogram, 6)}`
-    );
-
-    setText(
-      'macdCross',
-      `MACD: ${first(macd.crossover, '—')}`
-    );
-
-    setText('stochK', fmt(stochastic.k, 2));
-    setText('stochD', fmt(stochastic.d, 2));
-
-    setText(
-      'stochasticCross',
-      `Stochastic: ${first(stochastic.crossover, '—')}`
-    );
-
-    // These fields are not calculated by the supplied V9.5 server.
-    setText('bollingerUpper', 'NOT PROVIDED');
-    setText('bollingerMiddle', 'NOT PROVIDED');
-    setText('bollingerLower', 'NOT PROVIDED');
-    setText('volatility', 'NOT CALCULATED');
-
-    setText('support', fmt(levels.support));
-    setText('resistance', fmt(levels.resistance));
-
-    setText(
-      'candlePattern',
-      typeof pattern === 'string'
-        ? pattern
-        : first(obj(pattern).name, '—')
+      'pairsTracked',
+      PAIRS.length
     );
 
     setText(
-      'lastCandle',
-      market.lastCandle
-        ? `Latest completed candle: ${date(market.lastCandle)}`
-        : 'Latest completed candle: unavailable'
+      'marketFreshness',
+      root.scannerRunning ? 'SCANNING' : 'CHECKING'
     );
 
     setText(
-      'priceAction',
-      first(
-        obj(market.trendLine).description,
-        market.priceAction,
-        'Trend-line analysis unavailable.'
-      )
+      'marketFreshnessDetail',
+      root.scannerRunning
+        ? 'Market scanner is running'
+        : 'Waiting for selected-pair analysis'
     );
 
-    setText(
-      'psychology',
-      first(
-        market.marketPsychology,
-        'Market psychology unavailable.'
-      )
-    );
-
-    const reasons = Array.isArray(market.reasons)
-      ? market.reasons.slice()
-      : [];
-
-    if (!safe) {
-      reasons.unshift(
-        'NO TRADE: data freshness, price validity, or sufficiency could not be verified.'
-      );
-    }
-
-    if (signal === 'NO TRADE' && reasons.length === 0) {
-      reasons.push(
-        'NO TRADE: evidence is insufficient or conflicting.'
-      );
-    }
-
-    renderReasons(reasons);
-
-    setText(
-      'signalReason',
-      !safe
-        ? 'NO TRADE — data freshness or sufficiency has not been confirmed.'
-        : first(
-            obj(market.signal).reason,
-            market.reason,
-            reasons[0],
-            'Evidence score, not win probability. No guaranteed outcomes.'
-          )
-    );
-
-    renderUsage(root.metadata);
-
-    setText(
-      'scanInfo',
-      `${pair} · 1m · latest available analysis`
-    );
-  }
-
-  function getQualifiedCandidates(payload) {
-    const root = obj(payload);
-
-    const candidates = Array.isArray(root.rankedCandidates)
-      ? root.rankedCandidates
-      : [];
-
-    return candidates.filter(isQualifiedCandidate);
-  }
-
-  function renderProgressText(scanner, progress, running) {
-    const priorityCompleted = num(
-      first(progress.priorityCompleted, scanner.priorityCompleted)
-    );
-
-    const priorityTotal = num(
-      first(progress.priorityTotal, scanner.priorityTotal)
-    );
-
-    const backgroundCompleted = num(
-      first(progress.backgroundCompleted, scanner.backgroundCompleted)
-    );
-
-    const backgroundTotal = num(
-      first(progress.backgroundTotal, scanner.backgroundTotal)
-    );
-
-    if (priorityTotal !== null && priorityTotal > 0) {
-      const priorityText =
-        `Priority ${priorityCompleted || 0}/${priorityTotal}`;
-
-      const backgroundText =
-        backgroundTotal !== null
-          ? ` · Background ${backgroundCompleted || 0}/${backgroundTotal}`
-          : '';
-
+    if (!configured) {
       setText(
-        'scanInfo',
-        `${running ? 'Scanning' : 'Scan status'}: ${priorityText}${backgroundText}.`
+        'providerDetail',
+        'Twelve Data API key is not configured on backend'
       );
-
-      return;
     }
 
-    const completed = num(progress.completed) || 0;
-    const total = num(progress.total) || num(scanner.pairs) || 24;
-
-    setText(
-      'scanInfo',
-      `${running ? 'Scanning' : 'Scan status'}: ${completed}/${total} pairs checked.`
-    );
-  }
-
-  function renderScanner(payload) {
-    const root = obj(payload);
-    const scanner = obj(root.scanner);
-    const progress = obj(scanner.progress);
-
-    const allCandidates = Array.isArray(root.rankedCandidates)
-      ? root.rankedCandidates
-      : [];
-
-    const qualified = getQualifiedCandidates(root);
-
-    const panel = document.querySelector('.scanner-panel');
-    const scannerNode = $('scanner');
-
-    if (panel) panel.hidden = false;
-
-    setText('candidateCount', qualified.length);
-
-    setText(
-      'lastScanAt',
-      date(first(scanner.lastScanAt, root.lastScanAt))
-    );
-
-    const running = scanner.running === true;
-
-    setBadge(
-      el.scannerStatus,
-      running
-        ? 'Scanner running'
-        : qualified.length
-          ? `${qualified.length} qualified signal(s)`
-          : 'No qualified signal',
-      running
-        ? 'status-badge status-unknown'
-        : qualified.length
-          ? 'status-badge status-online'
-          : 'status-badge status-unknown'
-    );
-
-    renderProgressText(scanner, progress, running);
-
-    if (!scannerNode) return;
-
-    scannerNode.replaceChildren();
-
-    if (!qualified.length) {
-      const paragraph = document.createElement('p');
-      paragraph.className = 'muted-text';
-
-      paragraph.textContent = running
-        ? 'Scan in progress. No qualified BUY/SELL signal is confirmed yet.'
-        : allCandidates.length
-          ? 'No candidate passed the signal and freshness checks. NO TRADE.'
-          : 'No market results are available yet. Press Analyze to request analysis.';
-
-      scannerNode.appendChild(paragraph);
-      return;
+    if (metadata.databaseReady === true) {
+      setText('historySource', 'POSTGRESQL');
+    } else {
+      setText('historySource', 'MEMORY ONLY');
     }
 
-    const list = document.createElement('ol');
-    list.className = 'candidate-list';
-
-    for (const candidate of qualified.slice(0, 10)) {
-      const item = document.createElement('li');
-      const title = document.createElement('strong');
-      const detail = document.createElement('p');
-
-      const signal = getSignal(candidate);
-
-      title.textContent =
-        `${candidate.pair || 'Unknown pair'} · 1m · ${signal}`;
-
-      detail.textContent =
-        `Evidence score: ${fmt(candidate.confidence, 0)}/100 · ` +
-        `Data age: ${fmt(candidate.dataAgeSeconds, 0)} sec · ` +
-        String(candidate.reason || 'Evidence review.');
-
-      item.append(title, detail);
-      list.appendChild(item);
-    }
-
-    scannerNode.appendChild(list);
-  }
-
-  function setBusy(button, busy, busyText, normalText) {
-    if (!button) return;
-
-    button.disabled = busy;
-    button.textContent = busy ? busyText : normalText;
-  }
-
-  function setScanBusy(busy) {
-    state.scanBusy = busy;
-
-    setBusy(
-      $('backgroundScanBtn'),
-      busy,
-      'Scan running…',
-      'Continue background scan'
+    renderScannerProgress(
+      obj(root.scanProgress),
+      root.scannerRunning === true
     );
-  }
-
-  function stopPolling() {
-    if (state.scanTimer) {
-      clearInterval(state.scanTimer);
-      state.scanTimer = null;
-    }
-
-    setScanBusy(false);
   }
 
   async function checkHealth() {
@@ -842,181 +384,655 @@
       });
 
       renderHealth(payload);
-    } catch {
-      setBadge(
-        el.backendStatus,
-        'API offline / unavailable',
-        'status-badge status-offline'
-      );
+    } catch (error) {
+      renderApiStatus(false, 'API OFFLINE / UNAVAILABLE');
+      setText('apiStatusCard', 'OFFLINE');
+      setText('apiStatusDetail', error.message);
+      setText('providerDetail', 'Provider status unavailable');
     } finally {
       state.healthBusy = false;
     }
   }
 
-  async function pollScan() {
-    if (!state.scanBusy) return;
+  function renderScannerProgress(progress, running) {
+    const completed = number(progress.completed) || 0;
+    const total = number(progress.total) || PAIRS.length;
 
-    try {
-      const payload = await requestJson('/api/best');
+    const percent = total > 0
+      ? Math.max(0, Math.min(100, completed / total * 100))
+      : 0;
 
-      renderScanner(payload);
+    const bar = $('scannerProgressBar');
+    if (bar) bar.style.width = `${percent}%`;
 
-      const market = marketFrom(payload);
-
-      if (market.pair && market.pair !== 'NO MARKET') {
-        renderMarket(payload);
-      }
-
-      const scanner = obj(payload.scanner);
-
-      if (scanner.running === true) {
-        renderProgressText(
-          scanner,
-          obj(scanner.progress),
-          true
-        );
-
-        return;
-      }
-
-      stopPolling();
-
-      const diagnostic = obj(payload.diagnostic);
-
-      setText(
-        'scanInfo',
-        diagnostic.lastScanError
-          ? `Scan stopped with provider errors: ${diagnostic.lastScanError}`
-          : 'Scan stopped or completed. Only fresh, qualified signals are shown.'
-      );
-    } catch (error) {
-      setText(
-        'scanInfo',
-        `Scan status temporarily unavailable: ${String(error.message || error)}`
-      );
-    }
-  }
-
-  function startPolling() {
-    if (state.scanTimer) {
-      clearInterval(state.scanTimer);
-    }
-
-    setScanBusy(true);
-
-    state.scanTimer = setInterval(
-      pollScan,
-      SCAN_POLL_INTERVAL_MS
+    setText(
+      'scannerProgress',
+      `${completed} / ${total} pairs`
     );
 
-    pollScan();
+    setText(
+      'scannerStatus',
+      running
+        ? `Scanning ${first(progress.pair, 'forex pairs')}...`
+        : progress.phase === 'IDLE'
+          ? 'Scanner idle'
+          : first(progress.phase, 'Scanner status unavailable')
+    );
   }
 
-  async function loadLatestResults() {
-    const payload = await requestJson('/api/best');
+  function renderTechnical(market) {
+    const indicators = obj(market.indicators);
+    const macd = obj(indicators.macd);
+    const bollinger = obj(indicators.bollinger);
+    const divergence = obj(indicators.rsiDivergence);
+    const confirmation = obj(market.confirmation5m);
+    const volatility = obj(market.volatility);
+    const levels = obj(market.supportResistance);
+    const trendline = obj(market.trendLine);
+    const breakout = obj(market.breakout);
+    const pattern = obj(market.candlePattern);
+    const psychology = obj(market.marketPsychology);
 
-    renderScanner(payload);
+    setText(
+      'emaSignal',
+      first(indicators.emaCross, 'UNAVAILABLE')
+    );
 
-    const market = marketFrom(payload);
+    setText(
+      'emaDetail',
+      `EMA 9: ${formatNumber(indicators.ema9)} · EMA 21: ${formatNumber(indicators.ema21)}`
+    );
 
-    if (market.pair && market.pair !== 'NO MARKET') {
-      renderMarket(payload);
+    setText(
+      'rsiValue',
+      formatNumber(indicators.rsi14, 2)
+    );
+
+    setText(
+      'rsiSignal',
+      indicators.rsi14 === null || indicators.rsi14 === undefined
+        ? 'RSI 14 unavailable'
+        : Number(indicators.rsi14) > 70
+          ? 'Above 70 · elevated'
+          : Number(indicators.rsi14) < 30
+            ? 'Below 30 · depressed'
+            : 'Between 30 and 70'
+    );
+
+    setText(
+      'rsiDivergence',
+      first(divergence.type, 'UNAVAILABLE')
+    );
+
+    setText(
+      'rsiDivergenceDetail',
+      first(
+        divergence.description,
+        'RSI divergence not available'
+      )
+    );
+
+    setText(
+      'macdSignal',
+      first(macd.crossover, 'UNAVAILABLE')
+    );
+
+    setText(
+      'macdDetail',
+      `Line ${formatNumber(macd.line, 7)} · Signal ${formatNumber(macd.signal, 7)} · Histogram ${formatNumber(macd.histogram, 7)}`
+    );
+
+    setText(
+      'fiveMinuteTrend',
+      first(confirmation.direction, 'UNAVAILABLE')
+    );
+
+    setText(
+      'fiveMinuteDetail',
+      first(
+        confirmation.reason,
+        confirmation.status,
+        '5-minute confirmation unavailable'
+      )
+    );
+
+    setText(
+      'atrValue',
+      formatNumber(indicators.atr14, 7)
+    );
+
+    setText(
+      'atrDetail',
+      volatility.atrPercent !== undefined
+        ? `ATR percentage: ${formatNumber(volatility.atrPercent, 5)}%`
+        : 'ATR reading'
+    );
+
+    setText(
+      'bollingerSignal',
+      first(
+        bollinger.position,
+        'CALCULATED'
+      )
+    );
+
+    setText(
+      'bollingerDetail',
+      `Upper ${formatNumber(bollinger.upper, 7)} · Middle ${formatNumber(bollinger.middle, 7)} · Lower ${formatNumber(bollinger.lower, 7)}`
+    );
+
+    setText(
+      'bollingerWidth',
+      bollinger.width === undefined || bollinger.width === null
+        ? 'UNAVAILABLE'
+        : `${formatNumber(bollinger.width, 5)}%`
+    );
+
+    setText(
+      'bollingerWidthDetail',
+      'Band width expansion / contraction'
+    );
+
+    setText(
+      'volatilityRegime',
+      first(volatility.regime, 'UNAVAILABLE')
+    );
+
+    setText(
+      'volatilityDetail',
+      volatility.atrPercent !== undefined
+        ? `ATR ${formatNumber(volatility.atrPercent, 5)}% · Bollinger width ${formatNumber(volatility.bollingerWidth, 5)}%`
+        : 'Volatility regime unavailable'
+    );
+
+    setText(
+      'candlestickPatterns',
+      first(pattern.name, 'UNAVAILABLE')
+    );
+
+    setText(
+      'candlestickDetail',
+      first(pattern.direction, 'No pattern direction supplied')
+    );
+
+    setText(
+      'marketPsychology',
+      typeof market.marketPsychology === 'string'
+        ? market.marketPsychology
+        : first(psychology.psychology, 'UNAVAILABLE')
+    );
+
+    setText(
+      'psychologyDetail',
+      first(
+        psychology.direction,
+        'Price pressure interpretation'
+      )
+    );
+
+    setText(
+      'supportLevel',
+      formatNumber(levels.support)
+    );
+
+    setText(
+      'supportDetail',
+      first(levels.position, 'Support assessment unavailable')
+    );
+
+    setText(
+      'resistanceLevel',
+      formatNumber(levels.resistance)
+    );
+
+    setText(
+      'resistanceDetail',
+      first(levels.position, 'Resistance assessment unavailable')
+    );
+
+    setText(
+      'trendlineSignal',
+      first(trendline.direction, 'UNAVAILABLE')
+    );
+
+    setText(
+      'trendlineDetail',
+      first(
+        trendline.description,
+        'Trendline analysis unavailable'
+      )
+    );
+
+    setText(
+      'breakoutSignal',
+      first(breakout.status, 'UNAVAILABLE')
+    );
+
+    setText(
+      'breakoutDetail',
+      first(
+        breakout.description,
+        'Breakout assessment unavailable'
+      )
+    );
+
+    const retest = String(first(breakout.status, '')).includes('RETEST');
+
+    setText(
+      'retestSignal',
+      retest ? breakout.status : 'NO CONFIRMED RETEST'
+    );
+
+    setText(
+      'retestDetail',
+      retest
+        ? first(breakout.description, 'Retest detected')
+        : 'No confirmed retest supplied'
+    );
+
+    const falseBreakout = String(
+      first(breakout.status, '')
+    ).includes('FALSE');
+
+    setText(
+      'falseBreakoutSignal',
+      falseBreakout ? breakout.status : 'NOT DETECTED'
+    );
+
+    setText(
+      'falseBreakoutDetail',
+      falseBreakout
+        ? first(breakout.description, 'False breakout risk')
+        : 'No false breakout detected by current analysis'
+    );
+  }
+
+  function renderFundamentals(market) {
+    const news = String(
+      first(market.newsStatus, 'NOT_CONFIGURED')
+    ).toUpperCase();
+
+    const fundamentals = String(
+      first(market.fundamentalStatus, 'NOT_CONFIGURED')
+    ).toUpperCase();
+
+    setText('newsStatus', news);
+    setText('fundamentalStatus', fundamentals);
+
+    setText(
+      'newsDetail',
+      news === 'NOT_CONFIGURED'
+        ? 'No verified news feed is configured'
+        : 'News provider status returned by backend'
+    );
+
+    setText(
+      'fundamentalDetail',
+      fundamentals === 'NOT_CONFIGURED'
+        ? 'No verified fundamental feed is configured'
+        : 'Fundamental status returned by backend'
+    );
+
+    const unverified =
+      news === 'NOT_CONFIGURED' ||
+      news === 'UNVERIFIED' ||
+      fundamentals === 'NOT_CONFIGURED' ||
+      fundamentals === 'UNVERIFIED';
+
+    setText(
+      'economicEvents',
+      unverified ? 'UNVERIFIED' : 'PROVIDER STATUS'
+    );
+
+    setText(
+      'economicEventsDetail',
+      unverified
+        ? 'Economic calendar is not verified by the current backend'
+        : 'Economic event status returned by backend'
+    );
+
+    setText(
+      'newsRiskFilter',
+      unverified ? 'UNVERIFIED' : 'PROVIDER STATUS'
+    );
+
+    setText(
+      'newsRiskDetail',
+      unverified
+        ? 'Unknown news risk is not treated as confirmed safe'
+        : 'Risk status returned by backend'
+    );
+  }
+
+  function renderMarket(payload, expectedPair) {
+    const root = obj(payload);
+    const market = marketFrom(root);
+
+    if (!Object.keys(market).length) {
+      throw new Error('The API did not return a selected market result.');
     }
 
-    return payload;
+    state.lastMarket = market;
+
+    const pair = String(first(
+      market.pair,
+      root.selectedPair,
+      expectedPair,
+      'UNKNOWN'
+    ));
+
+    if (
+      expectedPair &&
+      pair.toUpperCase() !== expectedPair.toUpperCase()
+    ) {
+      throw new Error(
+        `Pair mismatch. Requested ${expectedPair}, received ${pair}.`
+      );
+    }
+
+    const fresh = isFresh(market);
+    const backendSignal = getSignal(market);
+    const direction = fresh ? backendSignal : 'NO TRADE';
+
+    const entryTime = market.entryTime;
+    const expiryTime = market.expiryTime;
+    const entryPrice = number(market.entryPrice);
+
+    renderDirection(direction);
+
+    setText('resultPair', pair);
+    setText('analysisTimestamp', formatDate(first(
+      market.fetchedAt,
+      market.lastCandle,
+      new Date().toISOString()
+    )));
+
+    const evidence = number(market.confidence);
+
+    setText(
+      'evidenceScore',
+      direction === 'NO TRADE' || evidence === null
+        ? '—'
+        : Math.round(evidence)
+    );
+
+    const evidenceBar = $('evidenceBar');
+
+    if (evidenceBar) {
+      const score = direction === 'NO TRADE' || evidence === null
+        ? 0
+        : Math.max(0, Math.min(100, evidence));
+
+      evidenceBar.style.width = `${score}%`;
+    }
+
+    setText(
+      'signalReason',
+      !fresh
+        ? 'NO TRADE — market data is stale or its freshness cannot be verified.'
+        : first(
+            obj(market.signal).reason,
+            market.reason,
+            Array.isArray(market.reasons) ? market.reasons[0] : null,
+            direction === 'NO TRADE'
+              ? 'Evidence is insufficient or conflicting.'
+              : 'Backend research direction returned.'
+          )
+    );
+
+    setText('entryTime', formatDate(entryTime));
+    setText('expiryTime', formatDate(expiryTime));
+
+    setText(
+      'entryPrice',
+      entryPrice === null
+        ? 'WAITING FOR PRICE'
+        : formatNumber(entryPrice)
+    );
+
+    setText(
+      'signalDuration',
+      formatDuration(entryTime, expiryTime)
+    );
+
+    setText(
+      'signalStatus',
+      direction === 'NO TRADE'
+        ? 'NO TRADE'
+        : entryPrice === null
+          ? 'WAITING FOR ENTRY PRICE'
+          : 'PRICE AVAILABLE'
+    );
+
+    setText(
+      'marketFreshness',
+      fresh ? 'FRESH' : 'NOT VERIFIED'
+    );
+
+    setText(
+      'marketFreshnessDetail',
+      market.dataAgeSeconds === null ||
+      market.dataAgeSeconds === undefined
+        ? 'Data age unavailable'
+        : `Last completed candle age: ${formatNumber(market.dataAgeSeconds, 1)} seconds`
+    );
+
+    const warning = $('signalWarning');
+
+    if (warning) {
+      warning.textContent =
+        direction === 'NO TRADE'
+          ? 'NO TRADE: required evidence or data checks have not passed.'
+          : entryPrice === null
+            ? 'Research direction only. Entry price has not been confirmed. Do not treat this as an executable trade.'
+            : 'A reference price is available. This remains a research signal, not a guarantee or financial advice.';
+    }
+
+    renderTechnical(market);
+    renderFundamentals(market);
+    renderReasons(market.reasons);
+
+    return market;
   }
 
-  async function analyzeAllPairs() {
+  function renderReasons(reasons) {
+    const items = Array.isArray(reasons)
+      ? reasons.filter(Boolean).slice(0, MAX_REASONS)
+      : [];
+
+    if (!items.length) {
+      items.push('No additional decision reasons were supplied.');
+    }
+
+    const node = document.createElement('ul');
+    node.className = 'reason-list';
+
+    for (const reason of items) {
+      const item = document.createElement('li');
+      item.textContent = String(reason);
+      node.appendChild(item);
+    }
+
+    const target = $('analysisMessage');
+    if (!target) return;
+
+    target.replaceChildren(
+      document.createTextNode('Analysis notes: '),
+      node
+    );
+  }
+
+  function renderScanner(payload) {
+    const root = obj(payload);
+    const scanner = obj(root.scanner);
+
+    state.lastScanner = root;
+
+    const candidates = Array.isArray(root.rankedCandidates)
+      ? root.rankedCandidates
+      : [];
+
+    const body = $('scannerTableBody');
+    if (!body) return;
+
+    body.replaceChildren();
+
+    if (!candidates.length) {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+
+      cell.colSpan = 8;
+      cell.className = 'empty-state';
+      cell.textContent = scanner.running
+        ? 'Scanner running. Waiting for pair results.'
+        : 'No scanned pair results are available yet.';
+
+      row.appendChild(cell);
+      body.appendChild(row);
+    } else {
+      for (const candidate of candidates) {
+        const row = document.createElement('tr');
+
+        const signal = getSignal(candidate);
+        const freshness = String(
+          first(candidate.freshness, 'UNKNOWN')
+        ).toUpperCase();
+
+        const values = [
+          candidate.pair,
+          '—',
+          '—',
+          '—',
+          '—',
+          candidate.confidence === null ||
+          candidate.confidence === undefined
+            ? '—'
+            : `${formatNumber(candidate.confidence, 0)}/100`,
+          freshness === 'FRESH' ? signal : 'NO TRADE',
+          'SELECT'
+        ];
+
+        for (let i = 0; i < values.length; i++) {
+          const cell = document.createElement('td');
+
+          if (i === 7) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'table-select-button';
+            button.textContent = 'SELECT';
+
+            button.addEventListener('click', () => {
+              if (PAIRS.includes(candidate.pair)) {
+                dom.pairSelect.value = candidate.pair;
+                analyzeSelectedPair();
+              }
+            });
+
+            cell.appendChild(button);
+          } else {
+            cell.textContent = String(first(values[i], '—'));
+          }
+
+          row.appendChild(cell);
+        }
+
+        body.appendChild(row);
+      }
+    }
+
+    renderScannerProgress(
+      obj(scanner.progress),
+      scanner.running === true
+    );
+  }
+
+  async function analyzeSelectedPair() {
     if (state.analysisBusy) return;
+
+    const pair = String(dom.pairSelect?.value || '').toUpperCase();
+
+    if (!PAIRS.includes(pair)) {
+      showMessage('Please select a supported LIVE forex pair.', 'error');
+      return;
+    }
 
     state.analysisBusy = true;
     const requestId = ++state.requestId;
 
-    clearError();
-
-    setBusy(
-      el.analyzeBtn,
+    setButtonBusy(
+      dom.analyzeButton,
       true,
-      'ANALYZING…',
-      'ANALYZE MARKET'
+      'ANALYZING SELECTED PAIR...',
+      'ANALYZE SELECTED PAIR'
     );
 
-    setText(
-      'scanInfo',
-      'Reviewing available fresh data and requesting analysis.'
-    );
+    showMessage(`Requesting analysis for ${pair}...`);
+
+    renderDirection('NO TRADE');
+    setText('evidenceScore', '—');
+    setText('signalStatus', 'ANALYZING');
 
     try {
-      // The analyze endpoint returns available results immediately
-      // and lets the backend manage its background scan.
-      const payload = await requestJson('/api/analyze', {
-        timeout: REQUEST_TIMEOUT_MS
-      });
+      const payload = await requestJson(
+        `/api/analyze?pair=${encodeURIComponent(pair)}`
+      );
 
       if (requestId !== state.requestId) return;
+
+      const market = renderMarket(payload, pair);
 
       renderScanner(payload);
 
-      const market = marketFrom(payload);
+      showMessage(
+        market.signal === 'NO TRADE'
+          ? `Analysis completed for ${pair}. Current assessment: NO TRADE.`
+          : `Analysis completed for ${pair}. Research direction: ${getSignal(market)}. Entry price must still be verified.`,
+        'success'
+      );
 
-      if (market.pair && market.pair !== 'NO MARKET') {
-        renderMarket(payload);
-      } else {
-        renderSignal('NO TRADE');
-        setText(
-          'signalReason',
-          'No scored market data is available yet. No trade is confirmed.'
-        );
-      }
-
-      const scanner = obj(payload.scanner);
-
-      if (scanner.running === true || payload.scanStarted === true) {
-        startPolling();
-
-        setText(
-          'scanInfo',
-          first(
-            payload.note,
-            'Analysis returned available results. Background scanning is continuing.'
-          )
-        );
-      } else {
-        setText(
-          'scanInfo',
-          first(
-            payload.note,
-            'Analysis complete. Only available fresh results are displayed.'
-          )
-        );
-      }
+      await loadHistory();
     } catch (error) {
       if (requestId !== state.requestId) return;
 
-      showError(String(error.message || error));
+      renderDirection('NO TRADE');
 
       setText(
         'signalReason',
-        'Analysis could not be confirmed. Do not infer BUY or SELL from an error.'
+        `Analysis could not be confirmed: ${error.message}`
       );
 
-      renderSignal('NO TRADE');
+      setText('signalStatus', 'UNAVAILABLE');
+
+      const warning = $('signalWarning');
+      if (warning) {
+        warning.textContent =
+          'NO TRADE: the selected-pair analysis failed or could not be verified.';
+      }
+
+      showMessage(error.message, 'error');
     } finally {
       state.analysisBusy = false;
 
-      setBusy(
-        el.analyzeBtn,
+      setButtonBusy(
+        dom.analyzeButton,
         false,
         '',
-        'ANALYZE MARKET'
+        'ANALYZE SELECTED PAIR'
       );
     }
   }
 
-  async function startBackgroundScan() {
-    if (state.scanBusy || state.analysisBusy) return;
+  async function refreshScanner() {
+    if (state.scanBusy) return;
 
-    clearError();
+    state.scanBusy = true;
+
+    setButtonBusy(
+      dom.refreshScannerButton,
+      true,
+      'STARTING SCANNER...',
+      'REFRESH SCANNER'
+    );
 
     try {
       const payload = await requestJson('/api/scan', {
@@ -1025,161 +1041,379 @@
         timeout: REQUEST_TIMEOUT_MS
       });
 
-      if (payload.ok === true) {
-        startPolling();
+      showMessage(
+        first(payload.message, 'Live forex scanner started.')
+      );
 
-        setText(
-          'scanInfo',
-          first(
-            payload.message,
-            'Background scan started.'
-          )
-        );
-      } else {
-        setText(
-          'scanInfo',
-          first(payload.message, 'Background scan could not start.')
-        );
-      }
+      startScannerPolling();
+      await loadBestResults();
     } catch (error) {
       if (error.status === 409) {
-        startPolling();
-
-        setText(
-          'scanInfo',
-          'A scan is already running. Monitoring its progress.'
-        );
-
-        return;
+        showMessage('A scanner is already running. Monitoring progress.');
+        startScannerPolling();
+      } else {
+        showMessage(error.message, 'error');
       }
+    } finally {
+      state.scanBusy = false;
 
-      if (error.status === 429) {
-        setText(
-          'scanInfo',
-          first(
-            error.message,
-            'Scan is unavailable because of cooldown or API credit limits.'
-          )
-        );
-
-        try {
-          await loadLatestResults();
-        } catch {
-          // Keep the original scan error visible.
-        }
-
-        return;
-      }
-
-      showError(String(error.message || error));
-
-      setText(
-        'scanInfo',
-        'Background scan could not be confirmed.'
+      setButtonBusy(
+        dom.refreshScannerButton,
+        false,
+        '',
+        'REFRESH SCANNER'
       );
     }
   }
 
-  function ensureScanButton() {
-    let button = $('backgroundScanBtn');
+  async function loadBestResults() {
+    const payload = await requestJson('/api/best');
 
-    if (!button) {
-      button = document.createElement('button');
-      button.id = 'backgroundScanBtn';
-      button.type = 'button';
-      button.textContent = 'Continue background scan';
-      button.style.marginTop = '10px';
+    renderScanner(payload);
 
-      el.analyzeBtn?.insertAdjacentElement('afterend', button);
-    }
-
-    if (button.dataset.listenerAttached !== 'true') {
-      button.addEventListener('click', startBackgroundScan);
-      button.dataset.listenerAttached = 'true';
-    }
+    return payload;
   }
 
-  function bindEvents() {
-    ensureScanButton();
-
-    if (
-      el.analyzeBtn &&
-      el.analyzeBtn.dataset.listenerAttached !== 'true'
-    ) {
-      el.analyzeBtn.textContent = 'ANALYZE MARKET';
-      el.analyzeBtn.addEventListener('click', analyzeAllPairs);
-      el.analyzeBtn.dataset.listenerAttached = 'true';
-    }
-
-    if (
-      el.selectedPair &&
-      el.selectedPair.dataset.listenerAttached !== 'true'
-    ) {
-      el.selectedPair.addEventListener('change', () => {
-        const selected = el.selectedPair.value;
-
-        setText(
-          'scanInfo',
-          `Selected pair: ${selected}. The scanner reviews market candidates independently.`
-        );
-      });
-
-      el.selectedPair.dataset.listenerAttached = 'true';
-    }
-
-    if (el.timeframe) {
-      // The strategy uses completed 1-minute candles only.
-      el.timeframe.value = '1';
-      el.timeframe.disabled = true;
-    }
-  }
-
-  async function initialize() {
-    bindEvents();
-
-    await checkHealth();
+  async function pollScanner() {
+    if (!state.scanTimer) return;
 
     try {
-      const current = await loadLatestResults();
-      const scanner = obj(current.scanner);
+      const payload = await loadBestResults();
+      const scanner = obj(payload.scanner);
 
-      if (scanner.running === true) {
-        startPolling();
+      if (!scanner.running) {
+        stopScannerPolling();
 
-        setText(
-          'scanInfo',
-          'A scan is already running. Showing results as they update.'
-        );
-      } else {
-        setText(
-          'scanInfo',
-          'Ready. Analyze reviews available fresh data and requests background analysis.'
+        showMessage(
+          'Scanner finished or is currently idle. Review the latest pair results.'
         );
       }
     } catch (error) {
       setText(
-        'scanInfo',
-        `API data could not be loaded: ${String(error.message || error)}`
+        'scannerStatus',
+        `Scanner status unavailable: ${error.message}`
       );
     }
+  }
 
-    if (state.healthTimer) {
-      clearInterval(state.healthTimer);
+  function startScannerPolling() {
+    stopScannerPolling();
+
+    state.scanTimer = setInterval(
+      pollScanner,
+      SCAN_POLL_INTERVAL_MS
+    );
+
+    pollScanner();
+  }
+
+  function stopScannerPolling() {
+    if (state.scanTimer) {
+      clearInterval(state.scanTimer);
+      state.scanTimer = null;
     }
+  }
+
+  async function loadHistory() {
+    if (state.historyBusy) return;
+
+    state.historyBusy = true;
+
+    try {
+      const payload = await requestJson('/api/history?limit=100');
+      const history = Array.isArray(payload.history)
+        ? payload.history
+        : [];
+
+      renderHistory(history, payload);
+    } catch (error) {
+      setText('historySource', `UNAVAILABLE`);
+      setText('historyTotal', '—');
+      setText('historyEvaluated', '—');
+      setText('historyPending', '—');
+
+      const body = $('historyTableBody');
+
+      if (body) {
+        body.replaceChildren();
+
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+
+        cell.colSpan = 7;
+        cell.textContent = `History unavailable: ${error.message}`;
+
+        row.appendChild(cell);
+        body.appendChild(row);
+      }
+    } finally {
+      state.historyBusy = false;
+    }
+  }
+
+  function renderHistory(history, payload) {
+    const evaluated = history.filter(record =>
+      String(first(record.outcome, 'PENDING')).toUpperCase() !== 'PENDING'
+    );
+
+    const pending = history.length - evaluated.length;
+
+    setText('historyTotal', history.length);
+    setText('historyEvaluated', evaluated.length);
+    setText('historyPending', pending);
+
+    setText(
+      'historySource',
+      payload.persistent ? 'POSTGRESQL' : 'MEMORY ONLY'
+    );
+
+    const body = $('historyTableBody');
+    if (!body) return;
+
+    body.replaceChildren();
+
+    if (!history.length) {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+
+      cell.colSpan = 7;
+      cell.className = 'empty-state';
+      cell.textContent = 'No signal records are available yet.';
+
+      row.appendChild(cell);
+      body.appendChild(row);
+      return;
+    }
+
+    for (const record of history) {
+      const row = document.createElement('tr');
+
+      const values = [
+        formatDate(first(record.createdAt, record.entryTime)),
+        record.pair,
+        record.signal,
+        record.evidenceScore === null ||
+        record.evidenceScore === undefined
+          ? '—'
+          : `${formatNumber(record.evidenceScore, 0)}/100`,
+        record.referencePrice === null ||
+        record.referencePrice === undefined
+          ? 'WAITING'
+          : formatNumber(record.referencePrice),
+        formatDuration(record.entryTime, record.expiryTime),
+        first(record.outcome, 'PENDING')
+      ];
+
+      for (const value of values) {
+        const cell = document.createElement('td');
+        cell.textContent = String(first(value, '—'));
+        row.appendChild(cell);
+      }
+
+      body.appendChild(row);
+    }
+  }
+
+  async function runBacktest() {
+    if (state.backtestBusy) return;
+
+    const pair = String(
+      dom.backtestPairSelect?.value || 'EUR/USD'
+    ).toUpperCase();
+
+    const duration = Number(dom.backtestDuration?.value || 1);
+
+    if (!PAIRS.includes(pair) || ![1, 2, 3].includes(duration)) {
+      setText('backtestMessage', 'Invalid pair or expiry duration.');
+      return;
+    }
+
+    state.backtestBusy = true;
+
+    setButtonBusy(
+      dom.runBacktestButton,
+      true,
+      'RUNNING BACKTEST...',
+      'RUN BACKTEST'
+    );
+
+    setText('backtestMessage', `Testing ${pair} with ${duration}-minute expiry...`);
+
+    try {
+      const query = new URLSearchParams({
+        pair,
+        expiry: String(duration)
+      });
+
+      const payload = await requestJson(
+        `/api/backtest?${query.toString()}`
+      );
+
+      renderBacktest(payload);
+    } catch (error) {
+      setText(
+        'backtestMessage',
+        `Backtest unavailable: ${error.message}`
+      );
+
+      setText('backtestSamples', '—');
+      setText('backtestWins', '—');
+      setText('backtestLosses', '—');
+      setText('backtestCoverage', '—');
+      setText('backtestWinRate', '—');
+      setText('backtestBaseline', '—');
+    } finally {
+      state.backtestBusy = false;
+
+      setButtonBusy(
+        dom.runBacktestButton,
+        false,
+        '',
+        'RUN BACKTEST'
+      );
+    }
+  }
+
+  function renderBacktest(payload) {
+    const result = obj(payload.result);
+    const holdout = obj(result.holdout);
+    const development = obj(result.development);
+
+    const samples = number(holdout.signals) || 0;
+    const wins = number(holdout.hits) || 0;
+    const losses = Math.max(0, samples - wins);
+
+    setText('backtestSamples', samples);
+    setText('backtestWins', wins);
+    setText('backtestLosses', losses);
+
+    setText(
+      'backtestCoverage',
+      result.coveragePercent === undefined
+        ? 'NOT REPORTED'
+        : `${formatNumber(result.coveragePercent, 2)}%`
+    );
+
+    setText(
+      'backtestWinRate',
+      holdout.hitRate === null || holdout.hitRate === undefined
+        ? '—'
+        : `${formatNumber(holdout.hitRate, 2)}%`
+    );
+
+    setText(
+      'backtestBaseline',
+      holdout.baselinePercent === null ||
+      holdout.baselinePercent === undefined
+        ? '—'
+        : `${formatNumber(holdout.baselinePercent, 2)}%`
+    );
+
+    const sufficient = holdout.sufficientSample === true;
+
+    setText(
+      'backtestMessage',
+      `${first(result.method, 'Walk-forward evaluation')} · ` +
+      `${first(result.conclusion, 'No conclusion supplied')} ` +
+      `Development signals: ${number(development.signals) || 0}. ` +
+      `Holdout signals: ${samples}. ` +
+      `Expiry: ${first(result.expiryMinutes, '—')} minute(s). ` +
+      (sufficient
+        ? 'Holdout sample threshold passed.'
+        : 'INSUFFICIENT HOLDOUT SAMPLE — no performance claim.')
+    );
+  }
+
+  function populatePairOptions() {
+    for (const select of [
+      dom.pairSelect,
+      dom.backtestPairSelect
+    ]) {
+      if (!select) continue;
+
+      const existing = new Set(
+        [...select.options].map(option => option.value)
+      );
+
+      for (const pair of PAIRS) {
+        if (existing.has(pair)) continue;
+
+        const option = document.createElement('option');
+        option.value = pair;
+        option.textContent = pair;
+        select.appendChild(option);
+      }
+    }
+  }
+
+  function initialize() {
+    populatePairOptions();
+
+    // The current backend generates a one-minute live expiry.
+    // 2m and 3m are evaluated through historical backtesting.
+    if (dom.expirySelect) {
+      dom.expirySelect.value = '1';
+      dom.expirySelect.disabled = true;
+      dom.expirySelect.title =
+        'Live signal expiry is currently fixed at one minute by the backend.';
+    }
+
+    dom.analyzeButton?.addEventListener(
+      'click',
+      analyzeSelectedPair
+    );
+
+    dom.refreshScannerButton?.addEventListener(
+      'click',
+      refreshScanner
+    );
+
+    dom.runBacktestButton?.addEventListener(
+      'click',
+      runBacktest
+    );
+
+    dom.refreshHistoryButton?.addEventListener(
+      'click',
+      loadHistory
+    );
+
+    dom.pairSelect?.addEventListener('change', () => {
+      showMessage(
+        `Selected ${dom.pairSelect.value}. Press Analyze to inspect this pair.`
+      );
+    });
+
+    checkHealth();
+    loadHistory();
 
     state.healthTimer = setInterval(
       checkHealth,
       HEALTH_INTERVAL_MS
     );
+
+    setText('apiStatusDetail', 'Connecting to backend...');
+    setText('scannerStatus', 'Scanner idle');
+    setText('scannerProgress', `0 / ${PAIRS.length} pairs`);
+
+    showMessage(
+      'Select a LIVE forex pair, then press Analyze.'
+    );
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener(
-      'DOMContentLoaded',
-      initialize,
-      { once: true }
-    );
+    document.addEventListener('DOMContentLoaded', initialize);
   } else {
     initialize();
   }
+
+  window.POAI = Object.freeze({
+    version: VERSION,
+    apiBase: API_BASE,
+    pairs: [...PAIRS],
+    analyzeSelectedPair,
+    refreshScanner,
+    loadHistory,
+    runBacktest
+  });
 })();
