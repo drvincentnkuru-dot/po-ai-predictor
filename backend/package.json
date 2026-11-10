@@ -1,17 +1,19 @@
-
 {
   "name": "po-ai-predictor-backend",
-  "version": "9.3.1",
-  "description": "PO AI Predictor V9.3.1 - Live Twelve Data forex analysis with evidence-gated signals",
+  "version": "10.1.0",
+  "private": true,
+  "description": "PO AI Predictor V10.1 - Live Forex research, evidence-gated signals, multi-timeframe confirmation and walk-forward evaluation",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js"
   },
   "engines": {
     "node": "20.x"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
   }
 }
