@@ -2,117 +2,217 @@
 
 const express = require('express');
 const cors = require('cors');
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
 
-const VERSION = 'V10.2.0';
+const VERSION = 'V10.3.0';
 const PORT = Number(process.env.PORT || 10000);
-const API_KEY = process.env.TWELVE_DATA_API_KEY || process.env.TWELVE_DATA_KEY || '';
+const API_KEY =
+  process.env.TWELVE_DATA_API_KEY ||
+  process.env.TWELVE_DATA_KEY ||
+  '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const PROVIDER_URL = 'https://api.twelvedata.com/time_series';
 
-// Exactly the same 24 pairs exposed by index.html and script.js.
-const PRIORITY_PAIRS = ['EUR/USD','GBP/USD','USD/JPY','USD/CHF','AUD/USD','USD/CAD'];
-const BACKGROUND_PAIRS = ['NZD/USD','EUR/GBP','EUR/JPY','GBP/JPY','EUR/CHF','EUR/AUD','EUR/CAD','GBP/CHF','GBP/AUD','GBP/CAD','AUD/JPY','AUD/CAD','AUD/NZD','CAD/JPY','CHF/JPY','NZD/JPY','NZD/CAD','EUR/NZD'];
+const PRIORITY_PAIRS = [
+  'EUR/USD',
+  'GBP/USD',
+  'USD/JPY',
+  'USD/CHF',
+  'AUD/USD',
+  'USD/CAD'
+];
+
+const BACKGROUND_PAIRS = [
+  'NZD/USD',
+  'EUR/GBP',
+  'EUR/JPY',
+  'GBP/JPY',
+  'EUR/CHF',
+  'EUR/AUD',
+  'EUR/CAD',
+  'GBP/CHF',
+  'GBP/AUD',
+  'GBP/CAD',
+  'AUD/JPY',
+  'AUD/CAD',
+  'AUD/NZD',
+  'CAD/JPY',
+  'CHF/JPY',
+  'NZD/JPY',
+  'NZD/CAD',
+  'EUR/NZD'
+];
+
 const PAIRS = [...PRIORITY_PAIRS, ...BACKGROUND_PAIRS];
 
 const DAILY_REQUEST_LIMIT = 768;
 const DAILY_RESERVE = 32;
-const DAILY_USABLE_LIMIT = DAILY_REQUEST_LIMIT - DAILY_RESERVE;
+const DAILY_USABLE_LIMIT =
+  DAILY_REQUEST_LIMIT - DAILY_RESERVE;
+
 const REQUESTS_PER_MINUTE = 6;
 const REQUEST_SPACING_MS = 10000;
 const PROVIDER_TIMEOUT_MS = 12000;
 const PAIR_CACHE_MS = 90000;
+
 const FRESHNESS_SECONDS = 150;
 const HARD_STALE_SECONDS = 300;
 const SCAN_COOLDOWN_MS = 60000;
+
 const MIN_CANDLES = 60;
 const MIN_5M_CANDLES = 30;
+
 const MIN_SIGNAL_SCORE = 55;
 const MIN_SCORE_GAP = 12;
 const MIN_OPPOSING_SCORE = 25;
+
+const BROKER_PRICE_MAX_AGE_MS = 30000;
+const DEFAULT_MAX_PRICE_GAP_PIPS = 3;
+
 const BACKTEST_MIN_SIGNALS = 30;
 const HISTORY_LIMIT = 5000;
 
 const pairCache = new Map();
 const inFlight = new Map();
 const latestMarkets = new Map();
+
 const signalHistory = [];
 const signalKeys = new Set();
+
 let pgPool = null;
 let databaseReady = false;
 let databaseError = null;
+
 let providerRequests = 0;
 let dailyCreditsUsed = 0;
 let dailyDate = new Date().toISOString().slice(0, 10);
+
 let requestTimes = [];
 let lastProviderRequestAt = 0;
 let requestQueue = Promise.resolve();
+
 let scannerRunning = false;
 let scannerStartedAt = null;
 let lastScanAt = null;
 let lastScanStartedAtMs = 0;
 let totalScanned = 0;
 let lastScanError = null;
-let cachedResult = null;
-let scanProgress = { phase:'IDLE', completed:0, total:6, priorityCompleted:0, priorityTotal:6, backgroundCompleted:0, backgroundTotal:18, pair:null };
 
-const finite = v => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
-const avg = a => a.length ? a.reduce((s,v)=>s+v,0)/a.length : null;
-const round = (v,d=6) => finite(v) ? Number(Number(v).toFixed(d)) : null;
-const iso = v => Number.isFinite(v) ? new Date(v).toISOString() : null;
-const sleep = ms => new Promise(r=>setTimeout(r,ms));
-const clamp = (v,min,max) => Math.max(min,Math.min(max,v));
+let scanProgress = {
+  phase: 'IDLE',
+  completed: 0,
+  total: 6,
+  priorityCompleted: 0,
+  priorityTotal: 6,
+  backgroundCompleted: 0,
+  backgroundTotal: 18,
+  pair: null
+};
 
-function normalizePair(value){
-  const p=String(value||'').trim().toUpperCase().replace(/\s/g,'');
-  return PAIRS.includes(p)?p:null;
+const finite = value =>
+  value !== null &&
+  value !== undefined &&
+  value !== '' &&
+  Number.isFinite(Number(value));
+
+const avg = values =>
+  values.length
+    ? values.reduce((sum, value) => sum + value, 0) /
+      values.length
+    : null;
+
+const round = (value, digits = 6) =>
+  finite(value)
+    ? Number(Number(value).toFixed(digits))
+    : null;
+
+const iso = value =>
+  Number.isFinite(value)
+    ? new Date(value).toISOString()
+    : null;
+
+const sleep = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
+
+const clamp = (value, min, max) =>
+  Math.max(min, Math.min(max, value));
+
+function normalizePair(value) {
+  const pair = String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s/g, '');
+
+  return PAIRS.includes(pair) ? pair : null;
 }
 
-function resetDailyCounter(){
-  const today=new Date().toISOString().slice(0,10);
-  if(today!==dailyDate){
-    dailyDate=today;
-    dailyCreditsUsed=0;
-    requestTimes=[];
+function pipSize(pair) {
+  return pair.endsWith('/JPY') ? 0.01 : 0.0001;
+}
+
+function priceDifferencePips(pair, brokerPrice, referencePrice) {
+  return Math.abs(brokerPrice - referencePrice) /
+    pipSize(pair);
+}
+
+function resetDailyCounter() {
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (today !== dailyDate) {
+    dailyDate = today;
+    dailyCreditsUsed = 0;
+    requestTimes = [];
   }
 }
 
-function metadata(){
+function metadata() {
   resetDailyCounter();
+
   return {
-    provider:'Twelve Data LIVE',
+    provider: 'Twelve Data LIVE',
     providerRequests,
     dailyCreditsUsed,
-    dailyCreditsRemaining:Math.max(0,DAILY_USABLE_LIMIT-dailyCreditsUsed),
-    dailyRequestLimit:DAILY_REQUEST_LIMIT,
-    dailyUsableLimit:DAILY_USABLE_LIMIT,
-    requestsPerMinuteLimit:REQUESTS_PER_MINUTE,
-    cachedPairs:pairCache.size,
-    priorityPairs:6,
-    backgroundPairs:18,
-    version:VERSION,
-    storage:databaseReady?'POSTGRESQL':'MEMORY_ONLY',
-    databaseConfigured:Boolean(DATABASE_URL),
+    dailyCreditsRemaining: Math.max(
+      0,
+      DAILY_USABLE_LIMIT - dailyCreditsUsed
+    ),
+    dailyRequestLimit: DAILY_REQUEST_LIMIT,
+    dailyUsableLimit: DAILY_USABLE_LIMIT,
+    requestsPerMinuteLimit: REQUESTS_PER_MINUTE,
+    cachedPairs: pairCache.size,
+    priorityPairs: PRIORITY_PAIRS.length,
+    backgroundPairs: BACKGROUND_PAIRS.length,
+    version: VERSION,
+    storage: databaseReady
+      ? 'POSTGRESQL'
+      : 'MEMORY_ONLY',
+    databaseConfigured: Boolean(DATABASE_URL),
     databaseReady,
     databaseError
   };
 }
 
-/* Optional PostgreSQL history. */
-async function initializeDatabase(){
-  if(!DATABASE_URL)return;
+/* -------------------------------------------------------
+   POSTGRESQL AND SIGNAL HISTORY
+------------------------------------------------------- */
 
-  try{
-    const {Pool}=require('pg');
+async function initializeDatabase() {
+  if (!DATABASE_URL) return;
 
-    pgPool=new Pool({
-      connectionString:DATABASE_URL,
-      ssl:process.env.PGSSL==='disable'?false:{rejectUnauthorized:false},
-      max:3,
-      idleTimeoutMillis:30000,
-      connectionTimeoutMillis:10000
+  try {
+    const { Pool } = require('pg');
+
+    pgPool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSL === 'disable'
+        ? false
+        : { rejectUnauthorized: false },
+      max: 3,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
     });
 
     await pgPool.query(`
@@ -125,6 +225,7 @@ async function initializeDatabase(){
         entry_time TIMESTAMPTZ,
         expiry_time TIMESTAMPTZ,
         reference_price DOUBLE PRECISION,
+        broker_price DOUBLE PRECISION,
         outcome TEXT DEFAULT 'PENDING',
         outcome_price DOUBLE PRECISION,
         created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -132,36 +233,59 @@ async function initializeDatabase(){
       )
     `);
 
-    await pgPool.query(
-      'CREATE INDEX IF NOT EXISTS po_signal_history_created_idx ON po_signal_history(created_at DESC)'
-    );
+    await pgPool.query(`
+      ALTER TABLE po_signal_history
+      ADD COLUMN IF NOT EXISTS broker_price DOUBLE PRECISION
+    `);
 
-    databaseReady=true;
-    databaseError=null;
-  }catch(e){
-    databaseReady=false;
-    databaseError=String(e.message||e);
-    console.error('PostgreSQL initialization failed:',databaseError);
+    await pgPool.query(`
+      CREATE INDEX IF NOT EXISTS
+      po_signal_history_created_idx
+      ON po_signal_history(created_at DESC)
+    `);
+
+    databaseReady = true;
+    databaseError = null;
+  } catch (error) {
+    databaseReady = false;
+    databaseError = String(error.message || error);
+    console.error(
+      'PostgreSQL initialization failed:',
+      databaseError
+    );
   }
 }
 
-async function saveSignal(record){
-  if(signalKeys.has(record.id))return;
+async function saveSignal(record) {
+  if (!record || !record.id || signalKeys.has(record.id)) {
+    return;
+  }
 
   signalKeys.add(record.id);
   signalHistory.unshift(record);
 
-  if(signalHistory.length>HISTORY_LIMIT){
-    signalHistory.length=HISTORY_LIMIT;
+  if (signalHistory.length > HISTORY_LIMIT) {
+    signalHistory.length = HISTORY_LIMIT;
   }
 
-  if(!databaseReady||!pgPool)return;
+  if (!databaseReady || !pgPool) return;
 
-  try{
+  try {
     await pgPool.query(
       `INSERT INTO po_signal_history
-      (signal_key,pair,direction,evidence_score,entry_time,expiry_time,reference_price,outcome,details)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+      (
+        signal_key,
+        pair,
+        direction,
+        evidence_score,
+        entry_time,
+        expiry_time,
+        reference_price,
+        broker_price,
+        outcome,
+        details
+      )
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
       ON CONFLICT(signal_key) DO NOTHING`,
       [
         record.id,
@@ -171,80 +295,147 @@ async function saveSignal(record){
         record.entryTime,
         record.expiryTime,
         record.referencePrice,
-        record.outcome,
+        record.brokerPrice,
+        record.outcome || 'PENDING',
         JSON.stringify(record)
       ]
     );
-  }catch(e){
-    databaseError=String(e.message||e);
+  } catch (error) {
+    databaseError = String(error.message || error);
   }
 }
 
-async function getHistory(limit=100){
-  const n=clamp(Number(limit)||100,1,500);
+async function updateSignalOutcome(id, outcome, outcomePrice) {
+  const record = signalHistory.find(item => item.id === id);
 
-  if(databaseReady&&pgPool){
-    try{
-      const q=await pgPool.query(
-        `SELECT signal_key,pair,direction,evidence_score,entry_time,expiry_time,
-        reference_price,outcome,outcome_price,created_at,details
+  if (record) {
+    record.outcome = outcome;
+    record.outcomePrice = outcomePrice;
+    record.evaluatedAt = iso(Date.now());
+  }
+
+  if (!databaseReady || !pgPool) return;
+
+  try {
+    await pgPool.query(
+      `UPDATE po_signal_history
+       SET outcome=$2,
+           outcome_price=$3,
+           details=details || $4::jsonb
+       WHERE signal_key=$1`,
+      [
+        id,
+        outcome,
+        outcomePrice,
+        JSON.stringify({
+          outcome,
+          outcomePrice,
+          evaluatedAt: iso(Date.now())
+        })
+      ]
+    );
+  } catch (error) {
+    databaseError = String(error.message || error);
+  }
+}
+
+async function getHistory(limit = 100) {
+  const count = clamp(Number(limit) || 100, 1, 500);
+
+  if (databaseReady && pgPool) {
+    try {
+      const result = await pgPool.query(
+        `SELECT
+          signal_key,
+          pair,
+          direction,
+          evidence_score,
+          entry_time,
+          expiry_time,
+          reference_price,
+          broker_price,
+          outcome,
+          outcome_price,
+          created_at,
+          details
         FROM po_signal_history
-        ORDER BY created_at DESC LIMIT $1`,
-        [n]
+        ORDER BY created_at DESC
+        LIMIT $1`,
+        [count]
       );
 
-      return q.rows.map(r=>({
-        ...r.details,
-        id:r.signal_key,
-        pair:r.pair,
-        signal:r.direction,
-        evidenceScore:r.evidence_score,
-        entryTime:r.entry_time,
-        expiryTime:r.expiry_time,
-        referencePrice:r.reference_price,
-        outcome:r.outcome,
-        outcomePrice:r.outcome_price,
-        createdAt:r.created_at
+      return result.rows.map(row => ({
+        ...row.details,
+        id: row.signal_key,
+        pair: row.pair,
+        signal: row.direction,
+        evidenceScore: row.evidence_score,
+        entryTime: row.entry_time,
+        expiryTime: row.expiry_time,
+        referencePrice: row.reference_price,
+        brokerPrice: row.broker_price,
+        outcome: row.outcome,
+        outcomePrice: row.outcome_price,
+        createdAt: row.created_at
       }));
-    }catch(e){
-      databaseError=String(e.message||e);
+    } catch (error) {
+      databaseError = String(error.message || error);
     }
   }
 
-  return signalHistory.slice(0,n);
+  return signalHistory.slice(0, count);
 }
 
-/* Twelve Data: serialized requests and conservative account limits. */
-function enqueueProviderRequest(task){
-  const p=requestQueue.then(task,task);
-  requestQueue=p.catch(()=>{});
-  return p;
+/* -------------------------------------------------------
+   TWELVE DATA PROVIDER
+------------------------------------------------------- */
+
+function enqueueProviderRequest(task) {
+  const promise = requestQueue.then(task, task);
+  requestQueue = promise.catch(() => {});
+  return promise;
 }
 
-async function providerFetch(pair){
-  return enqueueProviderRequest(async()=>{
-    if(!API_KEY){
-      throw new Error('Twelve Data API key is not configured.');
+async function providerFetch(pair) {
+  return enqueueProviderRequest(async () => {
+    if (!API_KEY) {
+      throw new Error(
+        'Twelve Data API key is not configured.'
+      );
     }
 
-    while(true){
+    while (true) {
       resetDailyCounter();
 
-      const now=Date.now();
-      requestTimes=requestTimes.filter(t=>now-t<60000);
+      const now = Date.now();
 
-      if(dailyCreditsUsed>=DAILY_USABLE_LIMIT){
-        throw new Error('Daily Twelve Data safety limit reached.');
+      requestTimes = requestTimes.filter(
+        time => now - time < 60000
+      );
+
+      if (dailyCreditsUsed >= DAILY_USABLE_LIMIT) {
+        throw new Error(
+          'Daily Twelve Data safety limit reached.'
+        );
       }
 
-      const minuteWait=requestTimes.length>=REQUESTS_PER_MINUTE
-        ?Math.max(250,60000-(now-requestTimes[0])+100)
-        :0;
+      const minuteWait =
+        requestTimes.length >= REQUESTS_PER_MINUTE
+          ? Math.max(
+              250,
+              60000 - (now - requestTimes[0]) + 100
+            )
+          : 0;
 
-      const spacingWait=Math.max(0,REQUEST_SPACING_MS-(now-lastProviderRequestAt));
-      const wait=Math.max(minuteWait,spacingWait);
+      const spacingWait = Math.max(
+        0,
+        REQUEST_SPACING_MS -
+          (now - lastProviderRequestAt)
+      );
 
-      if(wait>0){
+      const wait = Math.max(minuteWait, spacingWait);
+
+      if (wait > 0) {
         await sleep(wait);
         continue;
       }
@@ -252,119 +443,170 @@ async function providerFetch(pair){
       break;
     }
 
-    const url=new URL(PROVIDER_URL);
-    url.searchParams.set('symbol',pair);
-    url.searchParams.set('interval','1min');
-    url.searchParams.set('outputsize','500');
-    url.searchParams.set('timezone','UTC');
-    url.searchParams.set('apikey',API_KEY);
+    const url = new URL(PROVIDER_URL);
 
-    const sent=Date.now();
-    lastProviderRequestAt=sent;
-    requestTimes.push(sent);
+    url.searchParams.set('symbol', pair);
+    url.searchParams.set('interval', '1min');
+    url.searchParams.set('outputsize', '500');
+    url.searchParams.set('timezone', 'UTC');
+    url.searchParams.set('apikey', API_KEY);
+
+    const sentAt = Date.now();
+
+    lastProviderRequestAt = sentAt;
+    requestTimes.push(sentAt);
     providerRequests++;
     dailyCreditsUsed++;
 
-    const controller=new AbortController();
-    const timer=setTimeout(()=>controller.abort(),PROVIDER_TIMEOUT_MS);
+    const controller = new AbortController();
 
-    try{
-      const response=await fetch(url,{
-        signal:controller.signal,
-        headers:{Accept:'application/json'}
+    const timer = setTimeout(
+      () => controller.abort(),
+      PROVIDER_TIMEOUT_MS
+    );
+
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: { Accept: 'application/json' }
       });
 
-      if(!response.ok){
-        throw new Error(`Twelve Data HTTP ${response.status}.`);
+      if (!response.ok) {
+        throw new Error(
+          `Twelve Data HTTP ${response.status}.`
+        );
       }
 
-      const json=await response.json();
+      const json = await response.json();
 
-      if(json.status==='error'||json.code||!Array.isArray(json.values)){
-        throw new Error(json.message||'Provider returned no candle values.');
+      if (
+        json.status === 'error' ||
+        json.code ||
+        !Array.isArray(json.values)
+      ) {
+        throw new Error(
+          json.message ||
+          'Provider returned no candle values.'
+        );
       }
 
-      const candles=normalizeCandles(json.values);
+      const candles = normalizeCandles(json.values);
 
-      if(!candles.length){
-        throw new Error('No valid candles returned by Twelve Data.');
+      if (!candles.length) {
+        throw new Error(
+          'No valid candles returned by Twelve Data.'
+        );
       }
 
       return {
         candles,
-        fetchedAt:Date.now(),
-        source:'Twelve Data LIVE'
+        fetchedAt: Date.now(),
+        source: 'Twelve Data LIVE'
       };
-    }catch(e){
-      if(e.name==='AbortError'){
-        throw new Error('Twelve Data request timed out.');
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw new Error(
+          'Twelve Data request timed out.'
+        );
       }
 
-      throw new Error(e.message||'Twelve Data request failed.');
-    }finally{
+      throw new Error(
+        error.message || 'Twelve Data request failed.'
+      );
+    } finally {
       clearTimeout(timer);
     }
   });
 }
 
-function normalizeCandles(rows){
-  const byTime=new Map();
+function normalizeCandles(rows) {
+  const byTime = new Map();
 
-  for(const row of rows){
-    const raw=String(row.datetime||row.time||'').trim();
-    const zoned=/(Z|[+-]\d{2}:?\d{2})$/i.test(raw);
-    const time=Date.parse(raw&&!zoned?`${raw.replace(' ','T')}Z`:raw);
+  for (const row of rows) {
+    const raw = String(
+      row.datetime || row.time || ''
+    ).trim();
 
-    const open=Number(row.open);
-    const high=Number(row.high);
-    const low=Number(row.low);
-    const close=Number(row.close);
+    const zoned = /(Z|[+-]\d{2}:?\d{2})$/i.test(raw);
 
-    if(!Number.isFinite(time)||![open,high,low,close].every(Number.isFinite)){
+    const time = Date.parse(
+      raw && !zoned
+        ? `${raw.replace(' ', 'T')}Z`
+        : raw
+    );
+
+    const open = Number(row.open);
+    const high = Number(row.high);
+    const low = Number(row.low);
+    const close = Number(row.close);
+
+    if (
+      !Number.isFinite(time) ||
+      ![open, high, low, close].every(Number.isFinite)
+    ) {
       continue;
     }
 
-    if(high<Math.max(open,close,low)||low>Math.min(open,close,high)){
+    if (
+      high < Math.max(open, close, low) ||
+      low > Math.min(open, close, high)
+    ) {
       continue;
     }
 
-    byTime.set(time,{time,open,high,low,close});
+    byTime.set(time, {
+      time,
+      open,
+      high,
+      low,
+      close
+    });
   }
 
-  return [...byTime.values()].sort((a,b)=>a.time-b.time);
+  return [...byTime.values()]
+    .sort((a, b) => a.time - b.time);
 }
 
-async function getPairData(pair,force=false){
-  const cached=pairCache.get(pair);
+async function getPairData(pair, force = false) {
+  const cached = pairCache.get(pair);
 
-  if(!force&&cached&&Date.now()-cached.fetchedAt<PAIR_CACHE_MS){
+  if (
+    !force &&
+    cached &&
+    Date.now() - cached.fetchedAt < PAIR_CACHE_MS
+  ) {
     return cached;
   }
 
-  if(inFlight.has(pair)){
+  if (inFlight.has(pair)) {
     return inFlight.get(pair);
   }
 
-  const p=providerFetch(pair)
-    .then(d=>{
-      pairCache.set(pair,d);
-      return d;
+  const promise = providerFetch(pair)
+    .then(data => {
+      pairCache.set(pair, data);
+      return data;
     })
-    .finally(()=>inFlight.delete(pair));
+    .finally(() => inFlight.delete(pair));
 
-  inFlight.set(pair,p);
-  return p;
+  inFlight.set(pair, promise);
+
+  return promise;
 }
 
-function closedCandles(candles,now=Date.now()){
-  return candles.filter(c=>c.time+60000<=now);
+function closedCandles(candles, now = Date.now()) {
+  return candles.filter(
+    candle => candle.time + 60000 <= now
+  );
 }
 
-function hasContinuousMinutes(candles){
-  if(candles.length<2)return true;
+function hasContinuousMinutes(candles) {
+  if (candles.length < 2) return true;
 
-  for(let i=1;i<candles.length;i++){
-    if(candles[i].time-candles[i-1].time!==60000){
+  for (let i = 1; i < candles.length; i++) {
+    if (
+      candles[i].time - candles[i - 1].time !== 60000
+    ) {
       return false;
     }
   }
@@ -372,1001 +614,1517 @@ function hasContinuousMinutes(candles){
   return true;
 }
 
-/* Technical indicators: EMA9/21, RSI14, MACD, ATR14, Bollinger Bands (20,2). */
-function ema(values,period){
-  const out=Array(values.length).fill(null);
+/* -------------------------------------------------------
+   TECHNICAL INDICATORS
+------------------------------------------------------- */
 
-  if(values.length<period)return out;
+function ema(values, period) {
+  const output = Array(values.length).fill(null);
 
-  let v=avg(values.slice(0,period));
-  out[period-1]=v;
+  if (values.length < period) return output;
 
-  const a=2/(period+1);
+  let value = avg(values.slice(0, period));
 
-  for(let i=period;i<values.length;i++){
-    v=values[i]*a+v*(1-a);
-    out[i]=v;
+  output[period - 1] = value;
+
+  const alpha = 2 / (period + 1);
+
+  for (let i = period; i < values.length; i++) {
+    value =
+      values[i] * alpha +
+      value * (1 - alpha);
+
+    output[i] = value;
   }
 
-  return out;
+  return output;
 }
 
-function rsi(values,period=14){
-  const out=Array(values.length).fill(null);
+function rsi(values, period = 14) {
+  const output = Array(values.length).fill(null);
 
-  if(values.length<=period)return out;
+  if (values.length <= period) return output;
 
-  let g=0,l=0;
+  let gains = 0;
+  let losses = 0;
 
-  for(let i=1;i<=period;i++){
-    const d=values[i]-values[i-1];
-    g+=Math.max(d,0);
-    l+=Math.max(-d,0);
+  for (let i = 1; i <= period; i++) {
+    const difference = values[i] - values[i - 1];
+
+    gains += Math.max(difference, 0);
+    losses += Math.max(-difference, 0);
   }
 
-  let ag=g/period,al=l/period;
+  let averageGain = gains / period;
+  let averageLoss = losses / period;
 
-  const calc=()=>al===0?(ag===0?50:100):100-100/(1+ag/al);
+  const calculate = () =>
+    averageLoss === 0
+      ? averageGain === 0
+        ? 50
+        : 100
+      : 100 - 100 / (1 + averageGain / averageLoss);
 
-  out[period]=calc();
+  output[period] = calculate();
 
-  for(let i=period+1;i<values.length;i++){
-    const d=values[i]-values[i-1];
-    ag=(ag*(period-1)+Math.max(d,0))/period;
-    al=(al*(period-1)+Math.max(-d,0))/period;
-    out[i]=calc();
+  for (let i = period + 1; i < values.length; i++) {
+    const difference = values[i] - values[i - 1];
+
+    averageGain =
+      (averageGain * (period - 1) +
+        Math.max(difference, 0)) / period;
+
+    averageLoss =
+      (averageLoss * (period - 1) +
+        Math.max(-difference, 0)) / period;
+
+    output[i] = calculate();
   }
 
-  return out;
+  return output;
 }
 
-function macd(values){
-  const f=ema(values,12);
-  const s=ema(values,26);
+function macd(values) {
+  const fast = ema(values, 12);
+  const slow = ema(values, 26);
 
-  const line=values.map((_,i)=>
-    finite(f[i])&&finite(s[i])?f[i]-s[i]:null
+  const line = values.map((_, index) =>
+    finite(fast[index]) && finite(slow[index])
+      ? fast[index] - slow[index]
+      : null
   );
 
-  const compact=ema(line.filter(finite),9);
-  const sig=Array(values.length).fill(null);
+  const compact = ema(line.filter(finite), 9);
+  const signal = Array(values.length).fill(null);
 
-  let j=0;
+  let cursor = 0;
 
-  for(let i=0;i<line.length;i++){
-    if(finite(line[i]))sig[i]=compact[j++];
+  for (let i = 0; i < line.length; i++) {
+    if (finite(line[i])) {
+      signal[i] = compact[cursor++];
+    }
   }
 
   return {
     line,
-    signal:sig,
-    histogram:line.map((v,i)=>
-      finite(v)&&finite(sig[i])?v-sig[i]:null
+    signal,
+    histogram: line.map((value, index) =>
+      finite(value) && finite(signal[index])
+        ? value - signal[index]
+        : null
     )
   };
 }
 
-function atr(candles,period=14){
-  const tr=Array(candles.length).fill(null);
+function atr(candles, period = 14) {
+  const trueRanges = Array(candles.length).fill(null);
 
-  for(let i=1;i<candles.length;i++){
-    const c=candles[i],pc=candles[i-1].close;
+  for (let i = 1; i < candles.length; i++) {
+    const candle = candles[i];
+    const previousClose = candles[i - 1].close;
 
-    tr[i]=Math.max(
-      c.high-c.low,
-      Math.abs(c.high-pc),
-      Math.abs(c.low-pc)
+    trueRanges[i] = Math.max(
+      candle.high - candle.low,
+      Math.abs(candle.high - previousClose),
+      Math.abs(candle.low - previousClose)
     );
   }
 
-  const out=Array(candles.length).fill(null);
+  const output = Array(candles.length).fill(null);
 
-  if(candles.length<=period)return out;
+  if (candles.length <= period) return output;
 
-  let v=avg(tr.slice(1,period+1));
-  out[period]=v;
+  let value = avg(trueRanges.slice(1, period + 1));
 
-  for(let i=period+1;i<candles.length;i++){
-    v=(v*(period-1)+tr[i])/period;
-    out[i]=v;
+  output[period] = value;
+
+  for (let i = period + 1; i < candles.length; i++) {
+    value =
+      (value * (period - 1) + trueRanges[i]) / period;
+
+    output[i] = value;
   }
 
-  return out;
+  return output;
 }
 
-function bollinger(values,period=20,mult=2){
-  const upper=Array(values.length).fill(null);
-  const middle=Array(values.length).fill(null);
-  const lower=Array(values.length).fill(null);
-  const width=Array(values.length).fill(null);
+function bollinger(values, period = 20, multiplier = 2) {
+  const upper = Array(values.length).fill(null);
+  const middle = Array(values.length).fill(null);
+  const lower = Array(values.length).fill(null);
+  const width = Array(values.length).fill(null);
 
-  for(let i=period-1;i<values.length;i++){
-    const sample=values.slice(i-period+1,i+1);
-    const m=avg(sample);
-    const sd=Math.sqrt(avg(sample.map(v=>(v-m)**2)));
+  for (let i = period - 1; i < values.length; i++) {
+    const sample = values.slice(i - period + 1, i + 1);
+    const mean = avg(sample);
 
-    middle[i]=m;
-    upper[i]=m+mult*sd;
-    lower[i]=m-mult*sd;
-    width[i]=m?((upper[i]-lower[i])/m)*100:null;
+    const deviation = Math.sqrt(
+      avg(sample.map(value => (value - mean) ** 2))
+    );
+
+    middle[i] = mean;
+    upper[i] = mean + multiplier * deviation;
+    lower[i] = mean - multiplier * deviation;
+
+    width[i] = mean
+      ? ((upper[i] - lower[i]) / mean) * 100
+      : null;
   }
 
-  return {upper,middle,lower,width};
+  return { upper, middle, lower, width };
 }
 
-function cross(a0,b0,a1,b1){
-  if(![a0,b0,a1,b1].every(finite))return 'UNAVAILABLE';
-  if(a0<=b0&&a1>b1)return 'BULLISH_CROSSOVER';
-  if(a0>=b0&&a1<b1)return 'BEARISH_CROSSOVER';
+function cross(a0, b0, a1, b1) {
+  if (![a0, b0, a1, b1].every(finite)) {
+    return 'UNAVAILABLE';
+  }
+
+  if (a0 <= b0 && a1 > b1) {
+    return 'BULLISH_CROSSOVER';
+  }
+
+  if (a0 >= b0 && a1 < b1) {
+    return 'BEARISH_CROSSOVER';
+  }
+
   return 'NO_CROSSOVER';
 }
 
-function rsiDivergence(candles,rv){
-  const pts=[];
+function aggregate5m(candles, now = Date.now()) {
+  const groups = new Map();
 
-  for(let i=Math.max(2,candles.length-42);i<candles.length-2;i++){
-    const lo=candles[i].low<=candles[i-1].low&&candles[i].low<=candles[i+1].low;
-    const hi=candles[i].high>=candles[i-1].high&&candles[i].high>=candles[i+1].high;
+  for (const candle of candles) {
+    const start =
+      Math.floor(candle.time / 300000) * 300000;
 
-    if(finite(rv[i])&&(lo||hi)){
-      pts.push({
-        i,
-        lo:candles[i].low,
-        hi:candles[i].high,
-        r:rv[i],
-        type:lo?'L':'H'
-      });
+    let group = groups.get(start);
+
+    if (!group) {
+      group = {
+        time: start,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        count: 1,
+        lastTime: candle.time
+      };
+
+      groups.set(start, group);
+    } else {
+      group.high = Math.max(group.high, candle.high);
+      group.low = Math.min(group.low, candle.low);
+      group.close = candle.close;
+      group.count++;
+      group.lastTime = candle.time;
     }
   }
 
-  const lows=pts.filter(p=>p.type==='L').slice(-2);
-  const highs=pts.filter(p=>p.type==='H').slice(-2);
+  return [...groups.values()]
+    .filter(group =>
+      group.count === 5 &&
+      group.lastTime === group.time + 240000 &&
+      group.time + 300000 <= now
+    )
+    .map(({ count, lastTime, ...group }) => group)
+    .sort((a, b) => a.time - b.time);
+}
 
-  if(lows.length===2&&lows[1].lo<lows[0].lo&&lows[1].r>lows[0].r){
+function confirm5m(candles) {
+  const five = aggregate5m(candles);
+
+  if (five.length < MIN_5M_CANDLES) {
     return {
-      type:'BULLISH_DIVERGENCE',
-      direction:'BULLISH',
-      description:'Price lower low; RSI higher low.'
+      status: 'UNAVAILABLE',
+      direction: 'NEUTRAL',
+      candles: five.length,
+      required: MIN_5M_CANDLES,
+      reason:
+        'Not enough complete 5-minute candles.'
     };
   }
 
-  if(highs.length===2&&highs[1].hi>highs[0].hi&&highs[1].r<highs[0].r){
-    return {
-      type:'BEARISH_DIVERGENCE',
-      direction:'BEARISH',
-      description:'Price higher high; RSI lower high.'
-    };
-  }
+  const closes = five.map(candle => candle.close);
+  const fast = ema(closes, 9);
+  const slow = ema(closes, 21);
+  const index = closes.length - 1;
+
+  const direction =
+    fast[index] > slow[index]
+      ? 'BULLISH'
+      : fast[index] < slow[index]
+        ? 'BEARISH'
+        : 'NEUTRAL';
 
   return {
-    type:'NO_CONFIRMED_DIVERGENCE',
-    direction:'NEUTRAL',
-    description:'No confirmed RSI divergence.'
+    status: direction === 'NEUTRAL'
+      ? 'MIXED'
+      : 'CONFIRMED',
+    direction,
+    ema9: round(fast[index]),
+    ema21: round(slow[index]),
+    candles: five.length,
+    lastCandle: iso(five[index].time),
+    reason: `5-minute EMA9/EMA21 trend is ${direction}.`
   };
 }
 
-/* Common candlestick patterns. */
-function candlePattern(cs){
-  if(cs.length<3){
-    return {name:'INSUFFICIENT CANDLES',direction:'NEUTRAL'};
+function candlePattern(candles) {
+  if (candles.length < 3) {
+    return {
+      name: 'INSUFFICIENT CANDLES',
+      direction: 'NEUTRAL'
+    };
   }
 
-  const c=cs.at(-1),p=cs.at(-2),p2=cs.at(-3);
-  const body=Math.abs(c.close-c.open);
-  const range=Math.max(c.high-c.low,Number.EPSILON);
-  const up=c.high-Math.max(c.open,c.close);
-  const dn=Math.min(c.open,c.close)-c.low;
-  const ratio=body/range;
+  const current = candles.at(-1);
+  const previous = candles.at(-2);
+  const previous2 = candles.at(-3);
 
-  const bull=c.close>c.open;
-  const bear=c.close<c.open;
-  const pb=p.close<p.open;
-  const pu=p.close>p.open;
-
-  const result=(name,direction)=>({name,direction});
-
-  if(ratio<=.08&&dn<range*.15&&up<range*.15)
-    return result('DOJI','NEUTRAL');
-
-  if(ratio<=.12&&dn>range*.6&&up<range*.12)
-    return result('DRAGONFLY DOJI','POTENTIAL BULLISH');
-
-  if(ratio<=.12&&up>range*.6&&dn<range*.12)
-    return result('GRAVESTONE DOJI','POTENTIAL BEARISH');
-
-  if(ratio<=.12&&up>range*.3&&dn>range*.3)
-    return result('LONG-LEGGED DOJI','NEUTRAL');
-
-  if(pb&&bull&&c.open<=p.close&&c.close>=p.open)
-    return result('BULLISH ENGULFING','BULLISH');
-
-  if(pu&&bear&&c.open>=p.close&&c.close<=p.open)
-    return result('BEARISH ENGULFING','BEARISH');
-
-  if(ratio<=.35&&dn>=body*2&&up<=Math.max(body*.7,range*.05))
-    return result('HAMMER','POTENTIAL BULLISH');
-
-  if(ratio<=.35&&up>=body*2&&dn<=Math.max(body*.7,range*.05))
-    return result('SHOOTING STAR','POTENTIAL BEARISH');
-
-  if(ratio<=.35&&up>=body*2&&dn<=body*.7)
-    return result('INVERTED HAMMER','POTENTIAL BULLISH');
-
-  if(ratio<=.35&&dn>=body*2&&up<=body*.7)
-    return result('HANGING MAN','POTENTIAL BEARISH');
-
-  if(pb&&bull&&c.open>p.close&&c.close>(p.open+p.close)/2&&c.close<p.open)
-    return result('PIERCING LINE','BULLISH');
-
-  if(pu&&bear&&c.open<p.close&&c.close<(p.open+p.close)/2&&c.close>p.open)
-    return result('DARK CLOUD COVER','BEARISH');
-
-  if(pb&&bull&&c.open>p.close&&c.close<p.open)
-    return result('BULLISH HARAMI','BULLISH');
-
-  if(pu&&bear&&c.open<p.close&&c.close>p.open)
-    return result('BEARISH HARAMI','BEARISH');
-
-  if(p2.close<p2.open&&Math.abs(p.close-p.open)<Math.abs(p2.close-p2.open)*.4&&bull&&c.close>(p2.open+p2.close)/2)
-    return result('MORNING STAR','BULLISH');
-
-  if(p2.close>p2.open&&Math.abs(p.close-p.open)<Math.abs(p2.close-p2.open)*.4&&bear&&c.close<(p2.open+p2.close)/2)
-    return result('EVENING STAR','BEARISH');
-
-  if(Math.abs(c.high-p.high)<=range*.08&&bear&&pu)
-    return result('TWEEZER TOP','POTENTIAL BEARISH');
-
-  if(Math.abs(c.low-p.low)<=range*.08&&bull&&pb)
-    return result('TWEEZER BOTTOM','POTENTIAL BULLISH');
-
-  if(cs.length>=4){
-    const a=cs.at(-3),b=cs.at(-2);
-
-    if(a.close>a.open&&b.close>b.open&&bull&&c.close>b.close&&b.close>a.close&&c.close>b.close)
-      return result('THREE WHITE SOLDIERS','BULLISH');
-
-    if(a.close<a.open&&b.close<b.open&&bear&&c.close<b.close&&b.close<a.close&&c.close<b.close)
-      return result('THREE BLACK CROWS','BEARISH');
-  }
-
-  if(ratio<.25)return result('SPINNING TOP','NEUTRAL');
-
-  if(ratio>.9&&up<range*.05&&dn<range*.05)
-    return result(
-      bull?'BULLISH MARUBOZU':'BEARISH MARUBOZU',
-      bull?'BULLISH':'BEARISH'
-    );
-
-  if(c.high<=p.high&&c.low>=p.low)
-    return result('INSIDE BAR','NEUTRAL');
-
-  if(c.high>p.high&&c.low<p.low)
-    return result('OUTSIDE BAR',bull?'BULLISH':bear?'BEARISH':'NEUTRAL');
-
-  return result(
-    bull?'BULLISH CANDLE':bear?'BEARISH CANDLE':'NO CLEAR PATTERN',
-    bull?'BULLISH':bear?'BEARISH':'NEUTRAL'
+  const body = Math.abs(current.close - current.open);
+  const range = Math.max(
+    current.high - current.low,
+    Number.EPSILON
   );
-}
 
-function psychology(cs){
-  const recent=cs.slice(-8);
+  const upperWick =
+    current.high - Math.max(current.open, current.close);
 
-  if(recent.length<7){
+  const lowerWick =
+    Math.min(current.open, current.close) - current.low;
+
+  const ratio = body / range;
+
+  const bullish = current.close > current.open;
+  const bearish = current.close < current.open;
+
+  const previousBullish =
+    previous.close > previous.open;
+
+  const previousBearish =
+    previous.close < previous.open;
+
+  if (
+    previousBearish &&
+    bullish &&
+    current.open <= previous.close &&
+    current.close >= previous.open
+  ) {
     return {
-      psychology:'INSUFFICIENT PRICE EVIDENCE',
-      direction:'NEUTRAL',
-      buyerPressure:0,
-      sellerPressure:0
+      name: 'BULLISH ENGULFING',
+      direction: 'BULLISH'
     };
   }
 
-  let up=0,down=0;
-
-  for(let i=1;i<recent.length;i++){
-    if(recent[i].close>recent[i-1].close)up++;
-    if(recent[i].close<recent[i-1].close)down++;
-  }
-
-  const c=recent.at(-1);
-  const loc=(c.close-c.low)/Math.max(c.high-c.low,1e-12);
-
-  if(up>=5&&loc>=.65){
+  if (
+    previousBullish &&
+    bearish &&
+    current.open >= previous.close &&
+    current.close <= previous.open
+  ) {
     return {
-      psychology:'BUYERS SHOWING RECENT CONTROL',
-      direction:'BULLISH',
-      buyerPressure:up,
-      sellerPressure:down
+      name: 'BEARISH ENGULFING',
+      direction: 'BEARISH'
     };
   }
 
-  if(down>=5&&loc<=.35){
+  if (
+    ratio <= 0.35 &&
+    lowerWick >= body * 2 &&
+    upperWick <= Math.max(body * 0.7, range * 0.05)
+  ) {
     return {
-      psychology:'SELLERS SHOWING RECENT CONTROL',
-      direction:'BEARISH',
-      buyerPressure:up,
-      sellerPressure:down
+      name: 'HAMMER',
+      direction: 'POTENTIAL BULLISH'
+    };
+  }
+
+  if (
+    ratio <= 0.35 &&
+    upperWick >= body * 2 &&
+    lowerWick <= Math.max(body * 0.7, range * 0.05)
+  ) {
+    return {
+      name: 'SHOOTING STAR',
+      direction: 'POTENTIAL BEARISH'
+    };
+  }
+
+  if (
+    previous2.close < previous2.open &&
+    Math.abs(previous.close - previous.open) <
+      Math.abs(previous2.close - previous2.open) * 0.4 &&
+    bullish &&
+    current.close >
+      (previous2.open + previous2.close) / 2
+  ) {
+    return {
+      name: 'MORNING STAR',
+      direction: 'BULLISH'
+    };
+  }
+
+  if (
+    previous2.close > previous2.open &&
+    Math.abs(previous.close - previous.open) <
+      Math.abs(previous2.close - previous2.open) * 0.4 &&
+    bearish &&
+    current.close <
+      (previous2.open + previous2.close) / 2
+  ) {
+    return {
+      name: 'EVENING STAR',
+      direction: 'BEARISH'
+    };
+  }
+
+  if (ratio < 0.08) {
+    return {
+      name: 'DOJI',
+      direction: 'NEUTRAL'
+    };
+  }
+
+  if (ratio > 0.9 && upperWick < range * 0.05 &&
+      lowerWick < range * 0.05) {
+    return {
+      name: bullish
+        ? 'BULLISH MARUBOZU'
+        : 'BEARISH MARUBOZU',
+      direction: bullish ? 'BULLISH' : 'BEARISH'
     };
   }
 
   return {
-    psychology:'MIXED BUYER/SELLER PRESSURE',
-    direction:'NEUTRAL',
-    buyerPressure:up,
-    sellerPressure:down
+    name: bullish
+      ? 'BULLISH CANDLE'
+      : bearish
+        ? 'BEARISH CANDLE'
+        : 'NO CLEAR PATTERN',
+    direction: bullish
+      ? 'BULLISH'
+      : bearish
+        ? 'BEARISH'
+        : 'NEUTRAL'
   };
 }
 
-function trendline(cs){
-  const s=cs.slice(-30);
+function psychology(candles) {
+  const recent = candles.slice(-8);
 
-  if(s.length<15){
+  if (recent.length < 7) {
     return {
-      direction:'UNAVAILABLE',
-      slopePercent:null,
-      description:'Not enough candles for trendline.'
+      psychology: 'INSUFFICIENT PRICE EVIDENCE',
+      direction: 'NEUTRAL',
+      buyerPressure: 0,
+      sellerPressure: 0
     };
   }
 
-  const xs=s.map((_,i)=>i);
-  const ys=s.map(c=>c.close);
-  const mx=avg(xs),my=avg(ys);
+  let up = 0;
+  let down = 0;
 
-  let num=0,den=0;
-
-  for(let i=0;i<s.length;i++){
-    num+=(xs[i]-mx)*(ys[i]-my);
-    den+=(xs[i]-mx)**2;
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i].close > recent[i - 1].close) up++;
+    if (recent[i].close < recent[i - 1].close) down++;
   }
 
-  const slope=den?num/den:0;
-  const sp=my?slope/my*100:0;
-  const dir=sp>.002?'BULLISH':sp<-.002?'BEARISH':'SIDEWAYS';
-  const proj=my-slope*mx+slope*(s.length-1);
+  const last = recent.at(-1);
+
+  const location =
+    (last.close - last.low) /
+    Math.max(last.high - last.low, 1e-12);
+
+  if (up >= 5 && location >= 0.65) {
+    return {
+      psychology: 'BUYERS SHOWING RECENT CONTROL',
+      direction: 'BULLISH',
+      buyerPressure: up,
+      sellerPressure: down
+    };
+  }
+
+  if (down >= 5 && location <= 0.35) {
+    return {
+      psychology: 'SELLERS SHOWING RECENT CONTROL',
+      direction: 'BEARISH',
+      buyerPressure: up,
+      sellerPressure: down
+    };
+  }
 
   return {
-    direction:dir,
-    slopePercent:round(sp,6),
-    projectedPrice:round(proj),
-    aboveLine:ys.at(-1)>proj,
-    belowLine:ys.at(-1)<proj,
-    description:`30-candle regression trend: ${dir}.`
+    psychology: 'MIXED BUYER/SELLER PRESSURE',
+    direction: 'NEUTRAL',
+    buyerPressure: up,
+    sellerPressure: down
   };
 }
 
-function levels(cs){
-  const prev=cs.slice(-31,-1);
+function trendline(candles) {
+  const sample = candles.slice(-30);
 
-  if(prev.length<15){
+  if (sample.length < 15) {
     return {
-      support:null,
-      resistance:null,
-      position:'UNAVAILABLE',
-      direction:'NEUTRAL'
+      direction: 'UNAVAILABLE',
+      slopePercent: null,
+      description: 'Not enough candles for trendline.'
     };
   }
 
-  const sup=Math.min(...prev.map(c=>c.low));
-  const res=Math.max(...prev.map(c=>c.high));
-  const c=cs.at(-1);
-  const range=Math.max(c.high-c.low,1e-12);
+  const xs = sample.map((_, index) => index);
+  const ys = sample.map(candle => candle.close);
 
-  let position='BETWEEN LEVELS',direction='NEUTRAL';
+  const meanX = avg(xs);
+  const meanY = avg(ys);
 
-  if(c.close>res){
-    position='CLOSED-CANDLE RESISTANCE BREAKOUT';
-    direction='BULLISH';
-  }else if(c.close<sup){
-    position='CLOSED-CANDLE SUPPORT BREAKDOWN';
-    direction='BEARISH';
-  }else if(c.low<=sup+range*.15&&c.close>c.open){
-    position='POSSIBLE SUPPORT REJECTION';
-    direction='BULLISH';
-  }else if(c.high>=res-range*.15&&c.close<c.open){
-    position='POSSIBLE RESISTANCE REJECTION';
-    direction='BEARISH';
+  let numerator = 0;
+  let denominator = 0;
+
+  for (let i = 0; i < sample.length; i++) {
+    numerator +=
+      (xs[i] - meanX) * (ys[i] - meanY);
+
+    denominator += (xs[i] - meanX) ** 2;
+  }
+
+  const slope = denominator
+    ? numerator / denominator
+    : 0;
+
+  const slopePercent =
+    meanY ? slope / meanY * 100 : 0;
+
+  const direction =
+    slopePercent > 0.002
+      ? 'BULLISH'
+      : slopePercent < -0.002
+        ? 'BEARISH'
+        : 'SIDEWAYS';
+
+  return {
+    direction,
+    slopePercent: round(slopePercent, 6),
+    description: `30-candle regression trend: ${direction}.`
+  };
+}
+
+function levels(candles) {
+  const previous = candles.slice(-31, -1);
+
+  if (previous.length < 15) {
+    return {
+      support: null,
+      resistance: null,
+      position: 'UNAVAILABLE',
+      direction: 'NEUTRAL'
+    };
+  }
+
+  const support = Math.min(
+    ...previous.map(candle => candle.low)
+  );
+
+  const resistance = Math.max(
+    ...previous.map(candle => candle.high)
+  );
+
+  const current = candles.at(-1);
+  const range = Math.max(
+    current.high - current.low,
+    1e-12
+  );
+
+  let position = 'BETWEEN LEVELS';
+  let direction = 'NEUTRAL';
+
+  if (current.close > resistance) {
+    position = 'CLOSED-CANDLE RESISTANCE BREAKOUT';
+    direction = 'BULLISH';
+  } else if (current.close < support) {
+    position = 'CLOSED-CANDLE SUPPORT BREAKDOWN';
+    direction = 'BEARISH';
+  } else if (
+    current.low <= support + range * 0.15 &&
+    current.close > current.open
+  ) {
+    position = 'POSSIBLE SUPPORT REJECTION';
+    direction = 'BULLISH';
+  } else if (
+    current.high >= resistance - range * 0.15 &&
+    current.close < current.open
+  ) {
+    position = 'POSSIBLE RESISTANCE REJECTION';
+    direction = 'BEARISH';
   }
 
   return {
-    support:round(sup),
-    resistance:round(res),
+    support: round(support),
+    resistance: round(resistance),
     position,
     direction,
-    distanceToSupportPercent:round((c.close-sup)/c.close*100,5),
-    distanceToResistancePercent:round((res-c.close)/c.close*100,5)
+    distanceToSupportPercent:
+      round((current.close - support) / current.close * 100, 5),
+    distanceToResistancePercent:
+      round((resistance - current.close) / current.close * 100, 5)
   };
 }
 
-function breakout(cs){
-  if(cs.length<8){
+function breakout(candles) {
+  if (candles.length < 8) {
     return {
-      status:'UNAVAILABLE',
-      direction:'NEUTRAL',
-      description:'Insufficient range history.'
+      status: 'UNAVAILABLE',
+      direction: 'NEUTRAL',
+      description: 'Insufficient range history.'
     };
   }
 
-  const c=cs.at(-1),p=cs.at(-2);
-  const prior=cs.slice(-7,-2);
-  const hi=Math.max(...prior.map(x=>x.high));
-  const lo=Math.min(...prior.map(x=>x.low));
+  const current = candles.at(-1);
+  const previous = candles.at(-2);
+  const prior = candles.slice(-7, -2);
 
-  if(p.close<=hi&&c.close>hi){
+  const high = Math.max(...prior.map(item => item.high));
+  const low = Math.min(...prior.map(item => item.low));
+
+  if (previous.close <= high && current.close > high) {
     return {
-      status:'BREAKOUT',
-      direction:'BULLISH',
-      level:round(hi),
-      description:'Completed candle closed above prior range.'
+      status: 'BREAKOUT',
+      direction: 'BULLISH',
+      level: round(high),
+      description: 'Completed candle closed above prior range.'
     };
   }
 
-  if(p.close>=lo&&c.close<lo){
+  if (previous.close >= low && current.close < low) {
     return {
-      status:'BREAKDOWN',
-      direction:'BEARISH',
-      level:round(lo),
-      description:'Completed candle closed below prior range.'
+      status: 'BREAKDOWN',
+      direction: 'BEARISH',
+      level: round(low),
+      description: 'Completed candle closed below prior range.'
     };
   }
 
-  if(p.close>hi&&c.low<=hi&&c.close>hi){
+  if (
+    previous.close > high &&
+    current.low <= high &&
+    current.close > high
+  ) {
     return {
-      status:'BULLISH_RETEST',
-      direction:'BULLISH',
-      level:round(hi),
-      description:'Retest held above breakout level.'
+      status: 'BULLISH_RETEST',
+      direction: 'BULLISH',
+      level: round(high),
+      description: 'Retest held above breakout level.'
     };
   }
 
-  if(p.close<lo&&c.high>=lo&&c.close<lo){
+  if (
+    previous.close < low &&
+    current.high >= low &&
+    current.close < low
+  ) {
     return {
-      status:'BEARISH_RETEST',
-      direction:'BEARISH',
-      level:round(lo),
-      description:'Retest held below breakdown level.'
+      status: 'BEARISH_RETEST',
+      direction: 'BEARISH',
+      level: round(low),
+      description: 'Retest held below breakdown level.'
     };
   }
 
-  if(p.close>hi&&c.close<hi){
+  if (previous.close > high && current.close < high) {
     return {
-      status:'FALSE_BULLISH_BREAKOUT',
-      direction:'BEARISH',
-      level:round(hi),
-      description:'Price returned inside range after upside break.'
+      status: 'FALSE_BULLISH_BREAKOUT',
+      direction: 'BEARISH',
+      level: round(high),
+      description: 'Price returned inside range after upside break.'
     };
   }
 
-  if(p.close<lo&&c.close>lo){
+  if (previous.close < low && current.close > low) {
     return {
-      status:'FALSE_BEARISH_BREAKOUT',
-      direction:'BULLISH',
-      level:round(lo),
-      description:'Price returned inside range after downside break.'
+      status: 'FALSE_BEARISH_BREAKOUT',
+      direction: 'BULLISH',
+      level: round(low),
+      description: 'Price returned inside range after downside break.'
     };
   }
 
   return {
-    status:'NO_CONFIRMED_BREAKOUT',
-    direction:'NEUTRAL',
-    description:'No confirmed breakout/retest.'
+    status: 'NO_CONFIRMED_BREAKOUT',
+    direction: 'NEUTRAL',
+    description: 'No confirmed breakout/retest.'
   };
 }
 
-function aggregate5m(cs,now=Date.now()){
-  const map=new Map();
+function volatility(atrValues, widths, candles) {
+  const index = atrValues.length - 1;
+  const atrValue = atrValues[index];
+  const close = candles[index]?.close;
 
-  for(const c of cs){
-    const t=Math.floor(c.time/300000)*300000;
-    let g=map.get(t);
+  const atrPercent =
+    finite(atrValue) && close
+      ? atrValue / close * 100
+      : null;
 
-    if(!g){
-      g={
-        time:t,
-        open:c.open,
-        high:c.high,
-        low:c.low,
-        close:c.close,
-        count:1,
-        lastTime:c.time
-      };
-      map.set(t,g);
-    }else{
-      g.high=Math.max(g.high,c.high);
-      g.low=Math.min(g.low,c.low);
-      g.close=c.close;
-      g.count++;
-      g.lastTime=c.time;
-    }
-  }
+  const width = widths[index];
+  const valid = widths.filter(finite);
 
-  return [...map.values()]
-    .filter(g=>g.count===5&&g.lastTime===g.time+240000&&g.time+300000<=now)
-    .map(({count,lastTime,...g})=>g)
-    .sort((a,b)=>a.time-b.time);
-}
-
-function confirm5m(cs){
-  const five=aggregate5m(cs);
-
-  if(five.length<MIN_5M_CANDLES){
+  if (
+    !finite(atrPercent) ||
+    !finite(width) ||
+    valid.length < 30
+  ) {
     return {
-      status:'UNAVAILABLE',
-      direction:'NEUTRAL',
-      candles:five.length,
-      required:MIN_5M_CANDLES,
-      reason:'Not enough complete, gap-free 5-minute candles aggregated from 1-minute data.'
+      regime: 'UNAVAILABLE',
+      atr: round(atrValue),
+      atrPercent: round(atrPercent, 5),
+      bollingerWidth: round(width, 5)
     };
   }
 
-  const cl=five.map(c=>c.close);
-  const f=ema(cl,9);
-  const s=ema(cl,21);
-  const i=cl.length-1;
-  const dir=f[i]>s[i]?'BULLISH':f[i]<s[i]?'BEARISH':'NEUTRAL';
+  const sorted = [...valid].sort((a, b) => a - b);
 
-  return {
-    status:dir==='NEUTRAL'?'MIXED':'CONFIRMED',
-    direction:dir,
-    ema9:round(f[i]),
-    ema21:round(s[i]),
-    candles:five.length,
-    lastCandle:iso(five[i].time),
-    reason:`5-minute EMA9/EMA21 trend is ${dir}.`
-  };
-}
+  const low = sorted[
+    Math.floor((sorted.length - 1) * 0.25)
+  ];
 
-function volatility(atrValues,widths,cs){
-  const i=atrValues.length-1;
-  const a=atrValues[i];
-  const close=cs[i]?.close;
-  const ap=finite(a)&&close?a/close*100:null;
-  const w=widths[i];
-  const valid=widths.filter(finite);
+  const high = sorted[
+    Math.floor((sorted.length - 1) * 0.75)
+  ];
 
-  if(!finite(ap)||!finite(w)||valid.length<30){
-    return {
-      regime:'UNAVAILABLE',
-      atr:round(a),
-      atrPercent:round(ap,5),
-      bollingerWidth:round(w,5)
-    };
-  }
-
-  const sorted=[...valid].sort((x,y)=>x-y);
-  const lo=sorted[Math.floor((sorted.length-1)*.25)];
-  const hi=sorted[Math.floor((sorted.length-1)*.75)];
-  const regime=w<=lo?'LOW':w>=hi?'HIGH':'NORMAL';
+  const regime =
+    width <= low
+      ? 'LOW'
+      : width >= high
+        ? 'HIGH'
+        : 'NORMAL';
 
   return {
     regime,
-    atr:round(a),
-    atrPercent:round(ap,5),
-    bollingerWidth:round(w,5),
-    lowWidthThreshold:round(lo,5),
-    highWidthThreshold:round(hi,5)
+    atr: round(atrValue),
+    atrPercent: round(atrPercent, 5),
+    bollingerWidth: round(width, 5),
+    lowWidthThreshold: round(low, 5),
+    highWidthThreshold: round(high, 5)
   };
 }
 
-function emptyMarket(pair='NO MARKET',reason='No usable market data.'){
+/* -------------------------------------------------------
+   MARKET ANALYSIS AND SIGNAL QUALIFICATION
+------------------------------------------------------- */
+
+function emptyMarket(
+  pair = 'NO MARKET',
+  reason = 'No usable market data.'
+) {
   return {
     pair,
-    timeframe:1,
-    signal:'NO TRADE',
-    confidence:null,
-    callScore:0,
-    putScore:0,
-    gap:0,
-    entryTime:null,
-    expiryTime:null,
-    currentPrice:null,
-    entryPrice:null,
-    freshness:'NO DATA',
-    dataAgeSeconds:null,
-    lastCandle:null,
-    indicators:{},
-    reasons:[reason],
-    source:'Twelve Data LIVE',
-    evidenceLabel:'Evidence score, not win probability',
-    insufficientData:true,
-    tradeAllowed:false
+    timeframe: 1,
+    signal: 'NO TRADE',
+    technicalSignal: 'NO TRADE',
+    confidence: null,
+    callScore: 0,
+    putScore: 0,
+    gap: 0,
+    entryTime: null,
+    expiryTime: null,
+    currentPrice: null,
+    entryPrice: null,
+    entryPriceStatus: 'WAITING_FOR_ENTRY_PRICE',
+    freshness: 'NO DATA',
+    dataAgeSeconds: null,
+    lastCandle: null,
+    indicators: {},
+    reasons: [reason],
+    source: 'Twelve Data LIVE',
+    evidenceLabel: 'Evidence score, not win probability',
+    insufficientData: true,
+    tradeAllowed: false,
+    noTrade: true
   };
 }
 
-function scoreMarket(raw,pair,fetchedAt){
-  const now=Date.now();
-  const cs=closedCandles(raw,now);
-  const last=cs.at(-1);
+function scoreMarket(raw, pair, fetchedAt) {
+  const now = Date.now();
+  const candles = closedCandles(raw, now);
+  const last = candles.at(-1);
 
-  if(!last){
-    return emptyMarket(pair,'No completed 1-minute candles.');
+  if (!last) {
+    return emptyMarket(
+      pair,
+      'No completed 1-minute candles.'
+    );
   }
 
-  const age=Math.max(0,(now-(last.time+60000))/1000);
-  const fresh=age<=FRESHNESS_SECONDS?'FRESH':age<=HARD_STALE_SECONDS?'STALE':'HARD STALE';
+  const age = Math.max(
+    0,
+    (now - (last.time + 60000)) / 1000
+  );
 
-  const closes=cs.map(c=>c.close);
-  const i=cs.length-1;
-  const p=i-1;
+  const freshness =
+    age <= FRESHNESS_SECONDS
+      ? 'FRESH'
+      : age <= HARD_STALE_SECONDS
+        ? 'STALE'
+        : 'HARD STALE';
 
-  const e9=ema(closes,9);
-  const e21=ema(closes,21);
-  const rv=rsi(closes);
-  const mc=macd(closes);
-  const av=atr(cs);
-  const bb=bollinger(closes);
+  const closes = candles.map(candle => candle.close);
+  const index = candles.length - 1;
+  const previousIndex = index - 1;
 
-  const emaCross=cross(e9[p],e21[p],e9[i],e21[i]);
-  const macdCross=cross(mc.line[p],mc.signal[p],mc.line[i],mc.signal[i]);
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
+  const rsi14 = rsi(closes);
+  const macdValues = macd(closes);
+  const atr14 = atr(candles);
+  const bands = bollinger(closes);
 
-  const div=rsiDivergence(cs,rv);
-  const pattern=candlePattern(cs);
-  const psy=psychology(cs);
-  const sr=levels(cs);
-  const tl=trendline(cs);
-  const bo=breakout(cs);
-  const c5=confirm5m(cs);
-  const vol=volatility(av,bb.width,cs);
+  const emaCross = cross(
+    ema9[previousIndex],
+    ema21[previousIndex],
+    ema9[index],
+    ema21[index]
+  );
 
-  let call=0,put=0;
-  const reasons=[];
+  const macdCross = cross(
+    macdValues.line[previousIndex],
+    macdValues.signal[previousIndex],
+    macdValues.line[index],
+    macdValues.signal[index]
+  );
 
-  const add=(d,n,r)=>{
-    if(d==='BULLISH')call+=n;
-    if(d==='BEARISH')put+=n;
-    if(d!=='NEUTRAL'&&n>0)reasons.push(r);
-  };
+  const pattern = candlePattern(candles);
+  const marketPsychology = psychology(candles);
+  const supportResistance = levels(candles);
+  const trendLine = trendline(candles);
+  const breakoutResult = breakout(candles);
+  const confirmation5m = confirm5m(candles);
+  const volatilityResult = volatility(
+    atr14,
+    bands.width,
+    candles
+  );
 
-  const patPoints={
-    'BULLISH ENGULFING':12,
-    'BEARISH ENGULFING':12,
-    'MORNING STAR':12,
-    'EVENING STAR':12,
-    'PIERCING LINE':8,
-    'DARK CLOUD COVER':8,
-    'HAMMER':6,
-    'SHOOTING STAR':6,
-    'BULLISH HARAMI':6,
-    'BEARISH HARAMI':6,
-    'THREE WHITE SOLDIERS':10,
-    'THREE BLACK CROWS':10,
-    'BULLISH MARUBOZU':7,
-    'BEARISH MARUBOZU':7
-  };
+  let callScore = 0;
+  let putScore = 0;
 
-  add(pattern.direction,patPoints[pattern.name]||0,`Candlestick: ${pattern.name}.`);
-  add(psy.direction,8,`Market psychology: ${psy.psychology}.`);
-  add(sr.direction,8,`Support/resistance: ${sr.position}.`);
-  add(tl.direction,7,`Trendline: ${tl.direction}.`);
+  const reasons = [];
 
-  if(emaCross==='BULLISH_CROSSOVER'){
-    add('BULLISH',7,'EMA9 crossed above EMA21.');
-  }else if(emaCross==='BEARISH_CROSSOVER'){
-    add('BEARISH',7,'EMA9 crossed below EMA21.');
-  }else if(finite(e9[i])&&finite(e21[i])){
-    add(e9[i]>e21[i]?'BULLISH':'BEARISH',3,'EMA9/EMA21 alignment.');
-  }
+  function add(direction, points, reason) {
+    if (direction === 'BULLISH') {
+      callScore += points;
+    }
 
-  if(finite(rv[i])&&finite(rv[p])){
-    if(rv[p]<30&&rv[i]>=30){
-      add('BULLISH',5,'RSI14 recovered above 30.');
-    }else if(rv[p]>70&&rv[i]<=70){
-      add('BEARISH',5,'RSI14 fell below 70.');
-    }else if(rv[i]>50&&rv[i]<70){
-      add('BULLISH',2,'RSI14 positive momentum.');
-    }else if(rv[i]<50&&rv[i]>30){
-      add('BEARISH',2,'RSI14 negative momentum.');
+    if (direction === 'BEARISH') {
+      putScore += points;
+    }
+
+    if (
+      direction !== 'NEUTRAL' &&
+      direction !== 'UNAVAILABLE' &&
+      points > 0
+    ) {
+      reasons.push(reason);
     }
   }
 
-  add(div.direction,8,`RSI divergence: ${div.type}.`);
+  const patternPoints = {
+    'BULLISH ENGULFING': 12,
+    'BEARISH ENGULFING': 12,
+    'MORNING STAR': 12,
+    'EVENING STAR': 12,
+    'HAMMER': 6,
+    'SHOOTING STAR': 6,
+    'BULLISH MARUBOZU': 7,
+    'BEARISH MARUBOZU': 7
+  };
 
-  if(macdCross==='BULLISH_CROSSOVER'){
-    add('BULLISH',6,'MACD bullish crossover.');
-  }else if(macdCross==='BEARISH_CROSSOVER'){
-    add('BEARISH',6,'MACD bearish crossover.');
-  }else if(finite(mc.histogram[i])&&finite(mc.histogram[p])&&mc.histogram[i]>mc.histogram[p]&&mc.histogram[i]>0){
-    add('BULLISH',2,'MACD histogram strengthening positive.');
-  }else if(finite(mc.histogram[i])&&finite(mc.histogram[p])&&mc.histogram[i]<mc.histogram[p]&&mc.histogram[i]<0){
-    add('BEARISH',2,'MACD histogram strengthening negative.');
+  add(
+    pattern.direction,
+    patternPoints[pattern.name] || 0,
+    `Candlestick: ${pattern.name}.`
+  );
+
+  add(
+    marketPsychology.direction,
+    8,
+    `Market psychology: ${marketPsychology.psychology}.`
+  );
+
+  add(
+    supportResistance.direction,
+    8,
+    `Support/resistance: ${supportResistance.position}.`
+  );
+
+  add(
+    trendLine.direction,
+    7,
+    `Trendline: ${trendLine.direction}.`
+  );
+
+  if (emaCross === 'BULLISH_CROSSOVER') {
+    add('BULLISH', 7, 'EMA9 crossed above EMA21.');
+  } else if (emaCross === 'BEARISH_CROSSOVER') {
+    add('BEARISH', 7, 'EMA9 crossed below EMA21.');
+  } else if (
+    finite(ema9[index]) &&
+    finite(ema21[index])
+  ) {
+    add(
+      ema9[index] > ema21[index]
+        ? 'BULLISH'
+        : 'BEARISH',
+      3,
+      'EMA9/EMA21 alignment.'
+    );
+  }
+
+  if (
+    finite(rsi14[index]) &&
+    finite(rsi14[previousIndex])
+  ) {
+    if (
+      rsi14[previousIndex] < 30 &&
+      rsi14[index] >= 30
+    ) {
+      add('BULLISH', 5, 'RSI14 recovered above 30.');
+    } else if (
+      rsi14[previousIndex] > 70 &&
+      rsi14[index] <= 70
+    ) {
+      add('BEARISH', 5, 'RSI14 fell below 70.');
+    } else if (
+      rsi14[index] > 50 &&
+      rsi14[index] < 70
+    ) {
+      add('BULLISH', 2, 'RSI14 positive momentum.');
+    } else if (
+      rsi14[index] < 50 &&
+      rsi14[index] > 30
+    ) {
+      add('BEARISH', 2, 'RSI14 negative momentum.');
+    }
+  }
+
+  if (macdCross === 'BULLISH_CROSSOVER') {
+    add('BULLISH', 6, 'MACD bullish crossover.');
+  } else if (macdCross === 'BEARISH_CROSSOVER') {
+    add('BEARISH', 6, 'MACD bearish crossover.');
+  } else if (
+    finite(macdValues.histogram[index]) &&
+    finite(macdValues.histogram[previousIndex]) &&
+    macdValues.histogram[index] >
+      macdValues.histogram[previousIndex] &&
+    macdValues.histogram[index] > 0
+  ) {
+    add('BULLISH', 2, 'MACD histogram strengthening positive.');
+  } else if (
+    finite(macdValues.histogram[index]) &&
+    finite(macdValues.histogram[previousIndex]) &&
+    macdValues.histogram[index] <
+      macdValues.histogram[previousIndex] &&
+    macdValues.histogram[index] < 0
+  ) {
+    add('BEARISH', 2, 'MACD histogram strengthening negative.');
   }
 
   add(
-    bo.direction,
-    bo.status.includes('RETEST')?8:bo.status.includes('FALSE')?0:5,
-    `Breakout/retest: ${bo.status}.`
+    breakoutResult.direction,
+    breakoutResult.status.includes('RETEST')
+      ? 8
+      : breakoutResult.status.includes('FALSE')
+        ? 0
+        : 5,
+    `Breakout/retest: ${breakoutResult.status}.`
   );
 
-  const dir=call>put?'BULLISH':put>call?'BEARISH':'NEUTRAL';
-  const winning=Math.max(call,put);
-  const opposing=Math.min(call,put);
-  const gap=Math.abs(call-put);
-  const guards=[];
+  const direction =
+    callScore > putScore
+      ? 'BULLISH'
+      : putScore > callScore
+        ? 'BEARISH'
+        : 'NEUTRAL';
 
-  if(cs.length<MIN_CANDLES){
-    guards.push(`Fewer than ${MIN_CANDLES} completed 1-minute candles.`);
+  const winningScore = Math.max(callScore, putScore);
+  const opposingScore = Math.min(callScore, putScore);
+  const scoreGap = Math.abs(callScore - putScore);
+
+  const guards = [];
+
+  if (candles.length < MIN_CANDLES) {
+    guards.push(
+      `Fewer than ${MIN_CANDLES} completed 1-minute candles.`
+    );
   }
 
-  if(!hasContinuousMinutes(cs.slice(-60))){
-    guards.push('Missing minute candles in the recent data window.');
+  if (!hasContinuousMinutes(candles.slice(-60))) {
+    guards.push(
+      'Missing minute candles in the recent data window.'
+    );
   }
 
-  if(fresh!=='FRESH'){
+  if (freshness !== 'FRESH') {
     guards.push('Market data is not fresh.');
   }
 
-  if(c5.status==='UNAVAILABLE'){
-    guards.push('5-minute confirmation is unavailable.');
-  }else if(c5.direction!==dir){
-    guards.push('5-minute trend does not confirm the 1-minute direction.');
+  if (confirmation5m.status === 'UNAVAILABLE') {
+    guards.push(
+      '5-minute confirmation is unavailable.'
+    );
+  } else if (confirmation5m.direction !== direction) {
+    guards.push(
+      '5-minute trend does not confirm the 1-minute direction.'
+    );
   }
 
-  if(vol.regime==='UNAVAILABLE'){
+  if (volatilityResult.regime === 'UNAVAILABLE') {
     guards.push('Volatility regime is unavailable.');
-  }else if(vol.regime==='HIGH'){
-    guards.push('High-volatility regime: signal withheld.');
+  } else if (volatilityResult.regime === 'HIGH') {
+    guards.push(
+      'High-volatility regime: signal withheld.'
+    );
   }
 
-  if(
-    ![rv[i],e9[i],e21[i],mc.histogram[i],av[i],bb.width[i]].every(finite)||
-    tl.direction==='UNAVAILABLE'||
-    sr.position==='UNAVAILABLE'
-  ){
-    guards.push('One or more required technical measurements are unavailable.');
+  if (
+    ![
+      rsi14[index],
+      ema9[index],
+      ema21[index],
+      macdValues.histogram[index],
+      atr14[index],
+      bands.width[index]
+    ].every(finite) ||
+    trendLine.direction === 'UNAVAILABLE' ||
+    supportResistance.position === 'UNAVAILABLE'
+  ) {
+    guards.push(
+      'One or more required technical measurements are unavailable.'
+    );
   }
 
-  if(dir==='NEUTRAL'||gap<MIN_SCORE_GAP){
-    guards.push('Directional evidence conflicts or score gap is too small.');
+  if (
+    direction === 'NEUTRAL' ||
+    scoreGap < MIN_SCORE_GAP
+  ) {
+    guards.push(
+      'Directional evidence conflicts or score gap is too small.'
+    );
   }
 
-  if(winning<MIN_SIGNAL_SCORE){
-    guards.push('Evidence score is below the minimum threshold.');
+  if (winningScore < MIN_SIGNAL_SCORE) {
+    guards.push(
+      'Evidence score is below the minimum threshold.'
+    );
   }
 
-  if(opposing>=MIN_OPPOSING_SCORE){
-    guards.push('Opposing directional evidence is material.');
+  if (opposingScore >= MIN_OPPOSING_SCORE) {
+    guards.push(
+      'Opposing directional evidence is material.'
+    );
   }
 
-  if(bo.status.startsWith('FALSE_')){
+  if (breakoutResult.status.startsWith('FALSE_')) {
     guards.push('False-breakout risk detected.');
   }
 
-  const signal=guards.length?'NO TRADE':dir==='BULLISH'?'BUY':'SELL';
-  reasons.push(...guards.map(x=>`NO TRADE: ${x}`));
+  const technicalSignal =
+    guards.length > 0
+      ? 'NO TRADE'
+      : direction === 'BULLISH'
+        ? 'BUY'
+        : 'SELL';
 
-  const entry=(Math.floor(now/60000)+1)*60000;
-  const expiry=entry+60000;
+  reasons.push(
+    ...guards.map(reason => `NO TRADE: ${reason}`)
+  );
 
-  const result={
+  return {
     pair,
-    timeframe:1,
-    signal,
-    confidence:signal==='NO TRADE'?Math.min(100,winning):Math.min(100,winning),
-    callScore:round(call,0),
-    putScore:round(put,0),
-    gap:round(gap,0),
-    entryTime:signal==='NO TRADE'?null:iso(entry),
-    expiryTime:signal==='NO TRADE'?null:iso(expiry),
-    currentPrice:last.close,
-    entryPrice:null,
-    entryPriceStatus:'WAITING_FOR_ENTRY_PRICE',
-    freshness:fresh,
-    dataAgeSeconds:round(age,1),
-    lastCandle:iso(last.time),
-    fetchedAt:iso(fetchedAt),
-    supportResistance:sr,
-    trendLine:tl,
-    marketPsychology:psy.psychology,
-    priceAction:sr.position,
-    candlePattern:pattern,
-    breakout:bo,
-    confirmation5m:c5,
-    volatility:vol,
-    indicators:{
-      ema9:round(e9[i]),
-      ema21:round(e21[i]),
+    timeframe: 1,
+    signal: 'NO TRADE',
+    technicalSignal,
+    confidence: Math.min(100, winningScore),
+    callScore: round(callScore, 0),
+    putScore: round(putScore, 0),
+    gap: round(scoreGap, 0),
+    entryTime: null,
+    expiryTime: null,
+    currentPrice: last.close,
+    entryPrice: null,
+    entryPriceStatus: 'WAITING_FOR_ENTRY_PRICE',
+    brokerPrice: null,
+    brokerPriceStatus: 'NOT_SUBMITTED',
+    brokerPriceGapPips: null,
+    brokerPriceTolerancePips: DEFAULT_MAX_PRICE_GAP_PIPS,
+    freshness,
+    dataAgeSeconds: round(age, 1),
+    lastCandle: iso(last.time),
+    fetchedAt: iso(fetchedAt),
+    supportResistance,
+    trendLine,
+    marketPsychology,
+    priceAction: supportResistance.position,
+    candlePattern: pattern,
+    breakout: breakoutResult,
+    confirmation5m,
+    volatility: volatilityResult,
+    indicators: {
+      ema9: round(ema9[index]),
+      ema21: round(ema21[index]),
       emaCross,
-      rsi14:round(rv[i],2),
-      rsiDivergence:div,
-      macd:{
-        line:round(mc.line[i]),
-        signal:round(mc.signal[i]),
-        histogram:round(mc.histogram[i]),
-        crossover:macdCross
+      rsi14: round(rsi14[index], 2),
+      macd: {
+        line: round(macdValues.line[index]),
+        signal: round(macdValues.signal[index]),
+        histogram: round(
+          macdValues.histogram[index]
+        ),
+        crossover: macdCross
       },
-      atr14:round(av[i]),
-      bollinger:{
-        upper:round(bb.upper[i]),
-        middle:round(bb.middle[i]),
-        lower:round(bb.lower[i]),
-        width:round(bb.width[i],5)
+      atr14: round(atr14[index]),
+      bollinger: {
+        upper: round(bands.upper[index]),
+        middle: round(bands.middle[index]),
+        lower: round(bands.lower[index]),
+        width: round(bands.width[index], 5)
       }
     },
     reasons,
-    source:'Twelve Data LIVE',
-    evidenceLabel:'Evidence score, not win probability',
-    tradeAllowed:signal!=='NO TRADE',
-    noTrade:signal==='NO TRADE',
-    insufficientData:guards.length>0
+    source: 'Twelve Data LIVE',
+    evidenceLabel: 'Evidence score, not win probability',
+    tradeAllowed: false,
+    noTrade: true,
+    insufficientData: guards.length > 0
   };
-
-  // NO TRADE diagnostics are not stored as executable signal records.
-  return result;
 }
 
-function evaluateFreshness(m,now=Date.now()){
-  if(!m)return emptyMarket();
+function evaluateFreshness(market, now = Date.now()) {
+  if (!market) return emptyMarket();
 
-  const t=Date.parse(m.lastCandle||'');
+  const candleTime = Date.parse(market.lastCandle || '');
 
-  if(!Number.isFinite(t)){
+  if (!Number.isFinite(candleTime)) {
     return {
-      ...m,
-      freshness:'NO DATA',
-      dataAgeSeconds:null,
-      signal:'NO TRADE',
-      confidence:null,
-      tradeAllowed:false,
-      noTrade:true
+      ...market,
+      signal: 'NO TRADE',
+      tradeAllowed: false,
+      noTrade: true,
+      freshness: 'NO DATA',
+      dataAgeSeconds: null
     };
   }
 
-  const age=Math.max(0,(now-(t+60000))/1000);
-  const fresh=age<=FRESHNESS_SECONDS?'FRESH':age<=HARD_STALE_SECONDS?'STALE':'HARD STALE';
+  const age = Math.max(
+    0,
+    (now - (candleTime + 60000)) / 1000
+  );
 
-  return fresh==='FRESH'
-    ?{...m,freshness:fresh,dataAgeSeconds:round(age,1)}
-    :{
-      ...m,
-      freshness:fresh,
-      dataAgeSeconds:round(age,1),
-      signal:'NO TRADE',
-      confidence:null,
-      tradeAllowed:false,
-      noTrade:true,
-      reasons:[...(m.reasons||[]),'NO TRADE: latest completed candle is stale.']
+  const freshness =
+    age <= FRESHNESS_SECONDS
+      ? 'FRESH'
+      : age <= HARD_STALE_SECONDS
+        ? 'STALE'
+        : 'HARD STALE';
+
+  if (freshness !== 'FRESH') {
+    return {
+      ...market,
+      signal: 'NO TRADE',
+      tradeAllowed: false,
+      noTrade: true,
+      freshness,
+      dataAgeSeconds: round(age, 1),
+      reasons: [
+        ...(market.reasons || []),
+        'NO TRADE: latest completed candle is stale.'
+      ]
     };
+  }
+
+  return {
+    ...market,
+    freshness,
+    dataAgeSeconds: round(age, 1)
+  };
 }
 
-function rankCandidates(markets){
-  const ix=new Map(PRIORITY_PAIRS.map((p,i)=>[p,i]));
+/* -------------------------------------------------------
+   POCKET OPTION MANUAL PRICE VALIDATION
+------------------------------------------------------- */
+
+function applyBrokerPrice(market, brokerPriceValue) {
+  const result = {
+    ...market,
+    signal: 'NO TRADE',
+    tradeAllowed: false,
+    noTrade: true,
+    brokerPrice: null,
+    brokerPriceStatus: 'INVALID_OR_MISSING',
+    brokerPriceGapPips: null,
+    brokerPriceTolerancePips:
+      DEFAULT_MAX_PRICE_GAP_PIPS,
+    entryPrice: null,
+    entryPriceStatus: 'WAITING_FOR_ENTRY_PRICE'
+  };
+
+  const brokerPrice = Number(brokerPriceValue);
+
+  if (
+    brokerPriceValue === undefined ||
+    brokerPriceValue === null ||
+    brokerPriceValue === '' ||
+    !Number.isFinite(brokerPrice) ||
+    brokerPrice <= 0
+  ) {
+    result.reasons = [
+      ...(market.reasons || []),
+      'NO TRADE: enter a valid Pocket Option broker price.'
+    ];
+
+    return result;
+  }
+
+  result.brokerPrice = brokerPrice;
+  result.brokerPriceSubmittedAt = iso(Date.now());
+  result.brokerPriceSource = 'USER ENTERED POCKET OPTION PRICE';
+
+  if (market.freshness !== 'FRESH') {
+    result.brokerPriceStatus = 'MARKET_DATA_NOT_FRESH';
+    result.reasons = [
+      ...(market.reasons || []),
+      'NO TRADE: market data is not fresh.'
+    ];
+
+    return result;
+  }
+
+  if (market.technicalSignal === 'NO TRADE') {
+    result.brokerPriceStatus = 'TECHNICAL_FILTER_FAILED';
+    result.reasons = [
+      ...(market.reasons || []),
+      'NO TRADE: technical qualification did not pass.'
+    ];
+
+    return result;
+  }
+
+  if (!finite(market.currentPrice) || market.currentPrice <= 0) {
+    result.brokerPriceStatus = 'REFERENCE_PRICE_UNAVAILABLE';
+    result.reasons = [
+      ...(market.reasons || []),
+      'NO TRADE: Twelve Data reference price is unavailable.'
+    ];
+
+    return result;
+  }
+
+  const gap = priceDifferencePips(
+    market.pair,
+    brokerPrice,
+    Number(market.currentPrice)
+  );
+
+  result.brokerPriceGapPips = round(gap, 2);
+
+  if (gap > DEFAULT_MAX_PRICE_GAP_PIPS) {
+    result.brokerPriceStatus = 'PRICE_GAP_TOO_LARGE';
+
+    result.reasons = [
+      ...(market.reasons || []),
+      `NO TRADE: Pocket Option price differs from Twelve Data by ${round(gap, 2)} pips; maximum allowed is ${DEFAULT_MAX_PRICE_GAP_PIPS}.`
+    ];
+
+    return result;
+  }
+
+  const now = Date.now();
+  const entry = (Math.floor(now / 60000) + 1) * 60000;
+  const expiry = entry + 60000;
+
+  result.signal = market.technicalSignal;
+  result.tradeAllowed = true;
+  result.noTrade = false;
+  result.entryPrice = brokerPrice;
+  result.entryPriceStatus = 'USER_ENTERED_PRICE_ACCEPTED';
+  result.brokerPriceStatus = 'WITHIN_TOLERANCE';
+  result.entryTime = iso(entry);
+  result.expiryTime = iso(expiry);
+
+  result.reasons = [
+    ...(market.reasons || []),
+    `Pocket Option user-entered price is within ${DEFAULT_MAX_PRICE_GAP_PIPS}-pip tolerance.`,
+    '5-minute trend confirmation passed.',
+    'Live signal duration is one minute.'
+  ];
+
+  return result;
+}
+
+function createSignalRecord(market) {
+  if (
+    !market ||
+    market.tradeAllowed !== true ||
+    !['BUY', 'SELL'].includes(market.signal) ||
+    !finite(market.entryPrice)
+  ) {
+    return null;
+  }
+
+  const id = [
+    market.pair,
+    market.signal,
+    market.entryTime,
+    market.brokerPrice
+  ].join('_');
+
+  return {
+    id,
+    pair: market.pair,
+    signal: market.signal,
+    evidenceScore: market.confidence,
+    entryTime: market.entryTime,
+    expiryTime: market.expiryTime,
+    referencePrice: market.currentPrice,
+    brokerPrice: market.brokerPrice,
+    outcome: 'PENDING',
+    createdAt: iso(Date.now()),
+    source: 'Twelve Data reference + user-entered broker price',
+    brokerPriceSource: market.brokerPriceSource,
+    brokerPriceSubmittedAt: market.brokerPriceSubmittedAt,
+    brokerPriceGapPips: market.brokerPriceGapPips
+  };
+}
+
+/* -------------------------------------------------------
+   SCANNER AND AUTO SELECTION
+------------------------------------------------------- */
+
+function candidateIsQualified(market) {
+  return Boolean(
+    market &&
+    market.freshness === 'FRESH' &&
+    market.technicalSignal !== 'NO TRADE' &&
+    market.insufficientData !== true &&
+    market.confirmation5m &&
+    market.confirmation5m.status === 'CONFIRMED' &&
+    market.confirmation5m.direction ===
+      (market.technicalSignal === 'BUY'
+        ? 'BULLISH'
+        : 'BEARISH')
+  );
+}
+
+function rankCandidates(markets) {
+  const priorityIndex = new Map(
+    PRIORITY_PAIRS.map((pair, index) => [pair, index])
+  );
 
   return markets
     .map(evaluateFreshness)
-    .sort((a,b)=>
-      Number(b.freshness==='FRESH')-Number(a.freshness==='FRESH')||
-      Math.max(b.callScore||0,b.putScore||0)-Math.max(a.callScore||0,a.putScore||0)||
-      (ix.get(a.pair)??999)-(ix.get(b.pair)??999)
-    )
-    .map((m,i)=>({
-      rank:i+1,
-      pair:m.pair,
-      timeframe:1,
-      signal:m.signal,
-      confidence:m.confidence,
-      callScore:m.callScore,
-      putScore:m.putScore,
-      gap:m.gap,
-      freshness:m.freshness,
-      dataAgeSeconds:m.dataAgeSeconds,
-      entryTime:m.entryTime,
-      oneMinuteTrend:(m.callScore||0)>(m.putScore||0)
-        ?'BULLISH'
-        :(m.putScore||0)>(m.callScore||0)
-          ?'BEARISH'
-          :'NEUTRAL',
-      fiveMinuteConfirmation:m.confirmation5m?.direction||'UNAVAILABLE',
-      volatility:m.volatility?.regime||'UNAVAILABLE',
-      reason:m.reasons?.[0]||'Evidence review.'
+    .sort((a, b) => {
+      const qualifiedDifference =
+        Number(candidateIsQualified(b)) -
+        Number(candidateIsQualified(a));
+
+      if (qualifiedDifference !== 0) {
+        return qualifiedDifference;
+      }
+
+      const scoreDifference =
+        Math.max(b.callScore || 0, b.putScore || 0) -
+        Math.max(a.callScore || 0, a.putScore || 0);
+
+      if (scoreDifference !== 0) {
+        return scoreDifference;
+      }
+
+      return (
+        (priorityIndex.get(a.pair) ?? 999) -
+        (priorityIndex.get(b.pair) ?? 999)
+      );
+    })
+    .map((market, index) => ({
+      rank: index + 1,
+      pair: market.pair,
+      timeframe: 1,
+      signal: candidateIsQualified(market)
+        ? market.technicalSignal
+        : 'NO TRADE',
+      technicalSignal: market.technicalSignal,
+      qualified: candidateIsQualified(market),
+      confidence: market.confidence,
+      callScore: market.callScore,
+      putScore: market.putScore,
+      gap: market.gap,
+      currentPrice: market.currentPrice,
+      freshness: market.freshness,
+      dataAgeSeconds: market.dataAgeSeconds,
+      entryTime: market.entryTime,
+      oneMinuteTrend:
+        (market.callScore || 0) > (market.putScore || 0)
+          ? 'BULLISH'
+          : (market.putScore || 0) > (market.callScore || 0)
+            ? 'BEARISH'
+            : 'NEUTRAL',
+      fiveMinuteConfirmation:
+        market.confirmation5m?.direction || 'UNAVAILABLE',
+      volatility:
+        market.volatility?.regime || 'UNAVAILABLE',
+      reason:
+        market.reasons?.[0] || 'Evidence review.'
     }));
 }
 
-function selectBest(markets){
-  const ranked=rankCandidates(markets);
-  const best=ranked[0];
+function selectBest(markets) {
+  const ranked = rankCandidates(markets);
+
+  const qualified = ranked.find(
+    candidate => candidate.qualified === true
+  );
+
+  if (!qualified) {
+    return {
+      selected: emptyMarket(
+        'NO QUALIFIED PAIR',
+        'No pair passed all live evidence and confirmation requirements.'
+      ),
+      ranked
+    };
+  }
+
+  const selected =
+    markets.find(market => market.pair === qualified.pair) ||
+    latestMarkets.get(qualified.pair);
 
   return {
-    selected:best
-      ?latestMarkets.get(best.pair)||markets.find(m=>m.pair===best.pair)
-      :emptyMarket(),
+    selected: selected || emptyMarket(),
     ranked
   };
 }
 
-function getCurrentAnalysis(){
-  const all=[...latestMarkets.values()].map(evaluateFreshness);
-  const r=selectBest(all);
+function getCurrentAnalysis() {
+  const markets = [...latestMarkets.values()]
+    .map(evaluateFreshness);
+
+  const selection = selectBest(markets);
 
   return {
-    selectedMarket:r.selected||emptyMarket(
-      'NO MARKET',
-      API_KEY?'Priority scan is required.':'Twelve Data API key is not configured.'
-    ),
-    rankedCandidates:r.ranked
+    selectedMarket: selection.selected,
+    rankedCandidates: selection.ranked
   };
 }
 
-function makeResponse(selectedMarket,rankedCandidates=[],extra={}){
+function makeResponse(
+  selectedMarket,
+  rankedCandidates = [],
+  extra = {}
+) {
   return {
-    ok:true,
-    version:VERSION,
+    ok: true,
+    version: VERSION,
     selectedMarket,
     rankedCandidates,
-    scanner:{
-      running:scannerRunning,
-      startedAt:scannerStartedAt,
+    scanner: {
+      running: scannerRunning,
+      startedAt: scannerStartedAt,
       lastScanAt,
       totalScanned,
-      mode:'FIRST 6 OF 24 PRIORITY PAIRS; BACKGROUND 18 NOT PART OF INITIAL SCAN',
-      phase:scanProgress.phase,
-      batchSize:6,
-      pairs:24,
-      priorityPairs:PRIORITY_PAIRS,
-      backgroundPairs:BACKGROUND_PAIRS,
-      progress:{...scanProgress},
-      cooldownRemainingMs:Math.max(
+      mode:
+        'FIRST 6 OF 24 PRIORITY PAIRS; BACKGROUND 18 NOT PART OF INITIAL SCAN',
+      phase: scanProgress.phase,
+      batchSize: 6,
+      pairs: 24,
+      priorityPairs: PRIORITY_PAIRS,
+      backgroundPairs: BACKGROUND_PAIRS,
+      progress: { ...scanProgress },
+      cooldownRemainingMs: Math.max(
         0,
-        SCAN_COOLDOWN_MS-(Date.now()-lastScanStartedAtMs)
+        SCAN_COOLDOWN_MS -
+          (Date.now() - lastScanStartedAtMs)
       )
     },
-    metadata:metadata(),
-    source:'Twelve Data LIVE',
-    diagnostic:{lastScanError},
+    metadata: metadata(),
+    source: 'Twelve Data LIVE',
+    diagnostic: { lastScanError },
     ...extra
   };
 }
 
-function refreshCandidates(){
-  const a=getCurrentAnalysis();
-  cachedResult=makeResponse(a.selectedMarket,a.rankedCandidates);
+function refreshCandidates() {
+  const analysis = getCurrentAnalysis();
+
+  return makeResponse(
+    analysis.selectedMarket,
+    analysis.rankedCandidates
+  );
 }
 
-async function processPair(pair){
-  try{
-    let data=await getPairData(pair,false);
-    let m=evaluateFreshness(scoreMarket(data.candles,pair,data.fetchedAt));
+async function processPair(pair) {
+  try {
+    let data = await getPairData(pair, false);
 
-    if(m.freshness!=='FRESH'){
-      data=await getPairData(pair,true);
-      m=evaluateFreshness(scoreMarket(data.candles,pair,data.fetchedAt));
+    let market = evaluateFreshness(
+      scoreMarket(data.candles, pair, data.fetchedAt)
+    );
+
+    if (market.freshness !== 'FRESH') {
+      data = await getPairData(pair, true);
+
+      market = evaluateFreshness(
+        scoreMarket(data.candles, pair, data.fetchedAt)
+      );
     }
 
-    latestMarkets.set(pair,m);
+    latestMarkets.set(pair, market);
 
-    return {pair,success:true,market:m};
-  }catch(e){
-    lastScanError=`${pair}: ${String(e.message||e)}`;
-    const failed=emptyMarket(pair,lastScanError);
-    latestMarkets.set(pair,failed);
+    return {
+      pair,
+      success: true,
+      qualified: candidateIsQualified(market),
+      market
+    };
+  } catch (error) {
+    lastScanError =
+      `${pair}: ${String(error.message || error)}`;
 
-    return {pair,success:false,error:lastScanError};
-  }finally{
+    const failed = emptyMarket(pair, lastScanError);
+
+    latestMarkets.set(pair, failed);
+
+    return {
+      pair,
+      success: false,
+      qualified: false,
+      error: lastScanError
+    };
+  } finally {
     refreshCandidates();
   }
 }
 
-async function scanPriority(){
-  if(scannerRunning||!API_KEY)return false;
+async function scanPriority() {
+  if (scannerRunning || !API_KEY) return false;
 
-  scannerRunning=true;
-  scannerStartedAt=iso(Date.now());
-  lastScanStartedAtMs=Date.now();
-  lastScanError=null;
+  scannerRunning = true;
+  scannerStartedAt = iso(Date.now());
+  lastScanStartedAtMs = Date.now();
+  lastScanError = null;
 
-  scanProgress={
-    phase:'PRIORITY',
-    completed:0,
-    total:6,
-    priorityCompleted:0,
-    priorityTotal:6,
-    backgroundCompleted:0,
-    backgroundTotal:18,
-    pair:null
+  scanProgress = {
+    phase: 'PRIORITY',
+    completed: 0,
+    total: 6,
+    priorityCompleted: 0,
+    priorityTotal: 6,
+    backgroundCompleted: 0,
+    backgroundTotal: 18,
+    pair: null
   };
 
-  try{
-    for(const pair of PRIORITY_PAIRS){
-      scanProgress.phase='PRIORITY';
-      scanProgress.pair=pair;
+  try {
+    for (const pair of PRIORITY_PAIRS) {
+      scanProgress.phase = 'PRIORITY';
+      scanProgress.pair = pair;
 
       await processPair(pair);
 
@@ -1374,405 +2132,594 @@ async function scanPriority(){
       scanProgress.completed++;
     }
 
-    scanProgress.phase='PRIORITY_COMPLETE';
-    scanProgress.pair=null;
-    lastScanAt=iso(Date.now());
-    totalScanned+=scanProgress.completed;
+    scanProgress.phase = 'PRIORITY_COMPLETE';
+    scanProgress.pair = null;
 
-    refreshCandidates();
+    lastScanAt = iso(Date.now());
+    totalScanned += scanProgress.completed;
+
     return true;
-  }finally{
-    scannerRunning=false;
-    scanProgress.phase='PRIORITY_COMPLETE';
-    scanProgress.pair=null;
+  } finally {
+    scannerRunning = false;
+    scanProgress.phase = 'PRIORITY_COMPLETE';
+    scanProgress.pair = null;
     refreshCandidates();
   }
 }
 
-function startScanIfPossible(){
-  if(!API_KEY||scannerRunning)return false;
+function startScanIfPossible() {
+  if (!API_KEY || scannerRunning) return false;
 
-  const remain=Math.max(
+  const remaining = Math.max(
     0,
-    SCAN_COOLDOWN_MS-(Date.now()-lastScanStartedAtMs)
+    SCAN_COOLDOWN_MS -
+      (Date.now() - lastScanStartedAtMs)
   );
 
-  if(lastScanStartedAtMs&&remain>0)return false;
-
-  resetDailyCounter();
-
-  if(DAILY_USABLE_LIMIT-dailyCreditsUsed<6){
-    lastScanError='Insufficient daily Twelve Data safety budget for a complete six-pair priority scan.';
+  if (lastScanStartedAtMs && remaining > 0) {
     return false;
   }
 
-  void scanPriority().catch(e=>{
-    lastScanError=String(e.message||e);
-    scannerRunning=false;
-    scanProgress.phase='ERROR';
-    scanProgress.pair=null;
+  resetDailyCounter();
+
+  if (DAILY_USABLE_LIMIT - dailyCreditsUsed < 6) {
+    lastScanError =
+      'Insufficient daily Twelve Data budget for a complete six-pair scan.';
+
+    return false;
+  }
+
+  void scanPriority().catch(error => {
+    lastScanError = String(error.message || error);
+    scannerRunning = false;
+    scanProgress.phase = 'ERROR';
+    scanProgress.pair = null;
     refreshCandidates();
   });
 
   return true;
 }
 
-/* Backtest: decision at candle i close, entry at candle i+1 open; evaluate expiry close.
-   Chronological 70/30 split; no use of future candles in feature calculation. */
-function historicalSignal(cs,i){
-  const s=cs.slice(0,i+1);
+/* -------------------------------------------------------
+   WALK-FORWARD BACKTEST
+------------------------------------------------------- */
 
-  if(s.length<MIN_CANDLES)return null;
+function historicalSignal(candles, index) {
+  const sample = candles.slice(0, index + 1);
 
-  const cl=s.map(c=>c.close);
-  const e9=ema(cl,9);
-  const e21=ema(cl,21);
-  const rv=rsi(cl);
-  const mc=macd(cl);
-  const av=atr(s);
-  const bb=bollinger(cl);
-  const j=s.length-1;
+  if (sample.length < MIN_CANDLES) return null;
 
-  const vals=[e9[j],e21[j],rv[j],mc.histogram[j],av[j],bb.width[j]];
+  const closes = sample.map(candle => candle.close);
 
-  if(!vals.every(finite))return null;
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
+  const rsi14 = rsi(closes);
+  const macdValues = macd(closes);
+  const atrValues = atr(sample);
+  const bands = bollinger(closes);
 
-  const sr=levels(s);
-  const tl=trendline(s);
-  const bo=breakout(s);
-  const pat=candlePattern(s);
-  const psy=psychology(s);
+  const last = sample.length - 1;
 
-  const five=aggregate5m(s);
+  const values = [
+    ema9[last],
+    ema21[last],
+    rsi14[last],
+    macdValues.histogram[last],
+    atrValues[last],
+    bands.width[last]
+  ];
 
-  if(five.length<MIN_5M_CANDLES)return null;
+  if (!values.every(finite)) return null;
 
-  const fc=five.map(c=>c.close);
-  const f=ema(fc,9);
-  const sl=ema(fc,21);
-  const fd=f.at(-1)>sl.at(-1)
-    ?'BULLISH'
-    :f.at(-1)<sl.at(-1)
-      ?'BEARISH'
-      :'NEUTRAL';
+  const five = aggregate5m(sample);
 
-  let bull=0,bear=0;
+  if (five.length < MIN_5M_CANDLES) return null;
 
-  const add=(d,n)=>{
-    if(d==='BULLISH')bull+=n;
-    if(d==='BEARISH')bear+=n;
+  const fiveCloses = five.map(candle => candle.close);
+  const fiveFast = ema(fiveCloses, 9);
+  const fiveSlow = ema(fiveCloses, 21);
+
+  const fiveDirection =
+    fiveFast.at(-1) > fiveSlow.at(-1)
+      ? 'BULLISH'
+      : fiveFast.at(-1) < fiveSlow.at(-1)
+        ? 'BEARISH'
+        : 'NEUTRAL';
+
+  const pattern = candlePattern(sample);
+  const psychologyResult = psychology(sample);
+  const supportResistance = levels(sample);
+  const trend = trendline(sample);
+  const breakoutResult = breakout(sample);
+
+  let bull = 0;
+  let bear = 0;
+
+  const add = (direction, points) => {
+    if (direction === 'BULLISH') bull += points;
+    if (direction === 'BEARISH') bear += points;
   };
 
-  add(e9[j]>e21[j]?'BULLISH':'BEARISH',3);
-  add(rv[j]>50&&rv[j]<70?'BULLISH':rv[j]<50&&rv[j]>30?'BEARISH':'NEUTRAL',2);
-  add(mc.histogram[j]>0?'BULLISH':mc.histogram[j]<0?'BEARISH':'NEUTRAL',2);
-  add(pat.direction,pat.name.includes('ENGULFING')||pat.name.includes('STAR')?8:4);
-  add(psy.direction,4);
-  add(sr.direction,4);
-  add(tl.direction,3);
-  add(bo.direction,bo.status.includes('FALSE')?0:4);
+  add(
+    ema9[last] > ema21[last]
+      ? 'BULLISH'
+      : 'BEARISH',
+    3
+  );
 
-  const d=bull>bear?'BULLISH':bear>bull?'BEARISH':'NEUTRAL';
-  const win=Math.max(bull,bear);
-  const gap=Math.abs(bull-bear);
-  const atrPct=av[j]/s.at(-1).close*100;
+  add(
+    rsi14[last] > 50 && rsi14[last] < 70
+      ? 'BULLISH'
+      : rsi14[last] < 50 && rsi14[last] > 30
+        ? 'BEARISH'
+        : 'NEUTRAL',
+    2
+  );
 
-  const sorted=bb.width.filter(finite).sort((a,b)=>a-b);
-  const high=sorted[Math.floor((sorted.length-1)*.75)];
+  add(
+    macdValues.histogram[last] > 0
+      ? 'BULLISH'
+      : macdValues.histogram[last] < 0
+        ? 'BEARISH'
+        : 'NEUTRAL',
+    2
+  );
 
-  if(
-    d==='NEUTRAL'||
-    win<25||
-    gap<7||
-    fd!==d||
-    bb.width[j]>=high||
-    bo.status.startsWith('FALSE')
-  ){
+  add(
+    pattern.direction,
+    pattern.name.includes('ENGULFING') ||
+      pattern.name.includes('STAR')
+      ? 8
+      : 4
+  );
+
+  add(psychologyResult.direction, 4);
+  add(supportResistance.direction, 4);
+  add(trend.direction, 3);
+
+  add(
+    breakoutResult.direction,
+    breakoutResult.status.includes('FALSE') ? 0 : 4
+  );
+
+  const direction =
+    bull > bear
+      ? 'BULLISH'
+      : bear > bull
+        ? 'BEARISH'
+        : 'NEUTRAL';
+
+  const winning = Math.max(bull, bear);
+  const gap = Math.abs(bull - bear);
+
+  const sortedWidths = bands.width
+    .filter(finite)
+    .sort((a, b) => a - b);
+
+  const highWidth = sortedWidths[
+    Math.floor((sortedWidths.length - 1) * 0.75)
+  ];
+
+  if (
+    direction === 'NEUTRAL' ||
+    winning < 25 ||
+    gap < 7 ||
+    fiveDirection !== direction ||
+    bands.width[last] >= highWidth ||
+    breakoutResult.status.startsWith('FALSE')
+  ) {
     return null;
   }
 
-  return d==='BULLISH'?'BUY':'SELL';
+  return direction === 'BULLISH' ? 'BUY' : 'SELL';
 }
 
-function runWalkForward(cs,expiry=1){
-  const h=clamp(Number(expiry)||1,1,3);
-  const split=Math.floor(cs.length*.7);
-  const start=Math.max(MIN_CANDLES,Math.floor(cs.length*.25));
+function runWalkForward(candles, expiry = 1) {
+  const duration = clamp(Number(expiry) || 1, 1, 3);
+  const split = Math.floor(candles.length * 0.7);
+  const start = Math.max(
+    MIN_CANDLES,
+    Math.floor(candles.length * 0.25)
+  );
 
-  let devN=0,devW=0,testN=0,testW=0,eligible=0;
+  let developmentSignals = 0;
+  let developmentHits = 0;
+  let holdoutSignals = 0;
+  let holdoutHits = 0;
+  let eligible = 0;
 
-  for(let i=start;i+h<cs.length-1;i++){
-    const d=historicalSignal(cs,i);
+  for (
+    let index = start;
+    index + duration < candles.length - 1;
+    index++
+  ) {
+    const direction = historicalSignal(candles, index);
 
-    if(!d)continue;
+    if (!direction) continue;
 
     eligible++;
 
-    const entry=cs[i+1].open;
-    const exit=cs[i+h].close;
+    const entry = candles[index + 1].open;
+    const exit = candles[index + duration].close;
 
-    if(!finite(entry)||!finite(exit)||entry===exit)continue;
+    if (!finite(entry) || !finite(exit) || entry === exit) {
+      continue;
+    }
 
-    const hit=d==='BUY'?exit>entry:exit<entry;
+    const hit =
+      direction === 'BUY'
+        ? exit > entry
+        : exit < entry;
 
-    if(i<split){
-      devN++;
-      if(hit)devW++;
-    }else{
-      testN++;
-      if(hit)testW++;
+    if (index < split) {
+      developmentSignals++;
+
+      if (hit) developmentHits++;
+    } else {
+      holdoutSignals++;
+
+      if (hit) holdoutHits++;
     }
   }
 
-  const rate=testN?testW/testN*100:null;
-  const devRate=devN?devW/devN*100:null;
-  const sufficient=testN>=BACKTEST_MIN_SIGNALS;
+  const holdoutRate = holdoutSignals
+    ? holdoutHits / holdoutSignals * 100
+    : null;
+
+  const developmentRate = developmentSignals
+    ? developmentHits / developmentSignals * 100
+    : null;
+
+  const sufficient =
+    holdoutSignals >= BACKTEST_MIN_SIGNALS;
 
   return {
-    method:'CHRONOLOGICAL WALK-FORWARD · NEXT-CANDLE OPEN ENTRY',
-    lookAheadBiasControl:'Decision uses completed candles through index i; entry is next candle open; exit is expiry candle close.',
-    expiryMinutes:h,
-    candles:cs.length,
-    coveragePercent:cs.length
-      ?round(eligible/(cs.length-start-h)*100,2)
-      :0,
-    development:{
-      signals:devN,
-      hits:devW,
-      hitRate:round(devRate,2)
+    method:
+      'CHRONOLOGICAL WALK-FORWARD · NEXT-CANDLE OPEN ENTRY',
+    lookAheadBiasControl:
+      'Decision uses completed candles through index i; entry is next candle open; exit is expiry candle close.',
+    expiryMinutes: duration,
+    candles: candles.length,
+    coveragePercent: candles.length
+      ? round(
+          eligible / Math.max(1, candles.length - start - duration) * 100,
+          2
+        )
+      : 0,
+    development: {
+      signals: developmentSignals,
+      hits: developmentHits,
+      hitRate: round(developmentRate, 2)
     },
-    holdout:{
-      signals:testN,
-      hits:testW,
-      hitRate:round(rate,2),
-      baselinePercent:50,
-      sufficientSample:sufficient
+    holdout: {
+      signals: holdoutSignals,
+      hits: holdoutHits,
+      hitRate: round(holdoutRate, 2),
+      baselinePercent: 50,
+      sufficientSample: sufficient
     },
-    totalSignals:devN+testN,
-    conclusion:!sufficient
-      ?'INSUFFICIENT HOLDOUT SAMPLE — no performance claim.'
-      :rate>50
-        ?'Holdout exceeded 50% directional reference in this sample only; not a guarantee.'
-        :'Holdout did not exceed the 50% directional reference.',
-    limitations:[
+    totalSignals:
+      developmentSignals + holdoutSignals,
+    conclusion: !sufficient
+      ? 'INSUFFICIENT HOLDOUT SAMPLE — no performance claim.'
+      : holdoutRate > 50
+        ? 'Holdout exceeded 50% directional reference in this sample only; not a guarantee.'
+        : 'Holdout did not exceed the 50% directional reference.',
+    limitations: [
       'No broker spread, payout, slippage or execution latency model.',
+      'Historical candles are not Pocket Option execution prices.',
       'This is a research comparison, not a probability forecast.'
     ],
-    warning:'Historical results do not predict or guarantee future outcomes.'
+    warning:
+      'Historical results do not predict or guarantee future outcomes.'
   };
 }
 
-/* API routes retained for existing V10.1 frontend compatibility. */
-app.get('/',(_req,res)=>res.json({
-  ok:true,
-  name:'PO AI Predictor API',
-  version:VERSION,
-  mode:'LIVE FOREX ONLY',
-  endpoints:[
-    '/api/health',
-    '/api/best',
-    '/api/analyze',
-    '/api/scan',
-    '/api/history',
-    '/api/backtest'
-  ]
-}));
+/* -------------------------------------------------------
+   API ROUTES
+------------------------------------------------------- */
 
-app.get('/api/health',(_req,res)=>res.json({
-  ok:true,
-  version:VERSION,
-  provider:'Twelve Data LIVE',
-  configured:Boolean(API_KEY),
-  mode:'LIVE FOREX ONLY',
-  scannerRunning,
-  scannerEnabled:Boolean(API_KEY),
-  scannerMode:'FIRST 6 OF 24; BACKGROUND 18 NOT IN INITIAL SCAN',
-  scannerStartedAt,
-  lastScanAt,
-  totalScanned,
-  priorityPairs:PRIORITY_PAIRS,
-  backgroundPairs:BACKGROUND_PAIRS,
-  scanProgress:{...scanProgress},
-  cooldownRemainingMs:Math.max(
-    0,
-    SCAN_COOLDOWN_MS-(Date.now()-lastScanStartedAtMs)
-  ),
-  metadata:metadata()
-}));
-
-app.get('/api/best',(_req,res)=>{
-  const a=getCurrentAnalysis();
-  res.json(makeResponse(a.selectedMarket,a.rankedCandidates));
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    name: 'PO AI Predictor API',
+    version: VERSION,
+    mode: 'LIVE FOREX ONLY',
+    endpoints: [
+      '/api/health',
+      '/api/best',
+      '/api/analyze',
+      '/api/scan',
+      '/api/history',
+      '/api/backtest'
+    ]
+  });
 });
 
-app.get('/api/analyze',async(req,res)=>{
-  const rawPair=req.query.pair;
-  const pair=rawPair?normalizePair(rawPair):null;
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    version: VERSION,
+    provider: 'Twelve Data LIVE',
+    configured: Boolean(API_KEY),
+    mode: 'LIVE FOREX ONLY',
+    scannerRunning,
+    scannerEnabled: Boolean(API_KEY),
+    scannerMode: 'FIRST 6 OF 24',
+    scannerStartedAt,
+    lastScanAt,
+    totalScanned,
+    priorityPairs: PRIORITY_PAIRS,
+    backgroundPairs: BACKGROUND_PAIRS,
+    scanProgress: { ...scanProgress },
+    cooldownRemainingMs: Math.max(
+      0,
+      SCAN_COOLDOWN_MS -
+        (Date.now() - lastScanStartedAtMs)
+    ),
+    brokerPriceMode:
+      'MANUAL USER-ENTERED POCKET OPTION PRICE',
+    brokerPriceTolerancePips:
+      DEFAULT_MAX_PRICE_GAP_PIPS,
+    metadata: metadata()
+  });
+});
 
-  if(rawPair&&!pair){
+app.get('/api/best', (_req, res) => {
+  const analysis = getCurrentAnalysis();
+
+  res.json(
+    makeResponse(
+      analysis.selectedMarket,
+      analysis.rankedCandidates
+    )
+  );
+});
+
+app.get('/api/analyze', async (req, res) => {
+  const rawPair = req.query.pair;
+  const pair = rawPair
+    ? normalizePair(rawPair)
+    : null;
+
+  if (rawPair && !pair) {
     return res.status(400).json({
-      ok:false,
-      version:VERSION,
-      error:'Invalid pair. Select one of the supported 24 LIVE forex pairs.'
+      ok: false,
+      version: VERSION,
+      error:
+        'Invalid pair. Select one of the supported 24 LIVE forex pairs.'
     });
   }
 
-  // Explicit user selection is always honored; scanner selection never overrides it.
-  if(pair){
-    try{
-      let data=await getPairData(pair,false);
-      let m=evaluateFreshness(scoreMarket(data.candles,pair,data.fetchedAt));
+  /*
+   * Explicit pair selection:
+   * The user-selected pair is never replaced by AUTO ranking.
+   */
+  if (pair) {
+    try {
+      let data = await getPairData(pair, false);
 
-      if(m.freshness!=='FRESH'){
-        data=await getPairData(pair,true);
-        m=evaluateFreshness(scoreMarket(data.candles,pair,data.fetchedAt));
+      let market = evaluateFreshness(
+        scoreMarket(data.candles, pair, data.fetchedAt)
+      );
+
+      if (market.freshness !== 'FRESH') {
+        data = await getPairData(pair, true);
+
+        market = evaluateFreshness(
+          scoreMarket(data.candles, pair, data.fetchedAt)
+        );
       }
 
-      latestMarkets.set(pair,m);
-      const all=getCurrentAnalysis();
+      latestMarkets.set(pair, market);
 
-      return res.json(makeResponse(m,all.rankedCandidates,{
-        selectedPair:pair,
-        analysisMode:'USER SELECTED PAIR',
-        note:`Analysis is for selected pair ${pair}; it is not replaced by scanner ranking.`
-      }));
-    }catch(e){
+      const brokerPrice = req.query.brokerPrice;
+
+      if (
+        brokerPrice !== undefined &&
+        brokerPrice !== ''
+      ) {
+        market = applyBrokerPrice(
+          market,
+          brokerPrice
+        );
+
+        if (market.tradeAllowed === true) {
+          const record = createSignalRecord(market);
+
+          if (record) {
+            await saveSignal(record);
+          }
+        }
+      }
+
+      const analysis = getCurrentAnalysis();
+
+      return res.json(
+        makeResponse(
+          market,
+          analysis.rankedCandidates,
+          {
+            selectedPair: pair,
+            analysisMode: 'USER SELECTED PAIR',
+            note:
+              'Analysis is for the selected pair. Manual broker price is required before a live research direction is confirmed.'
+          }
+        )
+      );
+    } catch (error) {
       return res.status(503).json({
-        ok:false,
-        version:VERSION,
-        selectedPair:pair,
-        error:String(e.message||e),
-        selectedMarket:emptyMarket(pair,'Selected-pair analysis failed.')
+        ok: false,
+        version: VERSION,
+        selectedPair: pair,
+        error: String(error.message || error),
+        selectedMarket: emptyMarket(
+          pair,
+          'Selected-pair analysis could not be completed.'
+        )
       });
     }
   }
 
-  // AI mode: trigger priority scan if no recent six-pair batch exists.
-  const started=startScanIfPossible();
-  const a=getCurrentAnalysis();
+  /*
+   * AUTO mode:
+   * Start or monitor the first-six-pair scan.
+   * A selected technical candidate is not an executable signal
+   * until its broker price is submitted separately.
+   */
+  const started = startScanIfPossible();
+  const analysis = getCurrentAnalysis();
 
-  return res.json(makeResponse(a.selectedMarket,a.rankedCandidates,{
-    analysisMode:'AI PRIORITY SCAN',
-    scanStarted:started,
-    note:'AI mode scans the first six priority pairs. The 18 background pairs do not delay the initial selection.'
-  }));
+  return res.json(
+    makeResponse(
+      analysis.selectedMarket,
+      analysis.rankedCandidates,
+      {
+        analysisMode: 'AI PRIORITY SCAN',
+        scanStarted: started,
+        note:
+          'AI scans the first six priority pairs. No BUY/SELL is confirmed until a manual Pocket Option price is submitted for the selected pair.'
+      }
+    )
+  );
 });
 
-app.post('/api/scan',(_req,res)=>{
-  if(!API_KEY){
+app.post('/api/scan', (_req, res) => {
+  if (!API_KEY) {
     return res.status(503).json({
-      ok:false,
-      version:VERSION,
-      error:'Twelve Data API key is not configured.'
+      ok: false,
+      version: VERSION,
+      error: 'Twelve Data API key is not configured.'
     });
   }
 
-  if(scannerRunning){
+  if (scannerRunning) {
     return res.status(409).json({
-      ok:false,
-      version:VERSION,
-      error:'Priority scanner is already running.',
-      scanner:{
-        running:true,
-        progress:{...scanProgress}
+      ok: false,
+      version: VERSION,
+      error: 'Priority scanner is already running.',
+      scanner: {
+        running: true,
+        progress: { ...scanProgress }
       }
     });
   }
 
-  const remaining=Math.max(
+  const remaining = Math.max(
     0,
-    SCAN_COOLDOWN_MS-(Date.now()-lastScanStartedAtMs)
+    SCAN_COOLDOWN_MS -
+      (Date.now() - lastScanStartedAtMs)
   );
 
-  if(lastScanStartedAtMs&&remaining>0){
+  if (lastScanStartedAtMs && remaining > 0) {
     return res.status(429).json({
-      ok:false,
-      version:VERSION,
-      error:'Please wait before starting another priority scan.',
-      cooldownRemainingMs:remaining
+      ok: false,
+      version: VERSION,
+      error:
+        'Please wait before starting another priority scan.',
+      cooldownRemainingMs: remaining
     });
   }
 
-  const started=startScanIfPossible();
+  const started = startScanIfPossible();
 
-  return res.status(started?202:429).json({
-    ok:started,
-    version:VERSION,
-    message:started
-      ?'Six-pair LIVE forex priority scan started.'
-      :'Priority scan could not start.',
-    scanner:{
-      running:scannerRunning,
-      progress:{...scanProgress},
-      priorityPairs:PRIORITY_PAIRS,
-      backgroundPairs:BACKGROUND_PAIRS
+  return res.status(started ? 202 : 429).json({
+    ok: started,
+    version: VERSION,
+    message: started
+      ? 'Six-pair LIVE forex priority scan started.'
+      : 'Priority scan could not start.',
+    scanner: {
+      running: scannerRunning,
+      progress: { ...scanProgress },
+      priorityPairs: PRIORITY_PAIRS,
+      backgroundPairs: BACKGROUND_PAIRS
     }
   });
 });
 
-app.get('/api/history',async(req,res)=>{
-  const history=await getHistory(req.query.limit);
+app.get('/api/history', async (req, res) => {
+  const history = await getHistory(req.query.limit);
 
   res.json({
-    ok:true,
-    version:VERSION,
-    storage:databaseReady?'POSTGRESQL':'MEMORY_ONLY',
-    persistent:databaseReady,
-    count:history.length,
+    ok: true,
+    version: VERSION,
+    storage: databaseReady
+      ? 'POSTGRESQL'
+      : 'MEMORY_ONLY',
+    persistent: databaseReady,
+    count: history.length,
     history
   });
 });
 
-app.get('/api/backtest',async(req,res)=>{
-  const pair=normalizePair(req.query.pair||'EUR/USD');
-  const expiry=Number(req.query.expiry||1);
+app.get('/api/backtest', async (req, res) => {
+  const pair = normalizePair(
+    req.query.pair || 'EUR/USD'
+  );
 
-  if(!pair){
+  const expiry = Number(req.query.expiry || 1);
+
+  if (!pair) {
     return res.status(400).json({
-      ok:false,
-      error:'Invalid currency pair.'
+      ok: false,
+      error: 'Invalid currency pair.'
     });
   }
 
-  if(![1,2,3].includes(expiry)){
+  if (![1, 2, 3].includes(expiry)) {
     return res.status(400).json({
-      ok:false,
-      error:'Expiry must be 1, 2 or 3 minutes.'
+      ok: false,
+      error: 'Expiry must be 1, 2 or 3 minutes.'
     });
   }
 
-  try{
-    const d=await getPairData(pair,false);
-    const cs=closedCandles(d.candles);
-    const result=runWalkForward(cs,expiry);
+  try {
+    const data = await getPairData(pair, false);
+    const candles = closedCandles(data.candles);
+
+    const result = runWalkForward(candles, expiry);
 
     return res.json({
-      ok:true,
-      version:VERSION,
+      ok: true,
+      version: VERSION,
       pair,
       result,
-      source:'Twelve Data LIVE historical candles',
-      note:'Backtest uses next-candle open entry. Provider history depth and missing-candle gaps limit coverage.'
+      source: 'Twelve Data LIVE historical candles',
+      note:
+        'Backtest uses next-candle open entry. It does not model Pocket Option payout, spread, slippage or execution latency.'
     });
-  }catch(e){
+  } catch (error) {
     return res.status(503).json({
-      ok:false,
-      version:VERSION,
+      ok: false,
+      version: VERSION,
       pair,
-      error:String(e.message||e)
+      error: String(error.message || error)
     });
   }
 });
 
-if(require.main===module){
-  initializeDatabase().finally(()=>{
-    app.listen(PORT,()=>{
-      console.log(`PO AI Predictor ${VERSION} listening on ${PORT}`);
+/* -------------------------------------------------------
+   SERVER START
+------------------------------------------------------- */
+
+if (require.main === module) {
+  initializeDatabase().finally(() => {
+    app.listen(PORT, () => {
+      console.log(
+        `PO AI Predictor ${VERSION} listening on ${PORT}`
+      );
+
       console.log('Mode: LIVE FOREX ONLY');
-      console.log(`Twelve Data configured: ${Boolean(API_KEY)}`);
-      console.log(`PostgreSQL configured: ${Boolean(DATABASE_URL)}`);
+      console.log(
+        `Twelve Data configured: ${Boolean(API_KEY)}`
+      );
+
+      console.log(
+        `PostgreSQL configured: ${Boolean(DATABASE_URL)}`
+      );
     });
   });
 }
 
-module.exports=app;
+module.exports = app;
