@@ -1,4 +1,3 @@
-
 'use strict';
 
 (() => {
@@ -15,7 +14,7 @@
     REQUEST_TIMEOUT_MS: 35000,
     HEALTH_TIMEOUT_MS: 12000,
     MAX_DATA_AGE_SECONDS: 150,
-    MAX_BROKER_PRICE_AGE_SECONDS: 60,
+    MAX_BROKER_PRICE_AGE_SECONDS: 30,
     MAX_REASONS: 10,
     LIVE_EXPIRY_MINUTES: 1,
     INITIAL_PIP_TOLERANCE: 3
@@ -918,7 +917,8 @@
     const brokerValidated =
       broker.validated === true ||
       brokerStatus === 'VALIDATED' ||
-      brokerStatus === 'ACCEPTED';
+      brokerStatus === 'ACCEPTED' ||
+      brokerStatus === 'WITHIN_TOLERANCE';
 
     const signal = getSignal(market);
 
@@ -947,7 +947,8 @@
 
     const differencePips = number(first(
       broker.differencePips,
-      market.priceDifferencePips
+      market.priceDifferencePips,
+      market.brokerPriceGapPips
     ));
 
     setText('resultPair', pair);
@@ -1067,9 +1068,7 @@
       direction,
       market
     };
-  }
-
-  function renderScanner(payload) {
+  }  function renderScanner(payload) {
     const root = obj(payload);
     const scanner = obj(root.scanner);
     const progress = obj(scanner.progress);
@@ -1277,7 +1276,7 @@
         if (
           scanner.running === true ||
           !market.pair ||
-          market.pair === 'NO MARKET'
+          !PAIRS.includes(String(market.pair).toUpperCase())
         ) {
           showPendingAutoScan(payload);
           startScannerPolling(requestId);
@@ -1551,11 +1550,19 @@
 
       stopScannerPolling();
 
+      /*
+       * Only render a selected market if its pair is one of
+       * the supported 24 LIVE forex pairs. The backend may return
+       * "NO QUALIFIED PAIR" when no candidate passes its filters.
+       */
+      const hasQualifiedPair = PAIRS.includes(
+        String(market.pair || '').toUpperCase()
+      );
+
       if (
         requestId !== null &&
         state.autoSelecting &&
-        market.pair &&
-        market.pair !== 'NO MARKET'
+        hasQualifiedPair
       ) {
         const selectedMarket = renderMarket(payload);
 
@@ -1586,8 +1593,14 @@
           'signalReason',
           first(
             payload.diagnostic?.lastScanError,
+            market.reasons?.[0],
             'No qualifying priority pair is currently available.'
           )
+        );
+
+        setText(
+          'signalWarning',
+          'No priority pair passed all required checks. No signal was issued.'
         );
 
         clearBrokerPrice();
@@ -1679,9 +1692,7 @@
         'REFRESH SCANNER'
       );
     }
-  }
-
-  async function loadHistory() {
+  }  async function loadHistory() {
     if (state.historyBusy) return;
 
     state.historyBusy = true;
