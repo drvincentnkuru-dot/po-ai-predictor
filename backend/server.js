@@ -646,9 +646,7 @@ function rsi(values, period = 14) {
   if (values.length <= period) return output;
 
   let gains = 0;
-  let losses = 0;
-
-  for (let i = 1; i <= period; i++) {
+  let losses = 0;  for (let i = 1; i <= period; i++) {
     const difference = values[i] - values[i - 1];
 
     gains += Math.max(difference, 0);
@@ -1306,9 +1304,7 @@ function volatility(atrValues, widths, candles) {
     lowWidthThreshold: round(low, 5),
     highWidthThreshold: round(high, 5)
   };
-}
-
-/* -------------------------------------------------------
+}/* -------------------------------------------------------
    MARKET ANALYSIS AND SIGNAL QUALIFICATION
 ------------------------------------------------------- */
 
@@ -1752,7 +1748,11 @@ function evaluateFreshness(market, now = Date.now()) {
    POCKET OPTION MANUAL PRICE VALIDATION
 ------------------------------------------------------- */
 
-function applyBrokerPrice(market, brokerPriceValue) {
+function applyBrokerPrice(
+  market,
+  brokerPriceValue,
+  capturedAtMs = Date.now()
+) {
   const result = {
     ...market,
     signal: 'NO TRADE',
@@ -1785,7 +1785,8 @@ function applyBrokerPrice(market, brokerPriceValue) {
   }
 
   result.brokerPrice = brokerPrice;
-  result.brokerPriceSubmittedAt = iso(Date.now());
+  result.brokerPriceSubmittedAt = iso(capturedAtMs);
+  result.brokerPriceCapturedAt = iso(capturedAtMs);
   result.brokerPriceSource = 'USER ENTERED POCKET OPTION PRICE';
 
   if (market.freshness !== 'FRESH') {
@@ -2178,9 +2179,7 @@ function startScanIfPossible() {
   });
 
   return true;
-}
-
-/* -------------------------------------------------------
+}/* -------------------------------------------------------
    WALK-FORWARD BACKTEST
 ------------------------------------------------------- */
 
@@ -2430,6 +2429,7 @@ app.get('/', (_req, res) => {
       '/api/best',
       '/api/analyze',
       '/api/scan',
+      '/api/confirm-signal',
       '/api/history',
       '/api/backtest'
     ]
@@ -2461,6 +2461,8 @@ app.get('/api/health', (_req, res) => {
       'MANUAL USER-ENTERED POCKET OPTION PRICE',
     brokerPriceTolerancePips:
       DEFAULT_MAX_PRICE_GAP_PIPS,
+    brokerPriceMaxAgeSeconds:
+      BROKER_PRICE_MAX_AGE_MS / 1000,
     metadata: metadata()
   });
 });
@@ -2635,6 +2637,136 @@ app.post('/api/scan', (_req, res) => {
       priorityPairs: PRIORITY_PAIRS,
       backgroundPairs: BACKGROUND_PAIRS
     }
+  });
+});
+
+/*
+ * Confirm the exact pair selected and analyzed by the frontend.
+ * Pocket Option price is manually entered by the user.
+ * The backend checks its timestamp and compares it with
+ * the latest Twelve Data reference price.
+ */
+app.post('/api/confirm-signal', async (req, res) => {
+  const body = req.body && typeof req.body === 'object'
+    ? req.body
+    : {};
+
+  const pair = normalizePair(body.pair);
+
+  if (!pair) {
+    return res.status(400).json({
+      ok: false,
+      version: VERSION,
+      error: 'A valid selected LIVE forex pair is required.'
+    });
+  }
+
+  if (Number(body.expiryMinutes) !== 1) {
+    return res.status(400).json({
+      ok: false,
+      version: VERSION,
+      error: 'Live confirmation supports one-minute signals only.'
+    });
+  }
+
+  if (
+    body.source !==
+    'USER_ENTERED_POCKET_OPTION_PRICE'
+  ) {
+    return res.status(400).json({
+      ok: false,
+      version: VERSION,
+      error:
+        'Pocket Option price must be submitted as a user-entered quote.'
+    });
+  }
+
+  const capturedAtMs = Date.parse(
+    String(body.brokerPriceCapturedAt || '')
+  );
+
+  const now = Date.now();
+
+  if (
+    !Number.isFinite(capturedAtMs) ||
+    capturedAtMs > now + 5000 ||
+    now - capturedAtMs > BROKER_PRICE_MAX_AGE_MS
+  ) {
+    return res.status(400).json({
+      ok: false,
+      version: VERSION,
+      error:
+        'Pocket Option price timestamp is invalid or older than 30 seconds. Enter the current price and confirm again.'
+    });
+  }
+
+  const storedMarket = latestMarkets.get(pair);
+
+  if (!storedMarket) {
+    return res.status(409).json({
+      ok: false,
+      version: VERSION,
+      error:
+        'Analyze this exact pair first. No recent market analysis is available.'
+    });
+  }
+
+  const freshMarket = evaluateFreshness(storedMarket);
+
+  const confirmedMarket = applyBrokerPrice(
+    freshMarket,
+    body.brokerPrice,
+    capturedAtMs
+  );
+
+  let recordSaved = false;
+
+  if (confirmedMarket.tradeAllowed === true) {
+    const record = createSignalRecord(confirmedMarket);
+
+    if (record) {
+      await saveSignal(record);
+      recordSaved = true;
+    }
+  }
+
+  const validated =
+    confirmedMarket.tradeAllowed === true;
+
+  const failureReason =
+    (confirmedMarket.reasons || []).slice(-1)[0] ||
+    'Broker price validation did not pass.';
+
+  return res.json({
+    ok: true,
+    version: VERSION,
+    pair,
+    selectedPair: pair,
+    tradeAllowed: validated,
+    selectedMarket: confirmedMarket,
+    market: confirmedMarket,
+    brokerPrice: {
+      validated,
+      status: validated
+        ? 'VALIDATED'
+        : confirmedMarket.brokerPriceStatus,
+      price: confirmedMarket.brokerPrice,
+      referencePrice: confirmedMarket.currentPrice,
+      differencePips: confirmedMarket.brokerPriceGapPips,
+      tolerancePips: DEFAULT_MAX_PRICE_GAP_PIPS,
+      capturedAt: iso(capturedAtMs),
+      source: 'USER_ENTERED_POCKET_OPTION_PRICE',
+      reason: validated
+        ? 'Pocket Option user-entered price passed the configured tolerance.'
+        : failureReason
+    },
+    entryPrice: confirmedMarket.entryPrice,
+    entryTime: confirmedMarket.entryTime,
+    expiryTime: confirmedMarket.expiryTime,
+    recordSaved,
+    reason: validated
+      ? 'All backend confirmation checks passed. One-minute research signal only; no guaranteed outcome.'
+      : failureReason
   });
 });
 
