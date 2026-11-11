@@ -5,32 +5,28 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#07111f">
-  <meta name="description" content="PO AI Predictor — live forex research, evidence-based market analysis and walk-forward evaluation.">
-  <title>PO AI Predictor V10.1.0 | Live Forex Research</title>
+  <meta name="description" content="PO AI Predictor V10.3.0 — live forex research, evidence-based market analysis and walk-forward evaluation.">
+  <title>PO AI Predictor V10.3.0 | Live Forex Research</title>
   <link rel="stylesheet" href="style.css">
   <script src="script.js" defer></script>
 </head>
-
 <body>
   <div class="app-shell">
 
-    <!-- HEADER -->
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark">PO</div>
         <div class="brand-copy">
           <h1>PO AI PREDICTOR</h1>
-          <p>V10.1.0 · LIVE FOREX RESEARCH</p>
+          <p>V10.3.0 · LIVE FOREX RESEARCH</p>
         </div>
       </div>
-
       <div class="header-status">
         <span class="status-indicator" id="apiStatusDot"></span>
         <span id="apiStatusText">CONNECTING TO API</span>
       </div>
     </header>
 
-    <!-- PROJECT DISCLAIMER -->
     <section class="notice-panel">
       <div class="notice-heading">
         <span class="notice-icon">ⓘ</span>
@@ -44,26 +40,22 @@
       </p>
     </section>
 
-    <!-- MARKET STATUS -->
     <section class="status-grid">
       <article class="status-card">
         <span class="status-label">API STATUS</span>
         <strong id="apiStatusCard">CONNECTING</strong>
         <small id="apiStatusDetail">Checking backend connection</small>
       </article>
-
       <article class="status-card">
         <span class="status-label">DATA PROVIDER</span>
         <strong id="providerStatus">TWELVE DATA</strong>
         <small id="providerDetail">Waiting for provider data</small>
       </article>
-
       <article class="status-card">
         <span class="status-label">MARKET DATA</span>
         <strong id="marketFreshness">CHECKING</strong>
         <small id="marketFreshnessDetail">Freshness not yet verified</small>
       </article>
-
       <article class="status-card">
         <span class="status-label">PAIRS TRACKED</span>
         <strong id="pairsTracked">24</strong>
@@ -71,15 +63,16 @@
       </article>
     </section>
 
-    <!-- MAIN ANALYSIS -->
     <main>
-
       <section class="panel analysis-panel" id="analysisSection">
         <div class="section-heading">
           <div>
             <span class="eyebrow">MARKET ANALYSIS</span>
-            <h2>Analyze a currency pair</h2>
-            <p>Select a pair to analyze it. The selected pair must be respected by the analysis.</p>
+            <h2>Analyze the forex market</h2>
+            <p>
+              AUTO SELECT scans the first six priority pairs and selects only a
+              fully qualified candidate. You can also choose a pair manually.
+            </p>
           </div>
           <span class="live-label"><span class="live-dot"></span> LIVE FOREX</span>
         </div>
@@ -88,6 +81,7 @@
           <div class="field-group">
             <label for="pairSelect">CURRENCY PAIR</label>
             <select id="pairSelect">
+              <option value="AI AUTO SELECT" selected>AI AUTO SELECT</option>
               <option value="EUR/USD">EUR/USD</option>
               <option value="GBP/USD">GBP/USD</option>
               <option value="USD/JPY">USD/JPY</option>
@@ -116,25 +110,25 @@
           </div>
 
           <div class="field-group">
-            <label for="expirySelect">BACKTEST / SIGNAL DURATION</label>
+            <label for="expirySelect">LIVE SIGNAL DURATION</label>
             <select id="expirySelect">
-              <option value="1">1 minute</option>
+              <option value="1" selected>1 minute</option>
               <option value="2">2 minutes</option>
               <option value="3">3 minutes</option>
             </select>
+            <small>Live signals use 1-minute expiry. 2m and 3m are for backtesting.</small>
           </div>
 
           <button type="button" class="primary-button" id="analyzeButton">
-            ANALYZE SELECTED PAIR
+            ANALYZE
           </button>
         </div>
 
         <div class="analysis-message" id="analysisMessage" role="status">
-          Select a currency pair, then press Analyze.
+          Press Analyze to start the live market assessment.
         </div>
       </section>
 
-      <!-- SIGNAL RESULT -->
       <section class="panel signal-panel" id="signalPanel">
         <div class="section-heading">
           <div>
@@ -169,27 +163,22 @@
             <span class="status-label">SELECTED PAIR</span>
             <strong id="resultPair">--</strong>
           </div>
-
           <div class="detail-card">
             <span class="status-label">ENTRY TIME</span>
             <strong id="entryTime">--</strong>
           </div>
-
           <div class="detail-card">
             <span class="status-label">ENTRY PRICE</span>
             <strong id="entryPrice">WAITING</strong>
           </div>
-
           <div class="detail-card">
             <span class="status-label">EXPIRY TIME</span>
             <strong id="expiryTime">--</strong>
           </div>
-
           <div class="detail-card">
             <span class="status-label">DURATION</span>
             <strong id="signalDuration">--</strong>
           </div>
-
           <div class="detail-card">
             <span class="status-label">SIGNAL STATUS</span>
             <strong id="signalStatus">WAITING</strong>
@@ -197,18 +186,21 @@
         </div>
 
         <div class="signal-warning" id="signalWarning">
-          No actionable signal has been confirmed. An estimated direction must not
-          be treated as an executable entry without a verified entry price and fresh data.
+          No actionable signal has been confirmed. A direction must not be treated
+          as an executable entry without a verified entry price, fresh data and
+          completed 1-minute and 5-minute confirmation.
         </div>
       </section>
 
-      <!-- SCANNER -->
       <section class="panel">
         <div class="section-heading">
           <div>
             <span class="eyebrow">PAIR SCANNER</span>
             <h2>Market opportunities</h2>
-            <p>Research candidates across the supported live forex pairs.</p>
+            <p>
+              AUTO SELECT initially assesses six priority pairs from the 24-pair
+              live forex universe.
+            </p>
           </div>
           <button type="button" class="secondary-button" id="refreshScannerButton">
             REFRESH SCANNER
@@ -217,7 +209,7 @@
 
         <div class="scanner-status">
           <span id="scannerStatus">Scanner waiting</span>
-          <span id="scannerProgress">0 / 24 pairs</span>
+          <span id="scannerProgress">0 / 6 priority pairs</span>
         </div>
 
         <div class="progress-track">
@@ -249,13 +241,12 @@
         </div>
       </section>
 
-      <!-- TECHNICAL ANALYSIS -->
       <section class="panel">
         <div class="section-heading">
           <div>
             <span class="eyebrow">TECHNICAL ANALYSIS</span>
-            <h2>Approved indicator readings</h2>
-            <p>Only the indicators and analysis methods agreed for this project are shown.</p>
+            <h2>Indicator readings</h2>
+            <p>Technical evidence from completed live candles.</p>
           </div>
           <span class="timeframe-tag">1M + 5M</span>
         </div>
@@ -266,49 +257,41 @@
             <strong id="emaSignal">--</strong>
             <small id="emaDetail">Crossover and trend direction</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">RSI 14</span>
             <strong id="rsiValue">--</strong>
             <small id="rsiSignal">Momentum condition</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">RSI DIVERGENCE</span>
             <strong id="rsiDivergence">--</strong>
             <small id="rsiDivergenceDetail">Bullish / bearish divergence</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">MACD</span>
             <strong id="macdSignal">--</strong>
             <small id="macdDetail">MACD direction and momentum</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">5-MINUTE TREND</span>
             <strong id="fiveMinuteTrend">--</strong>
             <small id="fiveMinuteDetail">Higher timeframe confirmation</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">ATR VOLATILITY</span>
             <strong id="atrValue">--</strong>
             <small id="atrDetail">Average true range</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">BOLLINGER BANDS</span>
             <strong id="bollingerSignal">--</strong>
             <small id="bollingerDetail">Price position within bands</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">BOLLINGER WIDTH</span>
             <strong id="bollingerWidth">--</strong>
             <small id="bollingerWidthDetail">Band expansion / contraction</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">VOLATILITY REGIME</span>
             <strong id="volatilityRegime">--</strong>
@@ -317,7 +300,6 @@
         </div>
       </section>
 
-      <!-- PRICE ACTION AND MARKET STRUCTURE -->
       <section class="panel">
         <div class="section-heading">
           <div>
@@ -332,43 +314,36 @@
             <strong id="candlestickPatterns">--</strong>
             <small id="candlestickDetail">Detected candle patterns and context</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">MARKET PSYCHOLOGY</span>
             <strong id="marketPsychology">--</strong>
-            <small id="psychologyDetail">Buying and selling pressure interpretation</small>
+            <small id="psychologyDetail">Buying and selling pressure</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">SUPPORT</span>
             <strong id="supportLevel">--</strong>
             <small id="supportDetail">Nearest relevant support level</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">RESISTANCE</span>
             <strong id="resistanceLevel">--</strong>
             <small id="resistanceDetail">Nearest relevant resistance level</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">TRENDLINE ANALYSIS</span>
             <strong id="trendlineSignal">--</strong>
             <small id="trendlineDetail">Trendline direction and interaction</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">BREAKOUT DETECTION</span>
             <strong id="breakoutSignal">--</strong>
             <small id="breakoutDetail">Confirmed or unconfirmed breakout</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">RETEST DETECTION</span>
             <strong id="retestSignal">--</strong>
             <small id="retestDetail">Retest and level validation</small>
           </article>
-
           <article class="technical-card">
             <span class="status-label">FALSE BREAKOUT</span>
             <strong id="falseBreakoutSignal">--</strong>
@@ -377,50 +352,15 @@
         </div>
       </section>
 
-      <!-- NEWS AND FUNDAMENTALS -->
-      <section class="panel">
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">FUNDAMENTAL CONTEXT</span>
-            <h2>News and economic risk</h2>
-            <p>News data must come from a configured and verifiable source.</p>
-          </div>
-        </div>
-
-        <div class="technical-grid">
-          <article class="technical-card">
-            <span class="status-label">NEWS STATUS</span>
-            <strong id="newsStatus">NOT CONFIGURED</strong>
-            <small id="newsDetail">No verified news feed available</small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">ECONOMIC EVENTS</span>
-            <strong id="economicEvents">UNVERIFIED</strong>
-            <small id="economicEventsDetail">Upcoming event risk not verified</small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">FUNDAMENTAL CONTEXT</span>
-            <strong id="fundamentalStatus">NOT CONFIGURED</strong>
-            <small id="fundamentalDetail">No verified fundamental feed available</small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">NEWS RISK FILTER</span>
-            <strong id="newsRiskFilter">UNVERIFIED</strong>
-            <small id="newsRiskDetail">Unknown news risk is not treated as safe</small>
-          </article>
-        </div>
-      </section>
-
-      <!-- SIGNAL HISTORY -->
       <section class="panel">
         <div class="section-heading">
           <div>
             <span class="eyebrow">SIGNAL TRACKING</span>
             <h2>Historical signal records</h2>
-            <p>Signals are stored for later evaluation and feedback.</p>
+            <p>
+              Qualified signals are stored for later evaluation. Unverified
+              outcomes remain pending.
+            </p>
           </div>
           <button type="button" class="secondary-button" id="refreshHistoryButton">
             REFRESH HISTORY
@@ -468,13 +408,15 @@
         </div>
       </section>
 
-      <!-- WALK-FORWARD BACKTEST -->
       <section class="panel">
         <div class="section-heading">
           <div>
             <span class="eyebrow">HISTORICAL VALIDATION</span>
             <h2>Walk-forward backtesting</h2>
-            <p>Evaluate strategy performance on historical data without using future data to create past signals.</p>
+            <p>
+              Chronological development and holdout evaluation. Backtesting
+              supports 1, 2 and 3-minute expiry.
+            </p>
           </div>
           <button type="button" class="primary-button" id="runBacktestButton">
             RUN BACKTEST
@@ -554,26 +496,23 @@
         </div>
 
         <div class="backtest-note">
-          Backtest results are historical research, not a promise of future performance.
-          A strategy should not be considered validated when the sample is too small,
-          coverage is poor, or performance does not exceed an appropriate baseline.
+          Backtest results are historical research, not a promise of future
+          performance. Results do not model broker spread, payout, slippage or
+          execution latency unless those costs are separately supplied.
         </div>
       </section>
-
     </main>
 
-    <!-- FOOTER -->
     <footer class="footer">
-      <div class="footer-brand">PO AI PREDICTOR · V10.1.0</div>
+      <div class="footer-brand">PO AI PREDICTOR · V10.3.0</div>
       <p>
-        Historical evidence and walk-forward analysis only. No guaranteed outcomes.
-        This tool does not provide financial advice. Trading involves risk.
+        Historical evidence and walk-forward analysis only. No guaranteed
+        outcomes. This tool does not provide financial advice. Trading involves risk.
       </p>
       <p class="footer-meta">
         LIVE FOREX ONLY · TWELVE DATA · OTC NOT INCLUDED
       </p>
     </footer>
-
   </div>
 </body>
 </html>
