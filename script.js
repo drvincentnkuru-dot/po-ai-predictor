@@ -1,3 +1,4 @@
+
 'use strict';
 
 (() => {
@@ -1068,7 +1069,9 @@
       direction,
       market
     };
-  }  function renderScanner(payload) {
+  }
+
+  function renderScanner(payload) {
     const root = obj(payload);
     const scanner = obj(root.scanner);
     const progress = obj(scanner.progress);
@@ -1361,6 +1364,22 @@
       throw new Error('The selected pair is not supported.');
     }
 
+    const capturedAtMs = Date.parse(
+      String(state.brokerPriceCapturedAt || '')
+    );
+
+    const quoteAgeMs = Date.now() - capturedAtMs;
+
+    if (
+      !Number.isFinite(capturedAtMs) ||
+      quoteAgeMs < -5000 ||
+      quoteAgeMs > CONFIG.MAX_BROKER_PRICE_AGE_SECONDS * 1000
+    ) {
+      throw new Error(
+        'Pocket Option price is older than 30 seconds. Enter or edit the price again before confirming.'
+      );
+    }
+
     return price;
   }
 
@@ -1405,10 +1424,13 @@
 
     state.confirmationBusy = true;
 
-    const capturedAt = new Date().toISOString();
+    /*
+     * Preserve the timestamp created by the input event.
+     * CONFIRM must never make an old quote appear newly entered.
+     */
+    const capturedAt = state.brokerPriceCapturedAt;
 
     state.brokerPrice = brokerPrice;
-    state.brokerPriceCapturedAt = capturedAt;
 
     setButtonBusy(
       dom.confirmSignalButton,
@@ -1692,7 +1714,9 @@
         'REFRESH SCANNER'
       );
     }
-  }  async function loadHistory() {
+  }
+
+  async function loadHistory() {
     if (state.historyBusy) return;
 
     state.historyBusy = true;
@@ -2025,8 +2049,32 @@
 
     dom.brokerPriceInput?.addEventListener('input', () => {
       /*
-       * Any price edit invalidates a previously confirmed direction.
-       * The user must validate the newly entered quote again.
+       * Record the time immediately whenever the user enters, pastes,
+       * or edits the Pocket Option quote. CONFIRM does not reset it.
+       */
+      const raw = String(
+        dom.brokerPriceInput?.value || ''
+      ).trim();
+
+      const price = Number(raw);
+
+      state.brokerPriceCapturedAt = raw
+        ? new Date().toISOString()
+        : null;
+
+      state.brokerPrice =
+        raw && Number.isFinite(price) && price > 0
+          ? price
+          : null;
+
+      setText(
+        'brokerPriceTimestamp',
+        raw ? formatDate(state.brokerPriceCapturedAt) : '—'
+      );
+
+      /*
+       * Any edit invalidates a previously confirmed direction.
+       * The newly entered quote must pass backend validation again.
        */
       if (state.lastMarket) {
         renderDirection('NO TRADE');
