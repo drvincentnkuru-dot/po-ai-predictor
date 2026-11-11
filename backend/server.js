@@ -1,3 +1,4 @@
+
 'use strict';
 
 const express = require('express');
@@ -1304,7 +1305,9 @@ function volatility(atrValues, widths, candles) {
     lowWidthThreshold: round(low, 5),
     highWidthThreshold: round(high, 5)
   };
-}/* -------------------------------------------------------
+}
+
+/* -------------------------------------------------------
    MARKET ANALYSIS AND SIGNAL QUALIFICATION
 ------------------------------------------------------- */
 
@@ -2179,7 +2182,9 @@ function startScanIfPossible() {
   });
 
   return true;
-}/* -------------------------------------------------------
+}
+
+/* -------------------------------------------------------
    WALK-FORWARD BACKTEST
 ------------------------------------------------------- */
 
@@ -2453,6 +2458,8 @@ app.get('/api/health', (_req, res) => {
     backgroundPairs: BACKGROUND_PAIRS,
     scanProgress: { ...scanProgress },
     cooldownRemainingMs: Math.max(
+
+
       0,
       SCAN_COOLDOWN_MS -
         (Date.now() - lastScanStartedAtMs)
@@ -2700,18 +2707,83 @@ app.post('/api/confirm-signal', async (req, res) => {
     });
   }
 
-  const storedMarket = latestMarkets.get(pair);
+  /*
+   * Always obtain fresh Twelve Data candles for confirmation.
+   * force=true bypasses the pair cache. If a request for this pair
+   * is already queued/in flight, getPairData may join it; quote age
+   * is checked again after the await so queue time is included.
+   */
+  let providerData;
 
-  if (!storedMarket) {
-    return res.status(409).json({
+  try {
+    providerData = await getPairData(pair, true);
+  } catch (error) {
+    return res.status(503).json({
       ok: false,
       version: VERSION,
+      pair,
+      signal: 'NO TRADE',
+      tradeAllowed: false,
+      noTrade: true,
       error:
-        'Analyze this exact pair first. No recent market analysis is available.'
+        `NO TRADE: fresh Twelve Data confirmation failed: ${String(error.message || error)} Enter the Pocket Option price again and retry.`
     });
   }
 
-  const freshMarket = evaluateFreshness(storedMarket);
+  /*
+   * Time spent waiting in the provider queue and fetching candles
+   * consumes the quote's 30-second lifetime. Never reset capturedAtMs.
+   */
+  const confirmationNow = Date.now();
+  const quoteAgeMs = confirmationNow - capturedAtMs;
+
+  if (
+    !Number.isFinite(quoteAgeMs) ||
+    quoteAgeMs < -5000 ||
+    quoteAgeMs > BROKER_PRICE_MAX_AGE_MS
+  ) {
+    return res.status(409).json({
+      ok: false,
+      version: VERSION,
+      pair,
+      signal: 'NO TRADE',
+      tradeAllowed: false,
+      noTrade: true,
+      error:
+        'NO TRADE: Pocket Option price expired while waiting in the provider queue or for fresh market data. Enter the price again and confirm.'
+    });
+  }
+
+  if (
+    !providerData ||
+    !Array.isArray(providerData.candles) ||
+    providerData.candles.length === 0 ||
+    !Number.isFinite(Number(providerData.fetchedAt))
+  ) {
+    return res.status(503).json({
+      ok: false,
+      version: VERSION,
+      pair,
+      signal: 'NO TRADE',
+      tradeAllowed: false,
+      noTrade: true,
+      error:
+        'NO TRADE: Twelve Data did not return a valid fresh candle set.'
+    });
+  }
+
+  const rescoredMarket = scoreMarket(
+    providerData.candles,
+    pair,
+    providerData.fetchedAt
+  );
+
+  const freshMarket = evaluateFreshness(
+    rescoredMarket,
+    confirmationNow
+  );
+
+  latestMarkets.set(pair, freshMarket);
 
   const confirmedMarket = applyBrokerPrice(
     freshMarket,
@@ -2855,3 +2927,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
+
