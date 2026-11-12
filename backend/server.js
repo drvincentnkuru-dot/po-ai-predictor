@@ -1,4 +1,3 @@
-
 'use strict';
 
 const express = require('express');
@@ -8,14 +7,21 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
 
-const VERSION = 'V10.3.0';
+const VERSION = 'V10.4.0';
 const PORT = Number(process.env.PORT || 10000);
+
 const API_KEY =
   process.env.TWELVE_DATA_API_KEY ||
   process.env.TWELVE_DATA_KEY ||
   '';
+
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const PROVIDER_URL = 'https://api.twelvedata.com/time_series';
+
+/*
+ * LIVE FOREX ONLY
+ * OTC pairs are intentionally excluded.
+ */
 
 const PRIORITY_PAIRS = [
   'EUR/USD',
@@ -47,24 +53,51 @@ const BACKGROUND_PAIRS = [
   'EUR/NZD'
 ];
 
-const PAIRS = [...PRIORITY_PAIRS, ...BACKGROUND_PAIRS];
+const PAIRS = [
+  ...PRIORITY_PAIRS,
+  ...BACKGROUND_PAIRS
+];
+
+/*
+ * Twelve Data request protection.
+ *
+ * 24 pairs need approximately 4 minutes per complete
+ * sweep at the configured 6 requests/minute limit.
+ *
+ * One scheduled sweep per hour uses approximately
+ * 576 requests/day, leaving room for manual analysis
+ * and confirmation requests.
+ */
 
 const DAILY_REQUEST_LIMIT = 768;
 const DAILY_RESERVE = 32;
+
 const DAILY_USABLE_LIMIT =
   DAILY_REQUEST_LIMIT - DAILY_RESERVE;
+
+const SCANNER_DAILY_BUDGET = 576;
+const SCAN_INTERVAL_MS = 60 * 60 * 1000;
 
 const REQUESTS_PER_MINUTE = 6;
 const REQUEST_SPACING_MS = 10000;
 const PROVIDER_TIMEOUT_MS = 12000;
+
 const PAIR_CACHE_MS = 90000;
 
 const FRESHNESS_SECONDS = 150;
 const HARD_STALE_SECONDS = 300;
+
 const SCAN_COOLDOWN_MS = 60000;
 
 const MIN_CANDLES = 60;
 const MIN_5M_CANDLES = 30;
+
+/*
+ * These thresholds are retained until proper
+ * walk-forward tests justify changing them.
+ *
+ * Evidence score is NOT win probability.
+ */
 
 const MIN_SIGNAL_SCORE = 55;
 const MIN_SCORE_GAP = 12;
@@ -75,6 +108,10 @@ const DEFAULT_MAX_PRICE_GAP_PIPS = 3;
 
 const BACKTEST_MIN_SIGNALS = 30;
 const HISTORY_LIMIT = 5000;
+
+/* -------------------------------------------------------
+   APPLICATION STATE
+------------------------------------------------------- */
 
 const pairCache = new Map();
 const inFlight = new Map();
@@ -89,6 +126,8 @@ let databaseError = null;
 
 let providerRequests = 0;
 let dailyCreditsUsed = 0;
+let scannerCreditsUsed = 0;
+
 let dailyDate = new Date().toISOString().slice(0, 10);
 
 let requestTimes = [];
@@ -96,22 +135,32 @@ let lastProviderRequestAt = 0;
 let requestQueue = Promise.resolve();
 
 let scannerRunning = false;
+let backgroundScanTimer = null;
+
 let scannerStartedAt = null;
 let lastScanAt = null;
 let lastScanStartedAtMs = 0;
+
 let totalScanned = 0;
 let lastScanError = null;
 
 let scanProgress = {
   phase: 'IDLE',
   completed: 0,
-  total: 6,
+  total: 24,
+
   priorityCompleted: 0,
   priorityTotal: 6,
+
   backgroundCompleted: 0,
   backgroundTotal: 18,
+
   pair: null
 };
+
+/* -------------------------------------------------------
+   COMMON HELPERS
+------------------------------------------------------- */
 
 const finite = value =>
   value !== null &&
@@ -154,17 +203,28 @@ function pipSize(pair) {
   return pair.endsWith('/JPY') ? 0.01 : 0.0001;
 }
 
-function priceDifferencePips(pair, brokerPrice, referencePrice) {
+function priceDifferencePips(
+  pair,
+  brokerPrice,
+  referencePrice
+) {
   return Math.abs(brokerPrice - referencePrice) /
     pipSize(pair);
 }
+
+/* -------------------------------------------------------
+   DAILY REQUEST COUNTERS
+------------------------------------------------------- */
 
 function resetDailyCounter() {
   const today = new Date().toISOString().slice(0, 10);
 
   if (today !== dailyDate) {
     dailyDate = today;
+
     dailyCreditsUsed = 0;
+    scannerCreditsUsed = 0;
+
     requestTimes = [];
   }
 }
@@ -174,22 +234,41 @@ function metadata() {
 
   return {
     provider: 'Twelve Data LIVE',
+
     providerRequests,
+
     dailyCreditsUsed,
+
     dailyCreditsRemaining: Math.max(
       0,
       DAILY_USABLE_LIMIT - dailyCreditsUsed
     ),
+
     dailyRequestLimit: DAILY_REQUEST_LIMIT,
     dailyUsableLimit: DAILY_USABLE_LIMIT,
+
+    scannerCreditsUsed,
+    scannerDailyBudget: SCANNER_DAILY_BUDGET,
+
+    scannerCreditsRemaining: Math.max(
+      0,
+      SCANNER_DAILY_BUDGET - scannerCreditsUsed
+    ),
+
     requestsPerMinuteLimit: REQUESTS_PER_MINUTE,
+
     cachedPairs: pairCache.size,
+
     priorityPairs: PRIORITY_PAIRS.length,
     backgroundPairs: BACKGROUND_PAIRS.length,
+    totalPairs: PAIRS.length,
+
     version: VERSION,
+
     storage: databaseReady
       ? 'POSTGRESQL'
       : 'MEMORY_ONLY',
+
     databaseConfigured: Boolean(DATABASE_URL),
     databaseReady,
     databaseError
@@ -208,9 +287,11 @@ async function initializeDatabase() {
 
     pgPool = new Pool({
       connectionString: DATABASE_URL,
+
       ssl: process.env.PGSSL === 'disable'
         ? false
         : { rejectUnauthorized: false },
+
       max: 3,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000
@@ -247,9 +328,14 @@ async function initializeDatabase() {
 
     databaseReady = true;
     databaseError = null;
+
   } catch (error) {
     databaseReady = false;
-    databaseError = String(error.message || error);
+
+    databaseError = String(
+      error.message || error
+    );
+
     console.error(
       'PostgreSQL initialization failed:',
       databaseError
@@ -258,11 +344,16 @@ async function initializeDatabase() {
 }
 
 async function saveSignal(record) {
-  if (!record || !record.id || signalKeys.has(record.id)) {
+  if (
+    !record ||
+    !record.id ||
+    signalKeys.has(record.id)
+  ) {
     return;
   }
 
   signalKeys.add(record.id);
+
   signalHistory.unshift(record);
 
   if (signalHistory.length > HISTORY_LIMIT) {
@@ -288,6 +379,7 @@ async function saveSignal(record) {
       )
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
       ON CONFLICT(signal_key) DO NOTHING`,
+
       [
         record.id,
         record.pair,
@@ -301,13 +393,22 @@ async function saveSignal(record) {
         JSON.stringify(record)
       ]
     );
+
   } catch (error) {
-    databaseError = String(error.message || error);
+    databaseError = String(
+      error.message || error
+    );
   }
 }
 
-async function updateSignalOutcome(id, outcome, outcomePrice) {
-  const record = signalHistory.find(item => item.id === id);
+async function updateSignalOutcome(
+  id,
+  outcome,
+  outcomePrice
+) {
+  const record = signalHistory.find(
+    item => item.id === id
+  );
 
   if (record) {
     record.outcome = outcome;
@@ -324,10 +425,12 @@ async function updateSignalOutcome(id, outcome, outcomePrice) {
            outcome_price=$3,
            details=details || $4::jsonb
        WHERE signal_key=$1`,
+
       [
         id,
         outcome,
         outcomePrice,
+
         JSON.stringify({
           outcome,
           outcomePrice,
@@ -335,13 +438,20 @@ async function updateSignalOutcome(id, outcome, outcomePrice) {
         })
       ]
     );
+
   } catch (error) {
-    databaseError = String(error.message || error);
+    databaseError = String(
+      error.message || error
+    );
   }
 }
 
 async function getHistory(limit = 100) {
-  const count = clamp(Number(limit) || 100, 1, 500);
+  const count = clamp(
+    Number(limit) || 100,
+    1,
+    500
+  );
 
   if (databaseReady && pgPool) {
     try {
@@ -362,25 +472,35 @@ async function getHistory(limit = 100) {
         FROM po_signal_history
         ORDER BY created_at DESC
         LIMIT $1`,
+
         [count]
       );
 
       return result.rows.map(row => ({
         ...row.details,
+
         id: row.signal_key,
         pair: row.pair,
         signal: row.direction,
+
         evidenceScore: row.evidence_score,
+
         entryTime: row.entry_time,
         expiryTime: row.expiry_time,
+
         referencePrice: row.reference_price,
         brokerPrice: row.broker_price,
+
         outcome: row.outcome,
         outcomePrice: row.outcome_price,
+
         createdAt: row.created_at
       }));
+
     } catch (error) {
-      databaseError = String(error.message || error);
+      databaseError = String(
+        error.message || error
+      );
     }
   }
 
@@ -388,16 +508,18 @@ async function getHistory(limit = 100) {
 }
 
 /* -------------------------------------------------------
-   TWELVE DATA PROVIDER
+   TWELVE DATA PROVIDER QUEUE
 ------------------------------------------------------- */
 
 function enqueueProviderRequest(task) {
   const promise = requestQueue.then(task, task);
+
   requestQueue = promise.catch(() => {});
+
   return promise;
 }
 
-async function providerFetch(pair) {
+async function providerFetch(pair, requestSource = 'manual') {
   return enqueueProviderRequest(async () => {
     if (!API_KEY) {
       throw new Error(
@@ -420,6 +542,15 @@ async function providerFetch(pair) {
         );
       }
 
+      if (
+        requestSource === 'scanner' &&
+        scannerCreditsUsed >= SCANNER_DAILY_BUDGET
+      ) {
+        throw new Error(
+          'Daily background scanner budget reached.'
+        );
+      }
+
       const minuteWait =
         requestTimes.length >= REQUESTS_PER_MINUTE
           ? Math.max(
@@ -434,7 +565,10 @@ async function providerFetch(pair) {
           (now - lastProviderRequestAt)
       );
 
-      const wait = Math.max(minuteWait, spacingWait);
+      const wait = Math.max(
+        minuteWait,
+        spacingWait
+      );
 
       if (wait > 0) {
         await sleep(wait);
@@ -455,9 +589,15 @@ async function providerFetch(pair) {
     const sentAt = Date.now();
 
     lastProviderRequestAt = sentAt;
+
     requestTimes.push(sentAt);
+
     providerRequests++;
     dailyCreditsUsed++;
+
+    if (requestSource === 'scanner') {
+      scannerCreditsUsed++;
+    }
 
     const controller = new AbortController();
 
@@ -469,7 +609,9 @@ async function providerFetch(pair) {
     try {
       const response = await fetch(url, {
         signal: controller.signal,
-        headers: { Accept: 'application/json' }
+        headers: {
+          Accept: 'application/json'
+        }
       });
 
       if (!response.ok) {
@@ -504,6 +646,7 @@ async function providerFetch(pair) {
         fetchedAt: Date.now(),
         source: 'Twelve Data LIVE'
       };
+
     } catch (error) {
       if (error.name === 'AbortError') {
         throw new Error(
@@ -512,2419 +655,2595 @@ async function providerFetch(pair) {
       }
 
       throw new Error(
-        error.message || 'Twelve Data request failed.'
+        error.message ||
+        'Twelve Data request failed.'
       );
+
     } finally {
       clearTimeout(timer);
     }
   });
 }
-
 function normalizeCandles(rows) {
-  const byTime = new Map();
+  if (!Array.isArray(rows)) return [];
 
-  for (const row of rows) {
-    const raw = String(
-      row.datetime || row.time || ''
-    ).trim();
+  return rows
+    .map((row) => {
+      const time = String(row.datetime || row.time || '');
+      const open = finite(row.open);
+      const high = finite(row.high);
+      const low = finite(row.low);
+      const close = finite(row.close);
+      const volume = finite(row.volume);
 
-    const zoned = /(Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+      if (
+        !time ||
+        open === null ||
+        high === null ||
+        low === null ||
+        close === null ||
+        high < low
+      ) {
+        return null;
+      }
 
-    const time = Date.parse(
-      raw && !zoned
-        ? `${raw.replace(' ', 'T')}Z`
-        : raw
-    );
-
-    const open = Number(row.open);
-    const high = Number(row.high);
-    const low = Number(row.low);
-    const close = Number(row.close);
-
-    if (
-      !Number.isFinite(time) ||
-      ![open, high, low, close].every(Number.isFinite)
-    ) {
-      continue;
-    }
-
-    if (
-      high < Math.max(open, close, low) ||
-      low > Math.min(open, close, high)
-    ) {
-      continue;
-    }
-
-    byTime.set(time, {
-      time,
-      open,
-      high,
-      low,
-      close
-    });
-  }
-
-  return [...byTime.values()]
-    .sort((a, b) => a.time - b.time);
-}
-
-async function getPairData(pair, force = false) {
-  const cached = pairCache.get(pair);
-
-  if (
-    !force &&
-    cached &&
-    Date.now() - cached.fetchedAt < PAIR_CACHE_MS
-  ) {
-    return cached;
-  }
-
-  if (inFlight.has(pair)) {
-    return inFlight.get(pair);
-  }
-
-  const promise = providerFetch(pair)
-    .then(data => {
-      pairCache.set(pair, data);
-      return data;
+      return {
+        time,
+        timestamp: Date.parse(time.replace(' ', 'T') + (time.includes('Z') ? '' : 'Z')),
+        open,
+        high,
+        low,
+        close,
+        volume: volume === null ? 0 : volume
+      };
     })
-    .finally(() => inFlight.delete(pair));
-
-  inFlight.set(pair, promise);
-
-  return promise;
+    .filter(Boolean)
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .filter((candle, index, all) =>
+      index === 0 || candle.timestamp > all[index - 1].timestamp
+    );
 }
 
-function closedCandles(candles, now = Date.now()) {
-  return candles.filter(
-    candle => candle.time + 60000 <= now
-  );
+function candleIsClosed(candle, now = Date.now()) {
+  if (!candle || !Number.isFinite(candle.timestamp)) return false;
+  return now - candle.timestamp >= 60000;
 }
 
-function hasContinuousMinutes(candles) {
-  if (candles.length < 2) return true;
-
-  for (let i = 1; i < candles.length; i++) {
-    if (
-      candles[i].time - candles[i - 1].time !== 60000
-    ) {
-      return false;
-    }
-  }
-
-  return true;
+function getClosedCandles(candles, now = Date.now()) {
+  return (Array.isArray(candles) ? candles : [])
+    .filter((candle) => candleIsClosed(candle, now));
 }
-
-/* -------------------------------------------------------
-   TECHNICAL INDICATORS
-------------------------------------------------------- */
 
 function ema(values, period) {
-  const output = Array(values.length).fill(null);
+  if (!Array.isArray(values) || values.length < period || period < 1) {
+    return [];
+  }
 
-  if (values.length < period) return output;
+  const multiplier = 2 / (period + 1);
+  const output = new Array(values.length).fill(null);
 
-  let value = avg(values.slice(0, period));
+  let seed = 0;
+  for (let i = 0; i < period; i += 1) {
+    seed += values[i];
+  }
 
-  output[period - 1] = value;
+  let previous = seed / period;
+  output[period - 1] = previous;
 
-  const alpha = 2 / (period + 1);
-
-  for (let i = period; i < values.length; i++) {
-    value =
-      values[i] * alpha +
-      value * (1 - alpha);
-
-    output[i] = value;
+  for (let i = period; i < values.length; i += 1) {
+    previous = (values[i] - previous) * multiplier + previous;
+    output[i] = previous;
   }
 
   return output;
 }
 
-function rsi(values, period = 14) {
-  const output = Array(values.length).fill(null);
-
-  if (values.length <= period) return output;
+function calculateRsi(values, period = 14) {
+  if (!Array.isArray(values) || values.length <= period) return null;
 
   let gains = 0;
-  let losses = 0;  for (let i = 1; i <= period; i++) {
-    const difference = values[i] - values[i - 1];
+  let losses = 0;
 
-    gains += Math.max(difference, 0);
-    losses += Math.max(-difference, 0);
+  for (let i = 1; i <= period; i += 1) {
+    const change = values[i] - values[i - 1];
+    if (change > 0) gains += change;
+    else losses += Math.abs(change);
   }
 
   let averageGain = gains / period;
   let averageLoss = losses / period;
 
-  const calculate = () =>
-    averageLoss === 0
-      ? averageGain === 0
-        ? 50
-        : 100
-      : 100 - 100 / (1 + averageGain / averageLoss);
+  for (let i = period + 1; i < values.length; i += 1) {
+    const change = values[i] - values[i - 1];
+    const gain = Math.max(0, change);
+    const loss = Math.max(0, -change);
 
-  output[period] = calculate();
-
-  for (let i = period + 1; i < values.length; i++) {
-    const difference = values[i] - values[i - 1];
-
-    averageGain =
-      (averageGain * (period - 1) +
-        Math.max(difference, 0)) / period;
-
-    averageLoss =
-      (averageLoss * (period - 1) +
-        Math.max(-difference, 0)) / period;
-
-    output[i] = calculate();
+    averageGain = ((averageGain * (period - 1)) + gain) / period;
+    averageLoss = ((averageLoss * (period - 1)) + loss) / period;
   }
 
-  return output;
+  if (averageLoss === 0) return 100;
+  const relativeStrength = averageGain / averageLoss;
+  return 100 - (100 / (1 + relativeStrength));
 }
 
-function macd(values) {
+function calculateMacd(values) {
   const fast = ema(values, 12);
   const slow = ema(values, 26);
 
-  const line = values.map((_, index) =>
-    finite(fast[index]) && finite(slow[index])
-      ? fast[index] - slow[index]
+  const macdLine = values.map((_, index) => {
+    if (fast[index] === null || slow[index] === null) return null;
+    return fast[index] - slow[index];
+  });
+
+  const validMacd = macdLine.filter((value) => value !== null);
+  const signalValid = ema(validMacd, 9);
+  let signalIndex = 0;
+
+  const signalLine = macdLine.map((value) => {
+    if (value === null) return null;
+    const result = signalValid[signalIndex];
+    signalIndex += 1;
+    return result === undefined ? null : result;
+  });
+
+  const histogram = macdLine.map((value, index) => {
+    if (value === null || signalLine[index] === null) return null;
+    return value - signalLine[index];
+  });
+
+  return {
+    macd: macdLine[macdLine.length - 1] ?? null,
+    signal: signalLine[signalLine.length - 1] ?? null,
+    histogram: histogram[histogram.length - 1] ?? null,
+    previousHistogram: histogram.length > 1
+      ? histogram[histogram.length - 2]
       : null
-  );
-
-  const compact = ema(line.filter(finite), 9);
-  const signal = Array(values.length).fill(null);
-
-  let cursor = 0;
-
-  for (let i = 0; i < line.length; i++) {
-    if (finite(line[i])) {
-      signal[i] = compact[cursor++];
-    }
-  }
-
-  return {
-    line,
-    signal,
-    histogram: line.map((value, index) =>
-      finite(value) && finite(signal[index])
-        ? value - signal[index]
-        : null
-    )
   };
 }
 
-function atr(candles, period = 14) {
-  const trueRanges = Array(candles.length).fill(null);
+function calculateAtr(candles, period = 14) {
+  if (!Array.isArray(candles) || candles.length <= period) return null;
 
-  for (let i = 1; i < candles.length; i++) {
-    const candle = candles[i];
-    const previousClose = candles[i - 1].close;
+  const ranges = [];
 
-    trueRanges[i] = Math.max(
-      candle.high - candle.low,
-      Math.abs(candle.high - previousClose),
-      Math.abs(candle.low - previousClose)
-    );
+  for (let i = 1; i < candles.length; i += 1) {
+    const current = candles[i];
+    const previous = candles[i - 1];
+
+    ranges.push(Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    ));
   }
 
-  const output = Array(candles.length).fill(null);
+  const recent = ranges.slice(-period);
+  if (recent.length < period) return null;
 
-  if (candles.length <= period) return output;
-
-  let value = avg(trueRanges.slice(1, period + 1));
-
-  output[period] = value;
-
-  for (let i = period + 1; i < candles.length; i++) {
-    value =
-      (value * (period - 1) + trueRanges[i]) / period;
-
-    output[i] = value;
-  }
-
-  return output;
+  return recent.reduce((sum, value) => sum + value, 0) / period;
 }
 
-function bollinger(values, period = 20, multiplier = 2) {
-  const upper = Array(values.length).fill(null);
-  const middle = Array(values.length).fill(null);
-  const lower = Array(values.length).fill(null);
-  const width = Array(values.length).fill(null);
+function calculateBollinger(values, period = 20, multiplier = 2) {
+  if (!Array.isArray(values) || values.length < period) return null;
 
-  for (let i = period - 1; i < values.length; i++) {
-    const sample = values.slice(i - period + 1, i + 1);
-    const mean = avg(sample);
+  const recent = values.slice(-period);
+  const middle = recent.reduce((sum, value) => sum + value, 0) / period;
 
-    const deviation = Math.sqrt(
-      avg(sample.map(value => (value - mean) ** 2))
-    );
+  const variance = recent.reduce(
+    (sum, value) => sum + Math.pow(value - middle, 2),
+    0
+  ) / period;
 
-    middle[i] = mean;
-    upper[i] = mean + multiplier * deviation;
-    lower[i] = mean - multiplier * deviation;
+  const deviation = Math.sqrt(variance);
+  const upper = middle + deviation * multiplier;
+  const lower = middle - deviation * multiplier;
 
-    width[i] = mean
-      ? ((upper[i] - lower[i]) / mean) * 100
-      : null;
-  }
-
-  return { upper, middle, lower, width };
+  return {
+    middle,
+    upper,
+    lower,
+    width: middle !== 0 ? ((upper - lower) / middle) * 100 : null,
+    position: upper !== lower
+      ? (recent[recent.length - 1] - lower) / (upper - lower)
+      : 0.5
+  };
 }
 
-function cross(a0, b0, a1, b1) {
-  if (![a0, b0, a1, b1].every(finite)) {
-    return 'UNAVAILABLE';
-  }
-
-  if (a0 <= b0 && a1 > b1) {
-    return 'BULLISH_CROSSOVER';
-  }
-
-  if (a0 >= b0 && a1 < b1) {
-    return 'BEARISH_CROSSOVER';
-  }
-
-  return 'NO_CROSSOVER';
-}
-
-function aggregate5m(candles, now = Date.now()) {
-  const groups = new Map();
-
-  for (const candle of candles) {
-    const start =
-      Math.floor(candle.time / 300000) * 300000;
-
-    let group = groups.get(start);
-
-    if (!group) {
-      group = {
-        time: start,
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-        count: 1,
-        lastTime: candle.time
-      };
-
-      groups.set(start, group);
-    } else {
-      group.high = Math.max(group.high, candle.high);
-      group.low = Math.min(group.low, candle.low);
-      group.close = candle.close;
-      group.count++;
-      group.lastTime = candle.time;
-    }
-  }
-
-  return [...groups.values()]
-    .filter(group =>
-      group.count === 5 &&
-      group.lastTime === group.time + 240000 &&
-      group.time + 300000 <= now
-    )
-    .map(({ count, lastTime, ...group }) => group)
-    .sort((a, b) => a.time - b.time);
-}
-
-function confirm5m(candles) {
-  const five = aggregate5m(candles);
-
-  if (five.length < MIN_5M_CANDLES) {
+function calculateCandlePatterns(candles) {
+  if (!Array.isArray(candles) || candles.length < 3) {
     return {
-      status: 'UNAVAILABLE',
       direction: 'NEUTRAL',
-      candles: five.length,
-      required: MIN_5M_CANDLES,
-      reason:
-        'Not enough complete 5-minute candles.'
+      patterns: [],
+      strength: 0
     };
   }
 
-  const closes = five.map(candle => candle.close);
-  const fast = ema(closes, 9);
-  const slow = ema(closes, 21);
-  const index = closes.length - 1;
-
-  const direction =
-    fast[index] > slow[index]
-      ? 'BULLISH'
-      : fast[index] < slow[index]
-        ? 'BEARISH'
-        : 'NEUTRAL';
-
-  return {
-    status: direction === 'NEUTRAL'
-      ? 'MIXED'
-      : 'CONFIRMED',
-    direction,
-    ema9: round(fast[index]),
-    ema21: round(slow[index]),
-    candles: five.length,
-    lastCandle: iso(five[index].time),
-    reason: `5-minute EMA9/EMA21 trend is ${direction}.`
-  };
-}
-
-function candlePattern(candles) {
-  if (candles.length < 3) {
-    return {
-      name: 'INSUFFICIENT CANDLES',
-      direction: 'NEUTRAL'
-    };
-  }
-
-  const current = candles.at(-1);
-  const previous = candles.at(-2);
-  const previous2 = candles.at(-3);
+  const current = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
 
   const body = Math.abs(current.close - current.open);
-  const range = Math.max(
-    current.high - current.low,
-    Number.EPSILON
-  );
+  const range = Math.max(current.high - current.low, 1e-10);
+  const upperWick = current.high - Math.max(current.open, current.close);
+  const lowerWick = Math.min(current.open, current.close) - current.low;
 
-  const upperWick =
-    current.high - Math.max(current.open, current.close);
+  const previousBullish = previous.close > previous.open;
+  const previousBearish = previous.close < previous.open;
+  const currentBullish = current.close > current.open;
+  const currentBearish = current.close < current.open;
 
-  const lowerWick =
-    Math.min(current.open, current.close) - current.low;
-
-  const ratio = body / range;
-
-  const bullish = current.close > current.open;
-  const bearish = current.close < current.open;
-
-  const previousBullish =
-    previous.close > previous.open;
-
-  const previousBearish =
-    previous.close < previous.open;
+  const patterns = [];
+  let direction = 'NEUTRAL';
+  let strength = 0;
 
   if (
     previousBearish &&
-    bullish &&
+    currentBullish &&
     current.open <= previous.close &&
     current.close >= previous.open
   ) {
-    return {
-      name: 'BULLISH ENGULFING',
-      direction: 'BULLISH'
-    };
+    patterns.push('BULLISH_ENGULFING');
+    direction = 'BUY';
+    strength = Math.max(strength, 2);
   }
 
   if (
     previousBullish &&
-    bearish &&
+    currentBearish &&
     current.open >= previous.close &&
     current.close <= previous.open
   ) {
-    return {
-      name: 'BEARISH ENGULFING',
-      direction: 'BEARISH'
-    };
+    patterns.push('BEARISH_ENGULFING');
+    direction = 'SELL';
+    strength = Math.max(strength, 2);
   }
 
   if (
-    ratio <= 0.35 &&
+    body / range <= 0.30 &&
     lowerWick >= body * 2 &&
-    upperWick <= Math.max(body * 0.7, range * 0.05)
+    upperWick <= Math.max(body * 1.2, range * 0.15)
   ) {
-    return {
-      name: 'HAMMER',
-      direction: 'POTENTIAL BULLISH'
-    };
+    patterns.push('HAMMER');
+    if (current.close >= current.open) {
+      direction = 'BUY';
+      strength = Math.max(strength, 1);
+    }
   }
 
   if (
-    ratio <= 0.35 &&
+    body / range <= 0.30 &&
     upperWick >= body * 2 &&
-    lowerWick <= Math.max(body * 0.7, range * 0.05)
+    lowerWick <= Math.max(body * 1.2, range * 0.15)
   ) {
-    return {
-      name: 'SHOOTING STAR',
-      direction: 'POTENTIAL BEARISH'
-    };
+    patterns.push('SHOOTING_STAR');
+    if (current.close <= current.open) {
+      direction = 'SELL';
+      strength = Math.max(strength, 1);
+    }
   }
 
-  if (
-    previous2.close < previous2.open &&
-    Math.abs(previous.close - previous.open) <
-      Math.abs(previous2.close - previous2.open) * 0.4 &&
-    bullish &&
-    current.close >
-      (previous2.open + previous2.close) / 2
-  ) {
-    return {
-      name: 'MORNING STAR',
-      direction: 'BULLISH'
-    };
+  if (body / range <= 0.10) {
+    patterns.push('DOJI');
   }
 
-  if (
-    previous2.close > previous2.open &&
-    Math.abs(previous.close - previous.open) <
-      Math.abs(previous2.close - previous2.open) * 0.4 &&
-    bearish &&
-    current.close <
-      (previous2.open + previous2.close) / 2
-  ) {
-    return {
-      name: 'EVENING STAR',
-      direction: 'BEARISH'
-    };
+  if (patterns.length === 0 && currentBullish) {
+    patterns.push('BULLISH_CANDLE');
+    direction = 'BUY';
+    strength = 0.5;
+  } else if (patterns.length === 0 && currentBearish) {
+    patterns.push('BEARISH_CANDLE');
+    direction = 'SELL';
+    strength = 0.5;
   }
 
-  if (ratio < 0.08) {
-    return {
-      name: 'DOJI',
-      direction: 'NEUTRAL'
-    };
-  }
-
-  if (ratio > 0.9 && upperWick < range * 0.05 &&
-      lowerWick < range * 0.05) {
-    return {
-      name: bullish
-        ? 'BULLISH MARUBOZU'
-        : 'BEARISH MARUBOZU',
-      direction: bullish ? 'BULLISH' : 'BEARISH'
-    };
-  }
-
-  return {
-    name: bullish
-      ? 'BULLISH CANDLE'
-      : bearish
-        ? 'BEARISH CANDLE'
-        : 'NO CLEAR PATTERN',
-    direction: bullish
-      ? 'BULLISH'
-      : bearish
-        ? 'BEARISH'
-        : 'NEUTRAL'
-  };
+  return { direction, patterns, strength };
 }
 
-function psychology(candles) {
-  const recent = candles.slice(-8);
+function calculateSupportResistance(candles, lookback = 40) {
+  const recent = candles.slice(-lookback);
 
-  if (recent.length < 7) {
-    return {
-      psychology: 'INSUFFICIENT PRICE EVIDENCE',
-      direction: 'NEUTRAL',
-      buyerPressure: 0,
-      sellerPressure: 0
-    };
-  }
-
-  let up = 0;
-  let down = 0;
-
-  for (let i = 1; i < recent.length; i++) {
-    if (recent[i].close > recent[i - 1].close) up++;
-    if (recent[i].close < recent[i - 1].close) down++;
-  }
-
-  const last = recent.at(-1);
-
-  const location =
-    (last.close - last.low) /
-    Math.max(last.high - last.low, 1e-12);
-
-  if (up >= 5 && location >= 0.65) {
-    return {
-      psychology: 'BUYERS SHOWING RECENT CONTROL',
-      direction: 'BULLISH',
-      buyerPressure: up,
-      sellerPressure: down
-    };
-  }
-
-  if (down >= 5 && location <= 0.35) {
-    return {
-      psychology: 'SELLERS SHOWING RECENT CONTROL',
-      direction: 'BEARISH',
-      buyerPressure: up,
-      sellerPressure: down
-    };
-  }
-
-  return {
-    psychology: 'MIXED BUYER/SELLER PRESSURE',
-    direction: 'NEUTRAL',
-    buyerPressure: up,
-    sellerPressure: down
-  };
-}
-
-function trendline(candles) {
-  const sample = candles.slice(-30);
-
-  if (sample.length < 15) {
-    return {
-      direction: 'UNAVAILABLE',
-      slopePercent: null,
-      description: 'Not enough candles for trendline.'
-    };
-  }
-
-  const xs = sample.map((_, index) => index);
-  const ys = sample.map(candle => candle.close);
-
-  const meanX = avg(xs);
-  const meanY = avg(ys);
-
-  let numerator = 0;
-  let denominator = 0;
-
-  for (let i = 0; i < sample.length; i++) {
-    numerator +=
-      (xs[i] - meanX) * (ys[i] - meanY);
-
-    denominator += (xs[i] - meanX) ** 2;
-  }
-
-  const slope = denominator
-    ? numerator / denominator
-    : 0;
-
-  const slopePercent =
-    meanY ? slope / meanY * 100 : 0;
-
-  const direction =
-    slopePercent > 0.002
-      ? 'BULLISH'
-      : slopePercent < -0.002
-        ? 'BEARISH'
-        : 'SIDEWAYS';
-
-  return {
-    direction,
-    slopePercent: round(slopePercent, 6),
-    description: `30-candle regression trend: ${direction}.`
-  };
-}
-
-function levels(candles) {
-  const previous = candles.slice(-31, -1);
-
-  if (previous.length < 15) {
+  if (recent.length < 10) {
     return {
       support: null,
       resistance: null,
-      position: 'UNAVAILABLE',
-      direction: 'NEUTRAL'
+      nearestDistancePips: null
     };
   }
 
-  const support = Math.min(
-    ...previous.map(candle => candle.low)
+  const lows = recent.map((candle) => candle.low);
+  const highs = recent.map((candle) => candle.high);
+
+  const support = Math.min(...lows);
+  const resistance = Math.max(...highs);
+  const price = recent[recent.length - 1].close;
+
+  const pip = pipSize('EUR/USD');
+  const nearestDistance = Math.min(
+    Math.abs(price - support),
+    Math.abs(resistance - price)
   );
-
-  const resistance = Math.max(
-    ...previous.map(candle => candle.high)
-  );
-
-  const current = candles.at(-1);
-  const range = Math.max(
-    current.high - current.low,
-    1e-12
-  );
-
-  let position = 'BETWEEN LEVELS';
-  let direction = 'NEUTRAL';
-
-  if (current.close > resistance) {
-    position = 'CLOSED-CANDLE RESISTANCE BREAKOUT';
-    direction = 'BULLISH';
-  } else if (current.close < support) {
-    position = 'CLOSED-CANDLE SUPPORT BREAKDOWN';
-    direction = 'BEARISH';
-  } else if (
-    current.low <= support + range * 0.15 &&
-    current.close > current.open
-  ) {
-    position = 'POSSIBLE SUPPORT REJECTION';
-    direction = 'BULLISH';
-  } else if (
-    current.high >= resistance - range * 0.15 &&
-    current.close < current.open
-  ) {
-    position = 'POSSIBLE RESISTANCE REJECTION';
-    direction = 'BEARISH';
-  }
 
   return {
-    support: round(support),
-    resistance: round(resistance),
-    position,
-    direction,
-    distanceToSupportPercent:
-      round((current.close - support) / current.close * 100, 5),
-    distanceToResistancePercent:
-      round((resistance - current.close) / current.close * 100, 5)
+    support,
+    resistance,
+    nearestDistancePips: pip > 0 ? nearestDistance / pip : null,
+    supportDistance: price - support,
+    resistanceDistance: resistance - price
   };
 }
 
-function breakout(candles) {
-  if (candles.length < 8) {
+function calculateTrendline(candles, lookback = 20) {
+  const recent = candles.slice(-lookback);
+  if (recent.length < 8) return { direction: 'NEUTRAL', slope: 0 };
+
+  const first = recent[0].close;
+  const last = recent[recent.length - 1].close;
+  const change = last - first;
+  const threshold = Math.abs(first) * 0.00005;
+
+  if (change > threshold) {
+    return { direction: 'BUY', slope: change / recent.length };
+  }
+
+  if (change < -threshold) {
+    return { direction: 'SELL', slope: change / recent.length };
+  }
+
+  return { direction: 'NEUTRAL', slope: change / recent.length };
+}
+
+function aggregateFiveMinute(candles) {
+  const groups = new Map();
+
+  for (const candle of candles) {
+    const bucket = Math.floor(candle.timestamp / 300000) * 300000;
+
+    if (!groups.has(bucket)) {
+      groups.set(bucket, {
+        timestamp: bucket,
+        time: new Date(bucket).toISOString(),
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume
+      });
+    } else {
+      const group = groups.get(bucket);
+      group.high = Math.max(group.high, candle.high);
+      group.low = Math.min(group.low, candle.low);
+      group.close = candle.close;
+      group.volume += candle.volume;
+    }
+  }
+
+  return Array.from(groups.values()).sort(
+    (a, b) => a.timestamp - b.timestamp
+  );
+}
+
+function calculateMarketPsychology(candles) {
+  const recent = candles.slice(-10);
+  if (recent.length < 5) {
+    return { direction: 'NEUTRAL', score: 0, description: 'Insufficient candles' };
+  }
+
+  let bullish = 0;
+  let bearish = 0;
+  let totalBody = 0;
+  let totalRange = 0;
+
+  for (const candle of recent) {
+    const body = candle.close - candle.open;
+    totalBody += Math.abs(body);
+    totalRange += Math.max(candle.high - candle.low, 0);
+
+    if (body > 0) bullish += 1;
+    else if (body < 0) bearish += 1;
+  }
+
+  const averageBodyRatio = totalRange > 0 ? totalBody / totalRange : 0;
+  const difference = bullish - bearish;
+
+  if (difference >= 3 && averageBodyRatio >= 0.35) {
     return {
-      status: 'UNAVAILABLE',
-      direction: 'NEUTRAL',
-      description: 'Insufficient range history.'
+      direction: 'BUY',
+      score: Math.min(3, difference),
+      description: 'Bullish candle pressure'
     };
   }
 
-  const current = candles.at(-1);
-  const previous = candles.at(-2);
-  const prior = candles.slice(-7, -2);
-
-  const high = Math.max(...prior.map(item => item.high));
-  const low = Math.min(...prior.map(item => item.low));
-
-  if (previous.close <= high && current.close > high) {
+  if (difference <= -3 && averageBodyRatio >= 0.35) {
     return {
-      status: 'BREAKOUT',
-      direction: 'BULLISH',
-      level: round(high),
-      description: 'Completed candle closed above prior range.'
-    };
-  }
-
-  if (previous.close >= low && current.close < low) {
-    return {
-      status: 'BREAKDOWN',
-      direction: 'BEARISH',
-      level: round(low),
-      description: 'Completed candle closed below prior range.'
-    };
-  }
-
-  if (
-    previous.close > high &&
-    current.low <= high &&
-    current.close > high
-  ) {
-    return {
-      status: 'BULLISH_RETEST',
-      direction: 'BULLISH',
-      level: round(high),
-      description: 'Retest held above breakout level.'
-    };
-  }
-
-  if (
-    previous.close < low &&
-    current.high >= low &&
-    current.close < low
-  ) {
-    return {
-      status: 'BEARISH_RETEST',
-      direction: 'BEARISH',
-      level: round(low),
-      description: 'Retest held below breakdown level.'
-    };
-  }
-
-  if (previous.close > high && current.close < high) {
-    return {
-      status: 'FALSE_BULLISH_BREAKOUT',
-      direction: 'BEARISH',
-      level: round(high),
-      description: 'Price returned inside range after upside break.'
-    };
-  }
-
-  if (previous.close < low && current.close > low) {
-    return {
-      status: 'FALSE_BEARISH_BREAKOUT',
-      direction: 'BULLISH',
-      level: round(low),
-      description: 'Price returned inside range after downside break.'
+      direction: 'SELL',
+      score: Math.min(3, Math.abs(difference)),
+      description: 'Bearish candle pressure'
     };
   }
 
   return {
-    status: 'NO_CONFIRMED_BREAKOUT',
     direction: 'NEUTRAL',
-    description: 'No confirmed breakout/retest.'
+    score: 0,
+    description: 'Mixed market pressure'
   };
 }
 
-function volatility(atrValues, widths, candles) {
-  const index = atrValues.length - 1;
-  const atrValue = atrValues[index];
-  const close = candles[index]?.close;
+function calculateVolatility(candles, atrValue, pair) {
+  const price = candles[candles.length - 1]?.close;
+  const pip = pipSize(pair);
 
-  const atrPercent =
-    finite(atrValue) && close
-      ? atrValue / close * 100
-      : null;
-
-  const width = widths[index];
-  const valid = widths.filter(finite);
-
-  if (
-    !finite(atrPercent) ||
-    !finite(width) ||
-    valid.length < 30
-  ) {
+  if (!price || !atrValue || !pip) {
     return {
-      regime: 'UNAVAILABLE',
-      atr: round(atrValue),
-      atrPercent: round(atrPercent, 5),
-      bollingerWidth: round(width, 5)
+      regime: 'UNKNOWN',
+      atrPips: null,
+      riskPenalty: 0
     };
   }
 
-  const sorted = [...valid].sort((a, b) => a - b);
+  const atrPips = atrValue / pip;
+  const atrPercent = (atrValue / price) * 100;
 
-  const low = sorted[
-    Math.floor((sorted.length - 1) * 0.25)
-  ];
+  let regime = 'NORMAL';
+  let riskPenalty = 0;
 
-  const high = sorted[
-    Math.floor((sorted.length - 1) * 0.75)
-  ];
+  if (atrPercent < 0.015) {
+    regime = 'LOW';
+    riskPenalty = 1;
+  } else if (atrPercent > 0.12) {
+    regime = 'HIGH';
+    riskPenalty = 8;
+  } else if (atrPercent > 0.08) {
+    regime = 'ELEVATED';
+    riskPenalty = 4;
+  }
 
-  const regime =
-    width <= low
-      ? 'LOW'
-      : width >= high
-        ? 'HIGH'
-        : 'NORMAL';
-
-  return {
-    regime,
-    atr: round(atrValue),
-    atrPercent: round(atrPercent, 5),
-    bollingerWidth: round(width, 5),
-    lowWidthThreshold: round(low, 5),
-    highWidthThreshold: round(high, 5)
-  };
+  return { regime, atrPips, atrPercent, riskPenalty };
 }
 
-/* -------------------------------------------------------
-   MARKET ANALYSIS AND SIGNAL QUALIFICATION
-------------------------------------------------------- */
+function detectRecentEmaCross(fastValues, slowValues, maxBars = 4) {
+  const start = Math.max(1, fastValues.length - maxBars);
 
-function emptyMarket(
-  pair = 'NO MARKET',
-  reason = 'No usable market data.'
-) {
-  return {
-    pair,
-    timeframe: 1,
-    signal: 'NO TRADE',
-    technicalSignal: 'NO TRADE',
-    confidence: null,
-    callScore: 0,
-    putScore: 0,
-    gap: 0,
-    entryTime: null,
-    expiryTime: null,
-    currentPrice: null,
-    entryPrice: null,
-    entryPriceStatus: 'WAITING_FOR_ENTRY_PRICE',
-    freshness: 'NO DATA',
-    dataAgeSeconds: null,
-    lastCandle: null,
-    indicators: {},
-    reasons: [reason],
-    source: 'Twelve Data LIVE',
-    evidenceLabel: 'Evidence score, not win probability',
-    insufficientData: true,
-    tradeAllowed: false,
-    noTrade: true
-  };
+  for (let i = fastValues.length - 1; i >= start; i -= 1) {
+    const fastNow = fastValues[i];
+    const slowNow = slowValues[i];
+    const fastBefore = fastValues[i - 1];
+    const slowBefore = slowValues[i - 1];
+
+    if (
+      fastNow === null || slowNow === null ||
+      fastBefore === null || slowBefore === null
+    ) {
+      continue;
+    }
+
+    if (fastBefore <= slowBefore && fastNow > slowNow) {
+      return { direction: 'BUY', barsAgo: fastValues.length - 1 - i };
+    }
+
+    if (fastBefore >= slowBefore && fastNow < slowNow) {
+      return { direction: 'SELL', barsAgo: fastValues.length - 1 - i };
+    }
+  }
+
+  return { direction: 'NONE', barsAgo: null };
 }
 
-function scoreMarket(raw, pair, fetchedAt) {
-  const now = Date.now();
-  const candles = closedCandles(raw, now);
-  const last = candles.at(-1);
+function hasPriceFollowThrough(candles, direction) {
+  if (candles.length < 3) return false;
 
-  if (!last) {
-    return emptyMarket(
-      pair,
-      'No completed 1-minute candles.'
+  const last = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
+  const prior = candles[candles.length - 3];
+
+  if (direction === 'BUY') {
+    return (
+      last.close > last.open &&
+      last.close > previous.close &&
+      last.close >= prior.close
     );
   }
 
-  const age = Math.max(
-    0,
-    (now - (last.time + 60000)) / 1000
-  );
-
-  const freshness =
-    age <= FRESHNESS_SECONDS
-      ? 'FRESH'
-      : age <= HARD_STALE_SECONDS
-        ? 'STALE'
-        : 'HARD STALE';
-
-  const closes = candles.map(candle => candle.close);
-  const index = candles.length - 1;
-  const previousIndex = index - 1;
-
-  const ema9 = ema(closes, 9);
-  const ema21 = ema(closes, 21);
-  const rsi14 = rsi(closes);
-  const macdValues = macd(closes);
-  const atr14 = atr(candles);
-  const bands = bollinger(closes);
-
-  const emaCross = cross(
-    ema9[previousIndex],
-    ema21[previousIndex],
-    ema9[index],
-    ema21[index]
-  );
-
-  const macdCross = cross(
-    macdValues.line[previousIndex],
-    macdValues.signal[previousIndex],
-    macdValues.line[index],
-    macdValues.signal[index]
-  );
-
-  const pattern = candlePattern(candles);
-  const marketPsychology = psychology(candles);
-  const supportResistance = levels(candles);
-  const trendLine = trendline(candles);
-  const breakoutResult = breakout(candles);
-  const confirmation5m = confirm5m(candles);
-  const volatilityResult = volatility(
-    atr14,
-    bands.width,
-    candles
-  );
-
-  let callScore = 0;
-  let putScore = 0;
-
-  const reasons = [];
-
-  function add(direction, points, reason) {
-    if (direction === 'BULLISH') {
-      callScore += points;
-    }
-
-    if (direction === 'BEARISH') {
-      putScore += points;
-    }
-
-    if (
-      direction !== 'NEUTRAL' &&
-      direction !== 'UNAVAILABLE' &&
-      points > 0
-    ) {
-      reasons.push(reason);
-    }
-  }
-
-  const patternPoints = {
-    'BULLISH ENGULFING': 12,
-    'BEARISH ENGULFING': 12,
-    'MORNING STAR': 12,
-    'EVENING STAR': 12,
-    'HAMMER': 6,
-    'SHOOTING STAR': 6,
-    'BULLISH MARUBOZU': 7,
-    'BEARISH MARUBOZU': 7
-  };
-
-  add(
-    pattern.direction,
-    patternPoints[pattern.name] || 0,
-    `Candlestick: ${pattern.name}.`
-  );
-
-  add(
-    marketPsychology.direction,
-    8,
-    `Market psychology: ${marketPsychology.psychology}.`
-  );
-
-  add(
-    supportResistance.direction,
-    8,
-    `Support/resistance: ${supportResistance.position}.`
-  );
-
-  add(
-    trendLine.direction,
-    7,
-    `Trendline: ${trendLine.direction}.`
-  );
-
-  if (emaCross === 'BULLISH_CROSSOVER') {
-    add('BULLISH', 7, 'EMA9 crossed above EMA21.');
-  } else if (emaCross === 'BEARISH_CROSSOVER') {
-    add('BEARISH', 7, 'EMA9 crossed below EMA21.');
-  } else if (
-    finite(ema9[index]) &&
-    finite(ema21[index])
-  ) {
-    add(
-      ema9[index] > ema21[index]
-        ? 'BULLISH'
-        : 'BEARISH',
-      3,
-      'EMA9/EMA21 alignment.'
+  if (direction === 'SELL') {
+    return (
+      last.close < last.open &&
+      last.close < previous.close &&
+      last.close <= prior.close
     );
   }
 
-  if (
-    finite(rsi14[index]) &&
-    finite(rsi14[previousIndex])
-  ) {
-    if (
-      rsi14[previousIndex] < 30 &&
-      rsi14[index] >= 30
-    ) {
-      add('BULLISH', 5, 'RSI14 recovered above 30.');
-    } else if (
-      rsi14[previousIndex] > 70 &&
-      rsi14[index] <= 70
-    ) {
-      add('BEARISH', 5, 'RSI14 fell below 70.');
-    } else if (
-      rsi14[index] > 50 &&
-      rsi14[index] < 70
-    ) {
-      add('BULLISH', 2, 'RSI14 positive momentum.');
-    } else if (
-      rsi14[index] < 50 &&
-      rsi14[index] > 30
-    ) {
-      add('BEARISH', 2, 'RSI14 negative momentum.');
-    }
-  }
+  return false;
+}
+function scoreMarket(pair, rawCandles, fetchedAt = Date.now()) {
+  const candles = getClosedCandles(rawCandles);
 
-  if (macdCross === 'BULLISH_CROSSOVER') {
-    add('BULLISH', 6, 'MACD bullish crossover.');
-  } else if (macdCross === 'BEARISH_CROSSOVER') {
-    add('BEARISH', 6, 'MACD bearish crossover.');
-  } else if (
-    finite(macdValues.histogram[index]) &&
-    finite(macdValues.histogram[previousIndex]) &&
-    macdValues.histogram[index] >
-      macdValues.histogram[previousIndex] &&
-    macdValues.histogram[index] > 0
-  ) {
-    add('BULLISH', 2, 'MACD histogram strengthening positive.');
-  } else if (
-    finite(macdValues.histogram[index]) &&
-    finite(macdValues.histogram[previousIndex]) &&
-    macdValues.histogram[index] <
-      macdValues.histogram[previousIndex] &&
-    macdValues.histogram[index] < 0
-  ) {
-    add('BEARISH', 2, 'MACD histogram strengthening negative.');
-  }
-
-  add(
-    breakoutResult.direction,
-    breakoutResult.status.includes('RETEST')
-      ? 8
-      : breakoutResult.status.includes('FALSE')
-        ? 0
-        : 5,
-    `Breakout/retest: ${breakoutResult.status}.`
-  );
-
-  const direction =
-    callScore > putScore
-      ? 'BULLISH'
-      : putScore > callScore
-        ? 'BEARISH'
-        : 'NEUTRAL';
-
-  const winningScore = Math.max(callScore, putScore);
-  const opposingScore = Math.min(callScore, putScore);
-  const scoreGap = Math.abs(callScore - putScore);
-
-  const guards = [];
+  const rejectedReasons = [];
+  const evidence = [];
+  const warnings = [];
 
   if (candles.length < MIN_CANDLES) {
-    guards.push(
-      `Fewer than ${MIN_CANDLES} completed 1-minute candles.`
+    return {
+      pair,
+      signal: 'NO TRADE',
+      direction: 'NONE',
+      qualified: false,
+      score: 0,
+      buyScore: 0,
+      sellScore: 0,
+      evidenceScore: 0,
+      rejectedReasons: ['INSUFFICIENT_CANDLES'],
+      evidence,
+      warnings,
+      candleCount: candles.length,
+      fetchedAt
+    };
+  }
+
+  const closes = candles.map((candle) => candle.close);
+  const current = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
+
+  const ema9Values = ema(closes, 9);
+  const ema21Values = ema(closes, 21);
+
+  const ema9 = ema9Values[ema9Values.length - 1];
+  const ema21 = ema21Values[ema21Values.length - 1];
+
+  const previousEma9 = ema9Values[ema9Values.length - 2];
+  const previousEma21 = ema21Values[ema21Values.length - 2];
+
+  const cross = detectRecentEmaCross(
+    ema9Values,
+    ema21Values,
+    4
+  );
+
+  const macd = calculateMacd(closes);
+  const rsi = calculateRsi(closes, 14);
+  const atr = calculateAtr(candles, 14);
+  const bollinger = calculateBollinger(closes, 20, 2);
+  const patterns = calculateCandlePatterns(candles);
+  const levels = calculateSupportResistance(candles, 40);
+  const trendline = calculateTrendline(candles, 20);
+  const psychology = calculateMarketPsychology(candles);
+  const volatility = calculateVolatility(candles, atr, pair);
+
+  const fiveMinuteCandles = aggregateFiveMinute(candles);
+  const fiveMinuteCloses = fiveMinuteCandles.map((candle) => candle.close);
+  const fiveMinuteEma9 = ema(fiveMinuteCloses, 9);
+  const fiveMinuteEma21 = ema(fiveMinuteCloses, 21);
+
+  let fiveMinuteDirection = 'UNKNOWN';
+
+  if (
+    fiveMinuteEma9.length &&
+    fiveMinuteEma21.length &&
+    fiveMinuteEma9[fiveMinuteEma9.length - 1] !== null &&
+    fiveMinuteEma21[fiveMinuteEma21.length - 1] !== null
+  ) {
+    fiveMinuteDirection =
+      fiveMinuteEma9[fiveMinuteEma9.length - 1] >
+      fiveMinuteEma21[fiveMinuteEma21.length - 1]
+        ? 'BUY'
+        : 'SELL';
+  }
+
+  const buy = { score: 0, reasons: [] };
+  const sell = { score: 0, reasons: [] };
+
+  function addEvidence(direction, points, reason) {
+    if (direction === 'BUY') {
+      buy.score += points;
+      buy.reasons.push(reason);
+    } else if (direction === 'SELL') {
+      sell.score += points;
+      sell.reasons.push(reason);
+    }
+  }
+
+  // EMA trend alignment.
+  if (ema9 > ema21) {
+    addEvidence('BUY', 15, 'EMA9_ABOVE_EMA21');
+  } else if (ema9 < ema21) {
+    addEvidence('SELL', 15, 'EMA9_BELOW_EMA21');
+  }
+
+  // A recent crossover is required for a new entry.
+  if (cross.direction === 'BUY') {
+    addEvidence('BUY', 15, 'RECENT_BULLISH_EMA_CROSS');
+  } else if (cross.direction === 'SELL') {
+    addEvidence('SELL', 15, 'RECENT_BEARISH_EMA_CROSS');
+  } else {
+    rejectedReasons.push('NO_RECENT_EMA_CROSS');
+  }
+
+  // Price must follow through after the crossover.
+  const buyFollowThrough = hasPriceFollowThrough(candles, 'BUY');
+  const sellFollowThrough = hasPriceFollowThrough(candles, 'SELL');
+
+  if (cross.direction === 'BUY' && buyFollowThrough) {
+    addEvidence('BUY', 12, 'BULLISH_PRICE_FOLLOW_THROUGH');
+  } else if (cross.direction === 'SELL' && sellFollowThrough) {
+    addEvidence('SELL', 12, 'BEARISH_PRICE_FOLLOW_THROUGH');
+  } else {
+    rejectedReasons.push('NO_PRICE_FOLLOW_THROUGH');
+  }
+
+  // MACD is supporting evidence, not a standalone signal.
+  if (
+    macd.histogram !== null &&
+    macd.previousHistogram !== null
+  ) {
+    if (macd.histogram > 0 && macd.histogram >= macd.previousHistogram) {
+      addEvidence('BUY', 8, 'MACD_BULLISH_MOMENTUM');
+    } else if (
+      macd.histogram < 0 &&
+      macd.histogram <= macd.previousHistogram
+    ) {
+      addEvidence('SELL', 8, 'MACD_BEARISH_MOMENTUM');
+    }
+  }
+
+  // Candlestick evidence.
+  if (patterns.direction !== 'NEUTRAL') {
+    addEvidence(
+      patterns.direction,
+      patterns.strength >= 2 ? 10 : 5,
+      'CANDLE_PATTERN_' + patterns.patterns.join('_')
     );
   }
 
-  if (!hasContinuousMinutes(candles.slice(-60))) {
-    guards.push(
-      'Missing minute candles in the recent data window.'
+  // Market structure / trendline evidence.
+  if (trendline.direction !== 'NEUTRAL') {
+    addEvidence(trendline.direction, 6, 'TRENDLINE_DIRECTION');
+  }
+
+  // Psychology and short-term candle pressure.
+  if (psychology.direction !== 'NEUTRAL') {
+    addEvidence(
+      psychology.direction,
+      5,
+      'MARKET_PSYCHOLOGY_SUPPORT'
     );
   }
 
-  if (freshness !== 'FRESH') {
-    guards.push('Market data is not fresh.');
-  }
+  // Support and resistance proximity.
+  const pip = pipSize(pair);
+  const supportDistancePips = pip
+    ? (current.close - levels.support) / pip
+    : null;
+  const resistanceDistancePips = pip
+    ? (levels.resistance - current.close) / pip
+    : null;
 
-  if (confirmation5m.status === 'UNAVAILABLE') {
-    guards.push(
-      '5-minute confirmation is unavailable.'
-    );
-  } else if (confirmation5m.direction !== direction) {
-    guards.push(
-      '5-minute trend does not confirm the 1-minute direction.'
-    );
-  }
-
-  if (volatilityResult.regime === 'UNAVAILABLE') {
-    guards.push('Volatility regime is unavailable.');
-  } else if (volatilityResult.regime === 'HIGH') {
-    guards.push(
-      'High-volatility regime: signal withheld.'
-    );
+  if (
+    supportDistancePips !== null &&
+    supportDistancePips >= 0 &&
+    supportDistancePips <= 5
+  ) {
+    addEvidence('BUY', 5, 'PRICE_NEAR_SUPPORT');
   }
 
   if (
-    ![
-      rsi14[index],
-      ema9[index],
-      ema21[index],
-      macdValues.histogram[index],
-      atr14[index],
-      bands.width[index]
-    ].every(finite) ||
-    trendLine.direction === 'UNAVAILABLE' ||
-    supportResistance.position === 'UNAVAILABLE'
+    resistanceDistancePips !== null &&
+    resistanceDistancePips >= 0 &&
+    resistanceDistancePips <= 5
   ) {
-    guards.push(
-      'One or more required technical measurements are unavailable.'
+    addEvidence('SELL', 5, 'PRICE_NEAR_RESISTANCE');
+  }
+
+  // Breakout evidence must be supported by a candle close.
+  const structureCandles = candles.slice(-21, -1);
+  const recentHigh = structureCandles.length
+    ? Math.max(...structureCandles.map((candle) => candle.high))
+    : null;
+  const recentLow = structureCandles.length
+    ? Math.min(...structureCandles.map((candle) => candle.low))
+    : null;
+
+  if (recentHigh !== null && current.close > recentHigh) {
+    addEvidence('BUY', 7, 'BULLISH_CLOSED_CANDLE_BREAKOUT');
+  }
+
+  if (recentLow !== null && current.close < recentLow) {
+    addEvidence('SELL', 7, 'BEARISH_CLOSED_CANDLE_BREAKOUT');
+  }
+
+  // Volatility changes risk and score; it is not an automatic veto.
+  if (volatility.riskPenalty > 0) {
+    buy.score -= volatility.riskPenalty;
+    sell.score -= volatility.riskPenalty;
+
+    warnings.push(
+      'VOLATILITY_' + volatility.regime
     );
+  }
+
+  // RSI is diagnostic only. It does not create or block a trade.
+  if (rsi !== null) {
+    if (rsi >= 70) warnings.push('RSI_OVERBOUGHT_DIAGNOSTIC');
+    if (rsi <= 30) warnings.push('RSI_OVERSOLD_DIAGNOSTIC');
+  }
+
+  // Five-minute direction is diagnostic only, not a hard gate.
+  if (
+    fiveMinuteDirection !== 'UNKNOWN' &&
+    fiveMinuteDirection !== cross.direction
+  ) {
+    warnings.push('FIVE_MINUTE_DIRECTION_CONFLICT');
+  }
+
+  const buyScore = Math.round(clamp(buy.score, 0, 100));
+  const sellScore = Math.round(clamp(sell.score, 0, 100));
+
+  const difference = Math.abs(buyScore - sellScore);
+  const direction = buyScore > sellScore ? 'BUY' : 'SELL';
+  const selectedScore = Math.max(buyScore, sellScore);
+  const opposingScore = Math.min(buyScore, sellScore);
+
+  if (cross.direction === 'NONE') {
+    rejectedReasons.push('EMA_CROSS_NOT_RECENT');
+  }
+
+  if (cross.direction !== direction) {
+    rejectedReasons.push('EMA_CROSS_DIRECTION_MISMATCH');
   }
 
   if (
-    direction === 'NEUTRAL' ||
-    scoreGap < MIN_SCORE_GAP
+    direction === 'BUY' && !buyFollowThrough
   ) {
-    guards.push(
-      'Directional evidence conflicts or score gap is too small.'
-    );
+    rejectedReasons.push('BUY_FOLLOW_THROUGH_MISSING');
   }
 
-  if (winningScore < MIN_SIGNAL_SCORE) {
-    guards.push(
-      'Evidence score is below the minimum threshold.'
-    );
+  if (
+    direction === 'SELL' && !sellFollowThrough
+  ) {
+    rejectedReasons.push('SELL_FOLLOW_THROUGH_MISSING');
+  }
+
+  if (selectedScore < MIN_SIGNAL_SCORE) {
+    rejectedReasons.push('SCORE_BELOW_MINIMUM');
+  }
+
+  if (difference < MIN_SCORE_GAP) {
+    rejectedReasons.push('INSUFFICIENT_SCORE_GAP');
   }
 
   if (opposingScore >= MIN_OPPOSING_SCORE) {
-    guards.push(
-      'Opposing directional evidence is material.'
-    );
+    rejectedReasons.push('OPPOSING_EVIDENCE_TOO_HIGH');
   }
 
-  if (breakoutResult.status.startsWith('FALSE_')) {
-    guards.push('False-breakout risk detected.');
-  }
+  const qualified =
+    cross.direction === direction &&
+    (direction === 'BUY' ? buyFollowThrough : sellFollowThrough) &&
+    selectedScore >= MIN_SIGNAL_SCORE &&
+    difference >= MIN_SCORE_GAP &&
+    opposingScore < MIN_OPPOSING_SCORE;
 
-  const technicalSignal =
-    guards.length > 0
-      ? 'NO TRADE'
-      : direction === 'BULLISH'
-        ? 'BUY'
-        : 'SELL';
+  const selectedReasons = direction === 'BUY'
+    ? buy.reasons
+    : sell.reasons;
 
-  reasons.push(
-    ...guards.map(reason => `NO TRADE: ${reason}`)
-  );
+  const evidenceScore = qualified
+    ? selectedScore
+    : Math.min(selectedScore, 49);
 
   return {
     pair,
-    timeframe: 1,
-    signal: 'NO TRADE',
-    technicalSignal,
-    confidence: Math.min(100, winningScore),
-    callScore: round(callScore, 0),
-    putScore: round(putScore, 0),
-    gap: round(scoreGap, 0),
-    entryTime: null,
-    expiryTime: null,
-    currentPrice: last.close,
-    entryPrice: null,
-    entryPriceStatus: 'WAITING_FOR_ENTRY_PRICE',
-    brokerPrice: null,
-    brokerPriceStatus: 'NOT_SUBMITTED',
-    brokerPriceGapPips: null,
-    brokerPriceTolerancePips: DEFAULT_MAX_PRICE_GAP_PIPS,
-    freshness,
-    dataAgeSeconds: round(age, 1),
-    lastCandle: iso(last.time),
-    fetchedAt: iso(fetchedAt),
-    supportResistance,
-    trendLine,
-    marketPsychology,
-    priceAction: supportResistance.position,
-    candlePattern: pattern,
-    breakout: breakoutResult,
-    confirmation5m,
-    volatility: volatilityResult,
+    signal: qualified ? direction : 'NO TRADE',
+    direction: qualified ? direction : 'NONE',
+    qualified,
+    score: selectedScore,
+    buyScore,
+    sellScore,
+    scoreGap: difference,
+    opposingScore,
+    evidenceScore,
+    evidenceLabel: evidenceScore >= 75
+      ? 'STRONG'
+      : evidenceScore >= 55
+        ? 'MODERATE'
+        : 'INSUFFICIENT',
+    scoreMeaning: 'EVIDENCE_SCORE_NOT_WIN_PROBABILITY',
+    entryPrice: current.close,
+    candleTime: current.time,
+    fetchedAt,
+    candleCount: candles.length,
     indicators: {
-      ema9: round(ema9[index]),
-      ema21: round(ema21[index]),
-      emaCross,
-      rsi14: round(rsi14[index], 2),
-      macd: {
-        line: round(macdValues.line[index]),
-        signal: round(macdValues.signal[index]),
-        histogram: round(
-          macdValues.histogram[index]
-        ),
-        crossover: macdCross
-      },
-      atr14: round(atr14[index]),
-      bollinger: {
-        upper: round(bands.upper[index]),
-        middle: round(bands.middle[index]),
-        lower: round(bands.lower[index]),
-        width: round(bands.width[index], 5)
-      }
+      ema9,
+      ema21,
+      previousEma9,
+      previousEma21,
+      emaCross: cross,
+      macd,
+      rsi14: rsi,
+      atr14: atr,
+      bollinger,
+      support: levels.support,
+      resistance: levels.resistance,
+      trendline,
+      candlePatterns: patterns,
+      psychology,
+      volatility,
+      fiveMinuteDirection,
+      fiveMinuteCandleCount: fiveMinuteCandles.length
     },
-    reasons,
-    source: 'Twelve Data LIVE',
-    evidenceLabel: 'Evidence score, not win probability',
-    tradeAllowed: false,
-    noTrade: true,
-    insufficientData: guards.length > 0
+    evidence: selectedReasons,
+    rejectedReasons: qualified ? [] : [...new Set(rejectedReasons)],
+    warnings
   };
 }
+// ============================================================
+// V10.4.0 — MARKET CACHE AND 24-PAIR SCANNER
+// ============================================================
 
-function evaluateFreshness(market, now = Date.now()) {
-  if (!market) return emptyMarket();
+const v104MarketCache = new Map();
 
-  const candleTime = Date.parse(market.lastCandle || '');
+const v104ScannerState = {
+  running: false,
+  startedAt: null,
+  completedAt: null,
+  lastError: null,
+  currentPair: null,
+  completedPairs: 0,
+  totalPairs: PAIRS.length,
+  lastResults: [],
+  nextScanAt: null
+};
 
-  if (!Number.isFinite(candleTime)) {
-    return {
-      ...market,
-      signal: 'NO TRADE',
-      tradeAllowed: false,
-      noTrade: true,
-      freshness: 'NO DATA',
-      dataAgeSeconds: null
-    };
-  }
+function getMarketCacheEntry(pair) {
+  return v104MarketCache.get(normalizePair(pair)) || null;
+}
 
-  const age = Math.max(
-    0,
-    (now - (candleTime + 60000)) / 1000
+function isMarketDataFresh(entry, now = Date.now()) {
+  if (!entry || !Array.isArray(entry.candles)) return false;
+  if (!Number.isFinite(entry.fetchedAt)) return false;
+
+  const age = now - entry.fetchedAt;
+
+  return (
+    age >= 0 &&
+    age <= 150000 &&
+    entry.candles.length >= MIN_CANDLES
   );
-
-  const freshness =
-    age <= FRESHNESS_SECONDS
-      ? 'FRESH'
-      : age <= HARD_STALE_SECONDS
-        ? 'STALE'
-        : 'HARD STALE';
-
-  if (freshness !== 'FRESH') {
-    return {
-      ...market,
-      signal: 'NO TRADE',
-      tradeAllowed: false,
-      noTrade: true,
-      freshness,
-      dataAgeSeconds: round(age, 1),
-      reasons: [
-        ...(market.reasons || []),
-        'NO TRADE: latest completed candle is stale.'
-      ]
-    };
-  }
-
-  return {
-    ...market,
-    freshness,
-    dataAgeSeconds: round(age, 1)
-  };
 }
 
-/* -------------------------------------------------------
-   POCKET OPTION MANUAL PRICE VALIDATION
-------------------------------------------------------- */
-
-function applyBrokerPrice(
-  market,
-  brokerPriceValue,
-  capturedAtMs = Date.now()
-) {
-  const result = {
-    ...market,
-    signal: 'NO TRADE',
-    tradeAllowed: false,
-    noTrade: true,
-    brokerPrice: null,
-    brokerPriceStatus: 'INVALID_OR_MISSING',
-    brokerPriceGapPips: null,
-    brokerPriceTolerancePips:
-      DEFAULT_MAX_PRICE_GAP_PIPS,
-    entryPrice: null,
-    entryPriceStatus: 'WAITING_FOR_ENTRY_PRICE'
-  };
-
-  const brokerPrice = Number(brokerPriceValue);
-
-  if (
-    brokerPriceValue === undefined ||
-    brokerPriceValue === null ||
-    brokerPriceValue === '' ||
-    !Number.isFinite(brokerPrice) ||
-    brokerPrice <= 0
-  ) {
-    result.reasons = [
-      ...(market.reasons || []),
-      'NO TRADE: enter a valid Pocket Option broker price.'
-    ];
-
-    return result;
-  }
-
-  result.brokerPrice = brokerPrice;
-  result.brokerPriceSubmittedAt = iso(capturedAtMs);
-  result.brokerPriceCapturedAt = iso(capturedAtMs);
-  result.brokerPriceSource = 'USER ENTERED POCKET OPTION PRICE';
-
-  if (market.freshness !== 'FRESH') {
-    result.brokerPriceStatus = 'MARKET_DATA_NOT_FRESH';
-    result.reasons = [
-      ...(market.reasons || []),
-      'NO TRADE: market data is not fresh.'
-    ];
-
-    return result;
-  }
-
-  if (market.technicalSignal === 'NO TRADE') {
-    result.brokerPriceStatus = 'TECHNICAL_FILTER_FAILED';
-    result.reasons = [
-      ...(market.reasons || []),
-      'NO TRADE: technical qualification did not pass.'
-    ];
-
-    return result;
-  }
-
-  if (!finite(market.currentPrice) || market.currentPrice <= 0) {
-    result.brokerPriceStatus = 'REFERENCE_PRICE_UNAVAILABLE';
-    result.reasons = [
-      ...(market.reasons || []),
-      'NO TRADE: Twelve Data reference price is unavailable.'
-    ];
-
-    return result;
-  }
-
-  const gap = priceDifferencePips(
-    market.pair,
-    brokerPrice,
-    Number(market.currentPrice)
-  );
-
-  result.brokerPriceGapPips = round(gap, 2);
-
-  if (gap > DEFAULT_MAX_PRICE_GAP_PIPS) {
-    result.brokerPriceStatus = 'PRICE_GAP_TOO_LARGE';
-
-    result.reasons = [
-      ...(market.reasons || []),
-      `NO TRADE: Pocket Option price differs from Twelve Data by ${round(gap, 2)} pips; maximum allowed is ${DEFAULT_MAX_PRICE_GAP_PIPS}.`
-    ];
-
-    return result;
-  }
-
-  const now = Date.now();
-  const entry = (Math.floor(now / 60000) + 1) * 60000;
-  const expiry = entry + 60000;
-
-  result.signal = market.technicalSignal;
-  result.tradeAllowed = true;
-  result.noTrade = false;
-  result.entryPrice = brokerPrice;
-  result.entryPriceStatus = 'USER_ENTERED_PRICE_ACCEPTED';
-  result.brokerPriceStatus = 'WITHIN_TOLERANCE';
-  result.entryTime = iso(entry);
-  result.expiryTime = iso(expiry);
-
-  result.reasons = [
-    ...(market.reasons || []),
-    `Pocket Option user-entered price is within ${DEFAULT_MAX_PRICE_GAP_PIPS}-pip tolerance.`,
-    '5-minute trend confirmation passed.',
-    'Live signal duration is one minute.'
-  ];
-
-  return result;
+function isMarketDataHardStale(entry, now = Date.now()) {
+  if (!entry || !Number.isFinite(entry.fetchedAt)) return true;
+  return now - entry.fetchedAt > 300000;
 }
 
-function createSignalRecord(market) {
-  if (
-    !market ||
-    market.tradeAllowed !== true ||
-    !['BUY', 'SELL'].includes(market.signal) ||
-    !finite(market.entryPrice)
-  ) {
+function saveMarketCache(pair, candles, fetchedAt, source) {
+  const normalizedPair = normalizePair(pair);
+  const normalizedCandles = Array.isArray(candles) ? candles : [];
+
+  if (!normalizedPair || normalizedCandles.length === 0) {
     return null;
   }
 
-  const id = [
-    market.pair,
-    market.signal,
-    market.entryTime,
-    market.brokerPrice
-  ].join('_');
-
-  return {
-    id,
-    pair: market.pair,
-    signal: market.signal,
-    evidenceScore: market.confidence,
-    entryTime: market.entryTime,
-    expiryTime: market.expiryTime,
-    referencePrice: market.currentPrice,
-    brokerPrice: market.brokerPrice,
-    outcome: 'PENDING',
-    createdAt: iso(Date.now()),
-    source: 'Twelve Data reference + user-entered broker price',
-    brokerPriceSource: market.brokerPriceSource,
-    brokerPriceSubmittedAt: market.brokerPriceSubmittedAt,
-    brokerPriceGapPips: market.brokerPriceGapPips
+  const entry = {
+    pair: normalizedPair,
+    candles: normalizedCandles,
+    fetchedAt: Number(fetchedAt) || Date.now(),
+    source: source || 'unknown',
+    updatedAt: Date.now()
   };
+
+  v104MarketCache.set(normalizedPair, entry);
+  return entry;
 }
 
-/* -------------------------------------------------------
-   SCANNER AND AUTO SELECTION
-------------------------------------------------------- */
+function getCachedMarketAnalysis(pair) {
+  const normalizedPair = normalizePair(pair);
+  const entry = getMarketCacheEntry(normalizedPair);
 
-function candidateIsQualified(market) {
-  return Boolean(
-    market &&
-    market.freshness === 'FRESH' &&
-    market.technicalSignal !== 'NO TRADE' &&
-    market.insufficientData !== true &&
-    market.confirmation5m &&
-    market.confirmation5m.status === 'CONFIRMED' &&
-    market.confirmation5m.direction ===
-      (market.technicalSignal === 'BUY'
-        ? 'BULLISH'
-        : 'BEARISH')
-  );
-}
-
-function rankCandidates(markets) {
-  const priorityIndex = new Map(
-    PRIORITY_PAIRS.map((pair, index) => [pair, index])
-  );
-
-  return markets
-    .map(evaluateFreshness)
-    .sort((a, b) => {
-      const qualifiedDifference =
-        Number(candidateIsQualified(b)) -
-        Number(candidateIsQualified(a));
-
-      if (qualifiedDifference !== 0) {
-        return qualifiedDifference;
-      }
-
-      const scoreDifference =
-        Math.max(b.callScore || 0, b.putScore || 0) -
-        Math.max(a.callScore || 0, a.putScore || 0);
-
-      if (scoreDifference !== 0) {
-        return scoreDifference;
-      }
-
-      return (
-        (priorityIndex.get(a.pair) ?? 999) -
-        (priorityIndex.get(b.pair) ?? 999)
-      );
-    })
-    .map((market, index) => ({
-      rank: index + 1,
-      pair: market.pair,
-      timeframe: 1,
-      signal: candidateIsQualified(market)
-        ? market.technicalSignal
-        : 'NO TRADE',
-      technicalSignal: market.technicalSignal,
-      qualified: candidateIsQualified(market),
-      confidence: market.confidence,
-      callScore: market.callScore,
-      putScore: market.putScore,
-      gap: market.gap,
-      currentPrice: market.currentPrice,
-      freshness: market.freshness,
-      dataAgeSeconds: market.dataAgeSeconds,
-      entryTime: market.entryTime,
-      oneMinuteTrend:
-        (market.callScore || 0) > (market.putScore || 0)
-          ? 'BULLISH'
-          : (market.putScore || 0) > (market.callScore || 0)
-            ? 'BEARISH'
-            : 'NEUTRAL',
-      fiveMinuteConfirmation:
-        market.confirmation5m?.direction || 'UNAVAILABLE',
-      volatility:
-        market.volatility?.regime || 'UNAVAILABLE',
-      reason:
-        market.reasons?.[0] || 'Evidence review.'
-    }));
-}
-
-function selectBest(markets) {
-  const ranked = rankCandidates(markets);
-
-  const qualified = ranked.find(
-    candidate => candidate.qualified === true
-  );
-
-  if (!qualified) {
+  if (!entry) {
     return {
-      selected: emptyMarket(
-        'NO QUALIFIED PAIR',
-        'No pair passed all live evidence and confirmation requirements.'
-      ),
-      ranked
+      pair: normalizedPair,
+      available: false,
+      fresh: false,
+      reason: 'NO_CACHED_MARKET_DATA'
     };
   }
 
-  const selected =
-    markets.find(market => market.pair === qualified.pair) ||
-    latestMarkets.get(qualified.pair);
+  const fresh = isMarketDataFresh(entry);
+
+  if (!fresh) {
+    return {
+      pair: normalizedPair,
+      available: false,
+      fresh: false,
+      reason: isMarketDataHardStale(entry)
+        ? 'MARKET_DATA_HARD_STALE'
+        : 'MARKET_DATA_NOT_FRESH',
+      fetchedAt: entry.fetchedAt,
+      ageMs: Date.now() - entry.fetchedAt
+    };
+  }
+
+  const analysis = scoreMarket(
+    normalizedPair,
+    entry.candles,
+    entry.fetchedAt
+  );
 
   return {
-    selected: selected || emptyMarket(),
-    ranked
+    ...analysis,
+    available: true,
+    fresh: true,
+    ageMs: Date.now() - entry.fetchedAt,
+    dataSource: entry.source
   };
 }
 
-function getCurrentAnalysis() {
-  const markets = [...latestMarkets.values()]
-    .map(evaluateFreshness);
+function getFreshCachedAnalyses(pairs = PAIRS) {
+  const results = [];
 
-  const selection = selectBest(markets);
+  for (const pair of pairs) {
+    const result = getCachedMarketAnalysis(pair);
+
+    if (result.available && result.fresh) {
+      results.push(result);
+    }
+  }
+
+  return results;
+}
+
+function rankQualifiedMarkets(results) {
+  return results
+    .filter((result) => result && result.qualified === true)
+    .sort((a, b) => {
+      if (b.evidenceScore !== a.evidenceScore) {
+        return b.evidenceScore - a.evidenceScore;
+      }
+
+      if (b.scoreGap !== a.scoreGap) {
+        return b.scoreGap - a.scoreGap;
+      }
+
+      return (a.ageMs || 0) - (b.ageMs || 0);
+    });
+}
+
+function getBestCachedMarket() {
+  const analyses = getFreshCachedAnalyses(PAIRS);
+  const qualified = rankQualifiedMarkets(analyses);
+
+  if (!qualified.length) {
+    return {
+      signal: 'NO TRADE',
+      direction: 'NONE',
+      qualified: false,
+      reason: 'NO_FRESH_QUALIFIED_MARKET',
+      scannedFreshPairs: analyses.length,
+      totalPairs: PAIRS.length,
+      evidenceScore: 0,
+      scoreMeaning: 'EVIDENCE_SCORE_NOT_WIN_PROBABILITY'
+    };
+  }
 
   return {
-    selectedMarket: selection.selected,
-    rankedCandidates: selection.ranked
+    ...qualified[0],
+    selectedBy: 'BEST_FRESH_QUALIFIED_MARKET',
+    scannedFreshPairs: analyses.length,
+    totalPairs: PAIRS.length
   };
 }
 
-function makeResponse(
-  selectedMarket,
-  rankedCandidates = [],
-  extra = {}
-) {
+async function scanOnePair(pair) {
+  const normalizedPair = normalizePair(pair);
+
+  if (!normalizedPair || !PAIRS.includes(normalizedPair)) {
+    return {
+      pair: normalizedPair,
+      success: false,
+      reason: 'PAIR_NOT_SUPPORTED'
+    };
+  }
+
+  try {
+    const providerResult = await providerFetch(
+      normalizedPair,
+      'scanner'
+    );
+
+    if (
+      !providerResult ||
+      !Array.isArray(providerResult.candles) ||
+      providerResult.candles.length < MIN_CANDLES
+    ) {
+      return {
+        pair: normalizedPair,
+        success: false,
+        reason: 'INSUFFICIENT_PROVIDER_CANDLES'
+      };
+    }
+
+    const entry = saveMarketCache(
+      normalizedPair,
+      providerResult.candles,
+      providerResult.fetchedAt,
+      providerResult.source || 'twelve_data'
+    );
+
+    const analysis = scoreMarket(
+      normalizedPair,
+      entry.candles,
+      entry.fetchedAt
+    );
+
+    return {
+      pair: normalizedPair,
+      success: true,
+      fetchedAt: entry.fetchedAt,
+      candleCount: entry.candles.length,
+      analysis
+    };
+  } catch (error) {
+    return {
+      pair: normalizedPair,
+      success: false,
+      reason: error && error.message
+        ? error.message
+        : 'PAIR_SCAN_FAILED'
+    };
+  }
+}
+
+async function runBackgroundScan(options = {}) {
+  if (v104ScannerState.running) {
+    return {
+      started: false,
+      reason: 'SCAN_ALREADY_RUNNING',
+      progress: { ...v104ScannerState }
+    };
+  }
+
+  const force = options.force === true;
+  const now = Date.now();
+
+  // Avoid overlapping sweeps and protect the provider's daily quota.
+  if (!force && v104ScannerState.nextScanAt &&
+      now < v104ScannerState.nextScanAt) {
+    return {
+      started: false,
+      reason: 'SCAN_INTERVAL_NOT_REACHED',
+      nextScanAt: v104ScannerState.nextScanAt
+    };
+  }
+
+  const remainingDaily = Math.max(
+    0,
+    DAILY_USABLE_LIMIT - dailyCreditsUsed
+  );
+
+  const remainingScanner = Math.max(
+    0,
+    SCANNER_DAILY_BUDGET - scannerCreditsUsed
+  );
+
+  if (
+    remainingDaily < PAIRS.length ||
+    remainingScanner < PAIRS.length
+  ) {
+    v104ScannerState.lastError = 'INSUFFICIENT_DAILY_SCAN_BUDGET';
+
+    return {
+      started: false,
+      reason: 'INSUFFICIENT_DAILY_SCAN_BUDGET',
+      remainingDaily,
+      remainingScanner
+    };
+  }
+
+  v104ScannerState.running = true;
+  v104ScannerState.startedAt = Date.now();
+  v104ScannerState.completedAt = null;
+  v104ScannerState.lastError = null;
+  v104ScannerState.currentPair = null;
+  v104ScannerState.completedPairs = 0;
+  v104ScannerState.totalPairs = PAIRS.length;
+  v104ScannerState.lastResults = [];
+
+  const orderedPairs = [
+    ...PRIORITY_PAIRS,
+    ...BACKGROUND_PAIRS
+  ];
+
+  try {
+    for (const pair of orderedPairs) {
+      v104ScannerState.currentPair = pair;
+
+      const result = await scanOnePair(pair);
+
+      v104ScannerState.lastResults.push(result);
+      v104ScannerState.completedPairs += 1;
+
+      // Yield between requests. providerFetch also enforces
+      // the provider queue's request spacing and per-minute limit.
+      await sleep(100);
+    }
+
+    v104ScannerState.completedAt = Date.now();
+    v104ScannerState.nextScanAt =
+      v104ScannerState.completedAt + SCAN_INTERVAL_MS;
+
+    return {
+      started: true,
+      completed: true,
+      startedAt: v104ScannerState.startedAt,
+      completedAt: v104ScannerState.completedAt,
+      completedPairs: v104ScannerState.completedPairs,
+      totalPairs: v104ScannerState.totalPairs,
+      successfulPairs: v104ScannerState.lastResults.filter(
+        (item) => item.success
+      ).length,
+      failedPairs: v104ScannerState.lastResults.filter(
+        (item) => !item.success
+      ).length
+    };
+  } catch (error) {
+    v104ScannerState.lastError = error && error.message
+      ? error.message
+      : 'BACKGROUND_SCAN_ERROR';
+
+    return {
+      started: true,
+      completed: false,
+      error: v104ScannerState.lastError,
+      completedPairs: v104ScannerState.completedPairs,
+      totalPairs: v104ScannerState.totalPairs
+    };
+  } finally {
+    v104ScannerState.running = false;
+    v104ScannerState.currentPair = null;
+
+    if (!v104ScannerState.nextScanAt) {
+      v104ScannerState.nextScanAt =
+        Date.now() + SCAN_INTERVAL_MS;
+    }
+  }
+}
+
+function getScannerStatus() {
   return {
-    ok: true,
+    running: v104ScannerState.running,
+    startedAt: v104ScannerState.startedAt,
+    completedAt: v104ScannerState.completedAt,
+    currentPair: v104ScannerState.currentPair,
+    completedPairs: v104ScannerState.completedPairs,
+    totalPairs: v104ScannerState.totalPairs,
+    successfulPairs: v104ScannerState.lastResults.filter(
+      (item) => item.success
+    ).length,
+    failedPairs: v104ScannerState.lastResults.filter(
+      (item) => !item.success
+    ).length,
+    lastError: v104ScannerState.lastError,
+    nextScanAt: v104ScannerState.nextScanAt,
+    priorityPairs: PRIORITY_PAIRS,
+    backgroundPairs: BACKGROUND_PAIRS,
+    freshCachedPairs: getFreshCachedAnalyses(PAIRS).length
+  };
+}
+// ============================================================
+// V10.4.0 — ANALYSIS AND SCANNER API
+// ============================================================
+
+function buildNoTradeResponse(reason, extra = {}) {
+  return {
     version: VERSION,
-    selectedMarket,
-    rankedCandidates,
-    scanner: {
-      running: scannerRunning,
-      startedAt: scannerStartedAt,
-      lastScanAt,
-      totalScanned,
-      mode:
-        'FIRST 6 OF 24 PRIORITY PAIRS; BACKGROUND 18 NOT PART OF INITIAL SCAN',
-      phase: scanProgress.phase,
-      batchSize: 6,
-      pairs: 24,
-      priorityPairs: PRIORITY_PAIRS,
-      backgroundPairs: BACKGROUND_PAIRS,
-      progress: { ...scanProgress },
-      cooldownRemainingMs: Math.max(
-        0,
-        SCAN_COOLDOWN_MS -
-          (Date.now() - lastScanStartedAtMs)
-      )
-    },
-    metadata: metadata(),
-    source: 'Twelve Data LIVE',
-    diagnostic: { lastScanError },
+    signal: 'NO TRADE',
+    direction: 'NONE',
+    qualified: false,
+    evidenceScore: 0,
+    evidenceLabel: 'INSUFFICIENT',
+    scoreMeaning: 'EVIDENCE_SCORE_NOT_WIN_PROBABILITY',
+    reason,
     ...extra
   };
 }
 
-function refreshCandidates() {
-  const analysis = getCurrentAnalysis();
-
-  return makeResponse(
-    analysis.selectedMarket,
-    analysis.rankedCandidates
-  );
-}
-
-async function processPair(pair) {
-  try {
-    let data = await getPairData(pair, false);
-
-    let market = evaluateFreshness(
-      scoreMarket(data.candles, pair, data.fetchedAt)
+function buildAnalysisResponse(result) {
+  if (!result || !result.available || !result.fresh) {
+    return buildNoTradeResponse(
+      result?.reason || 'MARKET_DATA_UNAVAILABLE',
+      {
+        pair: result?.pair || null,
+        fetchedAt: result?.fetchedAt || null,
+        ageMs: result?.ageMs ?? null
+      }
     );
-
-    if (market.freshness !== 'FRESH') {
-      data = await getPairData(pair, true);
-
-      market = evaluateFreshness(
-        scoreMarket(data.candles, pair, data.fetchedAt)
-      );
-    }
-
-    latestMarkets.set(pair, market);
-
-    return {
-      pair,
-      success: true,
-      qualified: candidateIsQualified(market),
-      market
-    };
-  } catch (error) {
-    lastScanError =
-      `${pair}: ${String(error.message || error)}`;
-
-    const failed = emptyMarket(pair, lastScanError);
-
-    latestMarkets.set(pair, failed);
-
-    return {
-      pair,
-      success: false,
-      qualified: false,
-      error: lastScanError
-    };
-  } finally {
-    refreshCandidates();
   }
-}
-
-async function scanPriority() {
-  if (scannerRunning || !API_KEY) return false;
-
-  scannerRunning = true;
-  scannerStartedAt = iso(Date.now());
-  lastScanStartedAtMs = Date.now();
-  lastScanError = null;
-
-  scanProgress = {
-    phase: 'PRIORITY',
-    completed: 0,
-    total: 6,
-    priorityCompleted: 0,
-    priorityTotal: 6,
-    backgroundCompleted: 0,
-    backgroundTotal: 18,
-    pair: null
-  };
-
-  try {
-    for (const pair of PRIORITY_PAIRS) {
-      scanProgress.phase = 'PRIORITY';
-      scanProgress.pair = pair;
-
-      await processPair(pair);
-
-      scanProgress.priorityCompleted++;
-      scanProgress.completed++;
-    }
-
-    scanProgress.phase = 'PRIORITY_COMPLETE';
-    scanProgress.pair = null;
-
-    lastScanAt = iso(Date.now());
-    totalScanned += scanProgress.completed;
-
-    return true;
-  } finally {
-    scannerRunning = false;
-    scanProgress.phase = 'PRIORITY_COMPLETE';
-    scanProgress.pair = null;
-    refreshCandidates();
-  }
-}
-
-function startScanIfPossible() {
-  if (!API_KEY || scannerRunning) return false;
-
-  const remaining = Math.max(
-    0,
-    SCAN_COOLDOWN_MS -
-      (Date.now() - lastScanStartedAtMs)
-  );
-
-  if (lastScanStartedAtMs && remaining > 0) {
-    return false;
-  }
-
-  resetDailyCounter();
-
-  if (DAILY_USABLE_LIMIT - dailyCreditsUsed < 6) {
-    lastScanError =
-      'Insufficient daily Twelve Data budget for a complete six-pair scan.';
-
-    return false;
-  }
-
-  void scanPriority().catch(error => {
-    lastScanError = String(error.message || error);
-    scannerRunning = false;
-    scanProgress.phase = 'ERROR';
-    scanProgress.pair = null;
-    refreshCandidates();
-  });
-
-  return true;
-}
-
-/* -------------------------------------------------------
-   WALK-FORWARD BACKTEST
-------------------------------------------------------- */
-
-function historicalSignal(candles, index) {
-  const sample = candles.slice(0, index + 1);
-
-  if (sample.length < MIN_CANDLES) return null;
-
-  const closes = sample.map(candle => candle.close);
-
-  const ema9 = ema(closes, 9);
-  const ema21 = ema(closes, 21);
-  const rsi14 = rsi(closes);
-  const macdValues = macd(closes);
-  const atrValues = atr(sample);
-  const bands = bollinger(closes);
-
-  const last = sample.length - 1;
-
-  const values = [
-    ema9[last],
-    ema21[last],
-    rsi14[last],
-    macdValues.histogram[last],
-    atrValues[last],
-    bands.width[last]
-  ];
-
-  if (!values.every(finite)) return null;
-
-  const five = aggregate5m(sample);
-
-  if (five.length < MIN_5M_CANDLES) return null;
-
-  const fiveCloses = five.map(candle => candle.close);
-  const fiveFast = ema(fiveCloses, 9);
-  const fiveSlow = ema(fiveCloses, 21);
-
-  const fiveDirection =
-    fiveFast.at(-1) > fiveSlow.at(-1)
-      ? 'BULLISH'
-      : fiveFast.at(-1) < fiveSlow.at(-1)
-        ? 'BEARISH'
-        : 'NEUTRAL';
-
-  const pattern = candlePattern(sample);
-  const psychologyResult = psychology(sample);
-  const supportResistance = levels(sample);
-  const trend = trendline(sample);
-  const breakoutResult = breakout(sample);
-
-  let bull = 0;
-  let bear = 0;
-
-  const add = (direction, points) => {
-    if (direction === 'BULLISH') bull += points;
-    if (direction === 'BEARISH') bear += points;
-  };
-
-  add(
-    ema9[last] > ema21[last]
-      ? 'BULLISH'
-      : 'BEARISH',
-    3
-  );
-
-  add(
-    rsi14[last] > 50 && rsi14[last] < 70
-      ? 'BULLISH'
-      : rsi14[last] < 50 && rsi14[last] > 30
-        ? 'BEARISH'
-        : 'NEUTRAL',
-    2
-  );
-
-  add(
-    macdValues.histogram[last] > 0
-      ? 'BULLISH'
-      : macdValues.histogram[last] < 0
-        ? 'BEARISH'
-        : 'NEUTRAL',
-    2
-  );
-
-  add(
-    pattern.direction,
-    pattern.name.includes('ENGULFING') ||
-      pattern.name.includes('STAR')
-      ? 8
-      : 4
-  );
-
-  add(psychologyResult.direction, 4);
-  add(supportResistance.direction, 4);
-  add(trend.direction, 3);
-
-  add(
-    breakoutResult.direction,
-    breakoutResult.status.includes('FALSE') ? 0 : 4
-  );
-
-  const direction =
-    bull > bear
-      ? 'BULLISH'
-      : bear > bull
-        ? 'BEARISH'
-        : 'NEUTRAL';
-
-  const winning = Math.max(bull, bear);
-  const gap = Math.abs(bull - bear);
-
-  const sortedWidths = bands.width
-    .filter(finite)
-    .sort((a, b) => a - b);
-
-  const highWidth = sortedWidths[
-    Math.floor((sortedWidths.length - 1) * 0.75)
-  ];
-
-  if (
-    direction === 'NEUTRAL' ||
-    winning < 25 ||
-    gap < 7 ||
-    fiveDirection !== direction ||
-    bands.width[last] >= highWidth ||
-    breakoutResult.status.startsWith('FALSE')
-  ) {
-    return null;
-  }
-
-  return direction === 'BULLISH' ? 'BUY' : 'SELL';
-}
-
-function runWalkForward(candles, expiry = 1) {
-  const duration = clamp(Number(expiry) || 1, 1, 3);
-  const split = Math.floor(candles.length * 0.7);
-  const start = Math.max(
-    MIN_CANDLES,
-    Math.floor(candles.length * 0.25)
-  );
-
-  let developmentSignals = 0;
-  let developmentHits = 0;
-  let holdoutSignals = 0;
-  let holdoutHits = 0;
-  let eligible = 0;
-
-  for (
-    let index = start;
-    index + duration < candles.length - 1;
-    index++
-  ) {
-    const direction = historicalSignal(candles, index);
-
-    if (!direction) continue;
-
-    eligible++;
-
-    const entry = candles[index + 1].open;
-    const exit = candles[index + duration].close;
-
-    if (!finite(entry) || !finite(exit) || entry === exit) {
-      continue;
-    }
-
-    const hit =
-      direction === 'BUY'
-        ? exit > entry
-        : exit < entry;
-
-    if (index < split) {
-      developmentSignals++;
-
-      if (hit) developmentHits++;
-    } else {
-      holdoutSignals++;
-
-      if (hit) holdoutHits++;
-    }
-  }
-
-  const holdoutRate = holdoutSignals
-    ? holdoutHits / holdoutSignals * 100
-    : null;
-
-  const developmentRate = developmentSignals
-    ? developmentHits / developmentSignals * 100
-    : null;
-
-  const sufficient =
-    holdoutSignals >= BACKTEST_MIN_SIGNALS;
 
   return {
-    method:
-      'CHRONOLOGICAL WALK-FORWARD · NEXT-CANDLE OPEN ENTRY',
-    lookAheadBiasControl:
-      'Decision uses completed candles through index i; entry is next candle open; exit is expiry candle close.',
-    expiryMinutes: duration,
-    candles: candles.length,
-    coveragePercent: candles.length
-      ? round(
-          eligible / Math.max(1, candles.length - start - duration) * 100,
-          2
-        )
-      : 0,
-    development: {
-      signals: developmentSignals,
-      hits: developmentHits,
-      hitRate: round(developmentRate, 2)
-    },
-    holdout: {
-      signals: holdoutSignals,
-      hits: holdoutHits,
-      hitRate: round(holdoutRate, 2),
-      baselinePercent: 50,
-      sufficientSample: sufficient
-    },
-    totalSignals:
-      developmentSignals + holdoutSignals,
-    conclusion: !sufficient
-      ? 'INSUFFICIENT HOLDOUT SAMPLE — no performance claim.'
-      : holdoutRate > 50
-        ? 'Holdout exceeded 50% directional reference in this sample only; not a guarantee.'
-        : 'Holdout did not exceed the 50% directional reference.',
-    limitations: [
-      'No broker spread, payout, slippage or execution latency model.',
-      'Historical candles are not Pocket Option execution prices.',
-      'This is a research comparison, not a probability forecast.'
-    ],
-    warning:
-      'Historical results do not predict or guarantee future outcomes.'
+    version: VERSION,
+    pair: result.pair,
+    signal: result.signal,
+    direction: result.direction,
+    qualified: result.qualified,
+    score: result.score,
+    buyScore: result.buyScore,
+    sellScore: result.sellScore,
+    scoreGap: result.scoreGap,
+    opposingScore: result.opposingScore,
+    evidenceScore: result.evidenceScore,
+    evidenceLabel: result.evidenceLabel,
+    scoreMeaning: result.scoreMeaning,
+    entryPrice: result.entryPrice,
+    candleTime: result.candleTime,
+    fetchedAt: result.fetchedAt,
+    ageMs: result.ageMs,
+    candleCount: result.candleCount,
+    indicators: result.indicators,
+    evidence: result.evidence,
+    rejectedReasons: result.rejectedReasons,
+    warnings: result.warnings,
+    dataSource: result.dataSource
   };
 }
 
-/* -------------------------------------------------------
-   API ROUTES
-------------------------------------------------------- */
+function getAnalysisForPair(pair) {
+  const normalizedPair = normalizePair(pair);
 
-app.get('/', (_req, res) => {
+  if (!PAIRS.includes(normalizedPair)) {
+    return buildNoTradeResponse('UNSUPPORTED_PAIR', {
+      pair: normalizedPair
+    });
+  }
+
+  const result = getCachedMarketAnalysis(normalizedPair);
+  return buildAnalysisResponse(result);
+}
+
+function getBestAnalysisResponse() {
+  const best = getBestCachedMarket();
+
+  if (!best || !best.qualified) {
+    return buildNoTradeResponse(
+      best?.reason || 'NO_FRESH_QUALIFIED_MARKET',
+      {
+        scannedFreshPairs: best?.scannedFreshPairs || 0,
+        totalPairs: PAIRS.length,
+        scanner: getScannerStatus()
+      }
+    );
+  }
+
+  return {
+    version: VERSION,
+    ...best,
+    scoreMeaning: 'EVIDENCE_SCORE_NOT_WIN_PROBABILITY',
+    scanner: getScannerStatus()
+  };
+}
+
+// Health check.
+app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
-    name: 'PO AI Predictor API',
     version: VERSION,
-    mode: 'LIVE FOREX ONLY',
-    endpoints: [
-      '/api/health',
-      '/api/best',
-      '/api/analyze',
-      '/api/scan',
-      '/api/confirm-signal',
-      '/api/history',
-      '/api/backtest'
-    ]
+    service: 'PO AI PREDICTOR',
+    mode: 'LIVE_FOREX_ONLY',
+    timestamp: new Date().toISOString()
   });
 });
 
-app.get('/api/health', (_req, res) => {
+// Application metadata.
+app.get('/api/status', (req, res) => {
   res.json({
-    ok: true,
+    ...metadata(),
     version: VERSION,
-    provider: 'Twelve Data LIVE',
-    configured: Boolean(API_KEY),
-    mode: 'LIVE FOREX ONLY',
-    scannerRunning,
-    scannerEnabled: Boolean(API_KEY),
-    scannerMode: 'FIRST 6 OF 24',
-    scannerStartedAt,
-    lastScanAt,
-    totalScanned,
+    mode: 'LIVE_FOREX_ONLY',
+    pairs: PAIRS,
     priorityPairs: PRIORITY_PAIRS,
     backgroundPairs: BACKGROUND_PAIRS,
-    scanProgress: { ...scanProgress },
-    cooldownRemainingMs: Math.max(
-
-
-      0,
-      SCAN_COOLDOWN_MS -
-        (Date.now() - lastScanStartedAtMs)
-    ),
-    brokerPriceMode:
-      'MANUAL USER-ENTERED POCKET OPTION PRICE',
-    brokerPriceTolerancePips:
-      DEFAULT_MAX_PRICE_GAP_PIPS,
-    brokerPriceMaxAgeSeconds:
-      BROKER_PRICE_MAX_AGE_MS / 1000,
-    metadata: metadata()
+    scanner: getScannerStatus()
   });
 });
 
-app.get('/api/best', (_req, res) => {
-  const analysis = getCurrentAnalysis();
-
-  res.json(
-    makeResponse(
-      analysis.selectedMarket,
-      analysis.rankedCandidates
-    )
-  );
+// Scanner status.
+app.get('/api/scanner/status', (req, res) => {
+  res.json({
+    ok: true,
+    version: VERSION,
+    scanner: getScannerStatus()
+  });
 });
 
-app.get('/api/analyze', async (req, res) => {
-  const rawPair = req.query.pair;
-  const pair = rawPair
-    ? normalizePair(rawPair)
-    : null;
+// Cached analysis for a selected pair.
+// This endpoint does not make a Twelve Data request.
+app.get('/api/analyze', (req, res) => {
+  const pair = normalizePair(req.query.pair || '');
 
-  if (rawPair && !pair) {
-    return res.status(400).json({
-      ok: false,
-      version: VERSION,
-      error:
-        'Invalid pair. Select one of the supported 24 LIVE forex pairs.'
-    });
+  if (!pair || !PAIRS.includes(pair)) {
+    return res.status(400).json(
+      buildNoTradeResponse('UNSUPPORTED_PAIR', { pair })
+    );
   }
 
-  /*
-   * Explicit pair selection:
-   * The user-selected pair is never replaced by AUTO ranking.
-   */
-  if (pair) {
-    try {
-      let data = await getPairData(pair, false);
-
-      let market = evaluateFreshness(
-        scoreMarket(data.candles, pair, data.fetchedAt)
-      );
-
-      if (market.freshness !== 'FRESH') {
-        data = await getPairData(pair, true);
-
-        market = evaluateFreshness(
-          scoreMarket(data.candles, pair, data.fetchedAt)
-        );
-      }
-
-      latestMarkets.set(pair, market);
-
-      const brokerPrice = req.query.brokerPrice;
-
-      if (
-        brokerPrice !== undefined &&
-        brokerPrice !== ''
-      ) {
-        market = applyBrokerPrice(
-          market,
-          brokerPrice
-        );
-
-        if (market.tradeAllowed === true) {
-          const record = createSignalRecord(market);
-
-          if (record) {
-            await saveSignal(record);
-          }
-        }
-      }
-
-      const analysis = getCurrentAnalysis();
-
-      return res.json(
-        makeResponse(
-          market,
-          analysis.rankedCandidates,
-          {
-            selectedPair: pair,
-            analysisMode: 'USER SELECTED PAIR',
-            note:
-              'Analysis is for the selected pair. Manual broker price is required before a live research direction is confirmed.'
-          }
-        )
-      );
-    } catch (error) {
-      return res.status(503).json({
-        ok: false,
-        version: VERSION,
-        selectedPair: pair,
-        error: String(error.message || error),
-        selectedMarket: emptyMarket(
-          pair,
-          'Selected-pair analysis could not be completed.'
-        )
-      });
-    }
-  }
-
-  /*
-   * AUTO mode:
-   * Start or monitor the first-six-pair scan.
-   * A selected technical candidate is not an executable signal
-   * until its broker price is submitted separately.
-   */
-  const started = startScanIfPossible();
-  const analysis = getCurrentAnalysis();
-
-  return res.json(
-    makeResponse(
-      analysis.selectedMarket,
-      analysis.rankedCandidates,
-      {
-        analysisMode: 'AI PRIORITY SCAN',
-        scanStarted: started,
-        note:
-          'AI scans the first six priority pairs. No BUY/SELL is confirmed until a manual Pocket Option price is submitted for the selected pair.'
-      }
-    )
-  );
+  return res.json(getAnalysisForPair(pair));
 });
 
-app.post('/api/scan', (_req, res) => {
-  if (!API_KEY) {
-    return res.status(503).json({
-      ok: false,
-      version: VERSION,
-      error: 'Twelve Data API key is not configured.'
-    });
-  }
+// Compatibility endpoint for existing frontend.
+app.get('/api/best', (req, res) => {
+  return res.json(getBestAnalysisResponse());
+});
 
-  if (scannerRunning) {
+// Full cached scanner overview.
+app.get('/api/markets', (req, res) => {
+  const results = getFreshCachedAnalyses(PAIRS);
+
+  return res.json({
+    version: VERSION,
+    mode: 'LIVE_FOREX_ONLY',
+    totalPairs: PAIRS.length,
+    freshPairs: results.length,
+    qualifiedPairs: results.filter(
+      (item) => item.qualified
+    ).length,
+    markets: results.map((item) => ({
+      pair: item.pair,
+      signal: item.signal,
+      qualified: item.qualified,
+      evidenceScore: item.evidenceScore,
+      evidenceLabel: item.evidenceLabel,
+      ageMs: item.ageMs,
+      fetchedAt: item.fetchedAt,
+      rejectedReasons: item.rejectedReasons
+    })),
+    scanner: getScannerStatus()
+  });
+});
+
+// Manually request a background scan.
+// The scanner still observes the daily request budget.
+app.post('/api/scanner/start', async (req, res) => {
+  if (v104ScannerState.running) {
     return res.status(409).json({
       ok: false,
-      version: VERSION,
-      error: 'Priority scanner is already running.',
-      scanner: {
-        running: true,
-        progress: { ...scanProgress }
-      }
+      reason: 'SCAN_ALREADY_RUNNING',
+      scanner: getScannerStatus()
     });
   }
 
-  const remaining = Math.max(
-    0,
-    SCAN_COOLDOWN_MS -
-      (Date.now() - lastScanStartedAtMs)
-  );
+  const result = await runBackgroundScan({
+    force: req.body?.force === true
+  });
 
-  if (lastScanStartedAtMs && remaining > 0) {
+  if (!result.started) {
     return res.status(429).json({
       ok: false,
-      version: VERSION,
-      error:
-        'Please wait before starting another priority scan.',
-      cooldownRemainingMs: remaining
+      ...result,
+      scanner: getScannerStatus()
     });
   }
-
-  const started = startScanIfPossible();
-
-  return res.status(started ? 202 : 429).json({
-    ok: started,
-    version: VERSION,
-    message: started
-      ? 'Six-pair LIVE forex priority scan started.'
-      : 'Priority scan could not start.',
-    scanner: {
-      running: scannerRunning,
-      progress: { ...scanProgress },
-      priorityPairs: PRIORITY_PAIRS,
-      backgroundPairs: BACKGROUND_PAIRS
-    }
-  });
-});
-
-/*
- * Confirm the exact pair selected and analyzed by the frontend.
- * Pocket Option price is manually entered by the user.
- * The backend checks its timestamp and compares it with
- * the latest Twelve Data reference price.
- */
-app.post('/api/confirm-signal', async (req, res) => {
-  const body = req.body && typeof req.body === 'object'
-    ? req.body
-    : {};
-
-  const pair = normalizePair(body.pair);
-
-  if (!pair) {
-    return res.status(400).json({
-      ok: false,
-      version: VERSION,
-      error: 'A valid selected LIVE forex pair is required.'
-    });
-  }
-
-  if (Number(body.expiryMinutes) !== 1) {
-    return res.status(400).json({
-      ok: false,
-      version: VERSION,
-      error: 'Live confirmation supports one-minute signals only.'
-    });
-  }
-
-  if (
-    body.source !==
-    'USER_ENTERED_POCKET_OPTION_PRICE'
-  ) {
-    return res.status(400).json({
-      ok: false,
-      version: VERSION,
-      error:
-        'Pocket Option price must be submitted as a user-entered quote.'
-    });
-  }
-
-  const capturedAtMs = Date.parse(
-    String(body.brokerPriceCapturedAt || '')
-  );
-
-  const now = Date.now();
-
-  if (
-    !Number.isFinite(capturedAtMs) ||
-    capturedAtMs > now + 5000 ||
-    now - capturedAtMs > BROKER_PRICE_MAX_AGE_MS
-  ) {
-    return res.status(400).json({
-      ok: false,
-      version: VERSION,
-      error:
-        'Pocket Option price timestamp is invalid or older than 30 seconds. Enter the current price and confirm again.'
-    });
-  }
-
-  /*
-   * Always obtain fresh Twelve Data candles for confirmation.
-   * force=true bypasses the pair cache. If a request for this pair
-   * is already queued/in flight, getPairData may join it; quote age
-   * is checked again after the await so queue time is included.
-   */
-  let providerData;
-
-  try {
-    providerData = await getPairData(pair, true);
-  } catch (error) {
-    return res.status(503).json({
-      ok: false,
-      version: VERSION,
-      pair,
-      signal: 'NO TRADE',
-      tradeAllowed: false,
-      noTrade: true,
-      error:
-        `NO TRADE: fresh Twelve Data confirmation failed: ${String(error.message || error)} Enter the Pocket Option price again and retry.`
-    });
-  }
-
-  /*
-   * Time spent waiting in the provider queue and fetching candles
-   * consumes the quote's 30-second lifetime. Never reset capturedAtMs.
-   */
-  const confirmationNow = Date.now();
-  const quoteAgeMs = confirmationNow - capturedAtMs;
-
-  if (
-    !Number.isFinite(quoteAgeMs) ||
-    quoteAgeMs < -5000 ||
-    quoteAgeMs > BROKER_PRICE_MAX_AGE_MS
-  ) {
-    return res.status(409).json({
-      ok: false,
-      version: VERSION,
-      pair,
-      signal: 'NO TRADE',
-      tradeAllowed: false,
-      noTrade: true,
-      error:
-        'NO TRADE: Pocket Option price expired while waiting in the provider queue or for fresh market data. Enter the price again and confirm.'
-    });
-  }
-
-  if (
-    !providerData ||
-    !Array.isArray(providerData.candles) ||
-    providerData.candles.length === 0 ||
-    !Number.isFinite(Number(providerData.fetchedAt))
-  ) {
-    return res.status(503).json({
-      ok: false,
-      version: VERSION,
-      pair,
-      signal: 'NO TRADE',
-      tradeAllowed: false,
-      noTrade: true,
-      error:
-        'NO TRADE: Twelve Data did not return a valid fresh candle set.'
-    });
-  }
-
-  const rescoredMarket = scoreMarket(
-    providerData.candles,
-    pair,
-    providerData.fetchedAt
-  );
-
-  const freshMarket = evaluateFreshness(
-    rescoredMarket,
-    confirmationNow
-  );
-
-  latestMarkets.set(pair, freshMarket);
-
-  const confirmedMarket = applyBrokerPrice(
-    freshMarket,
-    body.brokerPrice,
-    capturedAtMs
-  );
-
-  let recordSaved = false;
-
-  if (confirmedMarket.tradeAllowed === true) {
-    const record = createSignalRecord(confirmedMarket);
-
-    if (record) {
-      await saveSignal(record);
-      recordSaved = true;
-    }
-  }
-
-  const validated =
-    confirmedMarket.tradeAllowed === true;
-
-  const failureReason =
-    (confirmedMarket.reasons || []).slice(-1)[0] ||
-    'Broker price validation did not pass.';
 
   return res.json({
     ok: true,
-    version: VERSION,
-    pair,
-    selectedPair: pair,
-    tradeAllowed: validated,
-    selectedMarket: confirmedMarket,
-    market: confirmedMarket,
-    brokerPrice: {
-      validated,
-      status: validated
-        ? 'VALIDATED'
-        : confirmedMarket.brokerPriceStatus,
-      price: confirmedMarket.brokerPrice,
-      referencePrice: confirmedMarket.currentPrice,
-      differencePips: confirmedMarket.brokerPriceGapPips,
-      tolerancePips: DEFAULT_MAX_PRICE_GAP_PIPS,
-      capturedAt: iso(capturedAtMs),
-      source: 'USER_ENTERED_POCKET_OPTION_PRICE',
-      reason: validated
-        ? 'Pocket Option user-entered price passed the configured tolerance.'
-        : failureReason
-    },
-    entryPrice: confirmedMarket.entryPrice,
-    entryTime: confirmedMarket.entryTime,
-    expiryTime: confirmedMarket.expiryTime,
-    recordSaved,
-    reason: validated
-      ? 'All backend confirmation checks passed. One-minute research signal only; no guaranteed outcome.'
-      : failureReason
+    ...result,
+    scanner: getScannerStatus()
   });
 });
 
-app.get('/api/history', async (req, res) => {
-  const history = await getHistory(req.query.limit);
+// Scan one requested pair manually.
+// This endpoint is separate from Analyze and is subject
+// to provider request limits.
+app.post('/api/scan/pair', async (req, res) => {
+  const pair = normalizePair(req.body?.pair || '');
 
-  res.json({
-    ok: true,
-    version: VERSION,
-    storage: databaseReady
-      ? 'POSTGRESQL'
-      : 'MEMORY_ONLY',
-    persistent: databaseReady,
-    count: history.length,
-    history
-  });
-});
-
-app.get('/api/backtest', async (req, res) => {
-  const pair = normalizePair(
-    req.query.pair || 'EUR/USD'
-  );
-
-  const expiry = Number(req.query.expiry || 1);
-
-  if (!pair) {
+  if (!pair || !PAIRS.includes(pair)) {
     return res.status(400).json({
       ok: false,
-      error: 'Invalid currency pair.'
-    });
-  }
-
-  if (![1, 2, 3].includes(expiry)) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Expiry must be 1, 2 or 3 minutes.'
+      reason: 'UNSUPPORTED_PAIR'
     });
   }
 
   try {
-    const data = await getPairData(pair, false);
-    const candles = closedCandles(data.candles);
+    const result = await scanOnePair(pair);
 
-    const result = runWalkForward(candles, expiry);
+    if (!result.success) {
+      return res.status(503).json({
+        ok: false,
+        pair,
+        reason: result.reason || 'PAIR_SCAN_FAILED'
+      });
+    }
+
+    return res.json({
+      ok: true,
+      pair,
+      analysis: buildAnalysisResponse(
+        getCachedMarketAnalysis(pair)
+      )
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      pair,
+      reason: error?.message || 'PAIR_SCAN_ERROR'
+    });
+  }
+});
+
+// ============================================================
+// V10.4.0 — DATA FRESHNESS HELPERS
+// ============================================================
+
+function validateMarketDataForSignal(pair) {
+  const entry = getMarketCacheEntry(pair);
+
+  if (!entry) {
+    return {
+      valid: false,
+      reason: 'NO_MARKET_DATA'
+    };
+  }
+
+  const ageMs = Date.now() - entry.fetchedAt;
+
+  if (ageMs > HARD_STALE_MS) {
+    return {
+      valid: false,
+      reason: 'MARKET_DATA_HARD_STALE',
+      ageMs
+    };
+  }
+
+  if (ageMs > DATA_FRESHNESS_MS) {
+    return {
+      valid: false,
+      reason: 'MARKET_DATA_NOT_FRESH',
+      ageMs
+    };
+  }
+
+  if (entry.candles.length < MIN_CANDLES) {
+    return {
+      valid: false,
+      reason: 'INSUFFICIENT_CANDLES',
+      candleCount: entry.candles.length
+    };
+  }
+
+  return {
+    valid: true,
+    pair,
+    ageMs,
+    fetchedAt: entry.fetchedAt,
+    candleCount: entry.candles.length
+  };
+}
+
+function validateFreshProviderResult(providerResult) {
+  if (
+    !providerResult ||
+    !Array.isArray(providerResult.candles)
+  ) {
+    return {
+      valid: false,
+      reason: 'PROVIDER_DATA_MISSING'
+    };
+  }
+
+  if (providerResult.candles.length < MIN_CANDLES) {
+    return {
+      valid: false,
+      reason: 'INSUFFICIENT_PROVIDER_CANDLES',
+      candleCount: providerResult.candles.length
+    };
+  }
+
+  const fetchedAt = Number(providerResult.fetchedAt);
+
+  if (!Number.isFinite(fetchedAt)) {
+    return {
+      valid: false,
+      reason: 'INVALID_PROVIDER_TIMESTAMP'
+    };
+  }
+
+  const ageMs = Date.now() - fetchedAt;
+
+  if (ageMs < 0 || ageMs > DATA_FRESHNESS_MS) {
+    return {
+      valid: false,
+      reason: 'PROVIDER_DATA_NOT_FRESH',
+      ageMs
+    };
+  }
+
+  return {
+    valid: true,
+    fetchedAt,
+    ageMs,
+    candleCount: providerResult.candles.length
+  };
+}
+// ============================================================
+// V10.4.0 — POCKET OPTION BROKER PRICE VALIDATION
+// ============================================================
+
+function validateBrokerPriceInput(input) {
+  const brokerPrice = finite(input?.brokerPrice);
+  const capturedAt = finite(input?.brokerPriceCapturedAt);
+
+  if (brokerPrice === null || brokerPrice <= 0) {
+    return {
+      valid: false,
+      reason: 'BROKER_PRICE_MISSING_OR_INVALID'
+    };
+  }
+
+  if (capturedAt === null || capturedAt <= 0) {
+    return {
+      valid: false,
+      reason: 'BROKER_PRICE_TIMESTAMP_MISSING'
+    };
+  }
+
+  const ageMs = Date.now() - capturedAt;
+
+  if (ageMs < 0) {
+    return {
+      valid: false,
+      reason: 'BROKER_PRICE_TIMESTAMP_INVALID',
+      ageMs
+    };
+  }
+
+  if (ageMs > BROKER_PRICE_MAX_AGE_MS) {
+    return {
+      valid: false,
+      reason: 'BROKER_PRICE_TOO_OLD',
+      ageMs,
+      maxAgeMs: BROKER_PRICE_MAX_AGE_MS
+    };
+  }
+
+  return {
+    valid: true,
+    brokerPrice,
+    capturedAt,
+    ageMs
+  };
+}
+
+function validateBrokerReferenceGap(pair, brokerPrice, referencePrice) {
+  const gapPips = priceDifferencePips(
+    pair,
+    brokerPrice,
+    referencePrice
+  );
+
+  if (!Number.isFinite(gapPips)) {
+    return {
+      valid: false,
+      reason: 'BROKER_REFERENCE_GAP_UNAVAILABLE'
+    };
+  }
+
+  if (gapPips > BROKER_MAX_GAP_PIPS) {
+    return {
+      valid: false,
+      reason: 'BROKER_PRICE_TOO_FAR_FROM_REFERENCE',
+      gapPips: round(gapPips, 2),
+      maxGapPips: BROKER_MAX_GAP_PIPS
+    };
+  }
+
+  return {
+    valid: true,
+    gapPips: round(gapPips, 2),
+    maxGapPips: BROKER_MAX_GAP_PIPS
+  };
+}
+
+function buildRejectedConfirmation(reason, details = {}) {
+  return {
+    ok: false,
+    version: VERSION,
+    confirmed: false,
+    signal: 'NO TRADE',
+    direction: 'NONE',
+    reason,
+    ...details
+  };
+}
+
+async function confirmSignalHandler(req, res) {
+  const pair = normalizePair(req.body?.pair || '');
+
+  if (!pair || !PAIRS.includes(pair)) {
+    return res.status(400).json(
+      buildRejectedConfirmation('UNSUPPORTED_PAIR', {
+        pair
+      })
+    );
+  }
+
+  // Only live forex is accepted by this endpoint.
+  const mode = String(req.body?.mode || 'LIVE_FOREX')
+    .trim()
+    .toUpperCase();
+
+  if (
+    mode === 'OTC' ||
+    mode.includes('OTC') ||
+    mode !== 'LIVE_FOREX'
+  ) {
+    return res.status(400).json(
+      buildRejectedConfirmation('LIVE_FOREX_ONLY')
+    );
+  }
+
+  // Validate the broker quote timestamp before waiting in
+  // the provider queue. It will be checked again afterwards.
+  const initialBrokerValidation = validateBrokerPriceInput(
+    req.body
+  );
+
+  if (!initialBrokerValidation.valid) {
+    return res.status(400).json(
+      buildRejectedConfirmation(
+        initialBrokerValidation.reason,
+        initialBrokerValidation
+      )
+    );
+  }
+
+  const expiryMinutes = finite(req.body?.expiryMinutes);
+
+  if (expiryMinutes !== 1) {
+    return res.status(400).json(
+      buildRejectedConfirmation('INVALID_LIVE_EXPIRY', {
+        allowedExpiryMinutes: 1
+      })
+    );
+  }
+
+  let providerResult;
+
+  try {
+    // IMPORTANT:
+    // Always request fresh Twelve Data before confirmation.
+    // Do not use the previously cached candles as confirmation data.
+    providerResult = await providerFetch(
+      pair,
+      'confirm'
+    );
+  } catch (error) {
+    return res.status(503).json(
+      buildRejectedConfirmation(
+        'FRESH_MARKET_DATA_REQUEST_FAILED',
+        {
+          detail: error?.message || 'PROVIDER_ERROR'
+        }
+      )
+    );
+  }
+
+  // Recheck broker price age after provider queue wait.
+  const brokerValidation = validateBrokerPriceInput(
+    req.body
+  );
+
+  if (!brokerValidation.valid) {
+    return res.status(400).json(
+      buildRejectedConfirmation(
+        brokerValidation.reason,
+        brokerValidation
+      )
+    );
+  }
+
+  const providerValidation = validateFreshProviderResult(
+    providerResult
+  );
+
+  if (!providerValidation.valid) {
+    return res.status(503).json(
+      buildRejectedConfirmation(
+        providerValidation.reason,
+        providerValidation
+      )
+    );
+  }
+
+  const marketEntry = saveMarketCache(
+    pair,
+    providerResult.candles,
+    providerResult.fetchedAt,
+    'twelve_data_confirm'
+  );
+
+  if (!marketEntry) {
+    return res.status(503).json(
+      buildRejectedConfirmation('MARKET_CACHE_UPDATE_FAILED')
+    );
+  }
+
+  // Analyze the newly fetched data, not the previous cache.
+  const analysis = scoreMarket(
+    pair,
+    providerResult.candles,
+    providerResult.fetchedAt
+  );
+
+  if (!analysis.qualified) {
+    return res.status(409).json(
+      buildRejectedConfirmation(
+        'FRESH_MARKET_ANALYSIS_NOT_QUALIFIED',
+        {
+          pair,
+          evidenceScore: analysis.evidenceScore,
+          rejectedReasons: analysis.rejectedReasons,
+          warnings: analysis.warnings,
+          indicators: analysis.indicators
+        }
+      )
+    );
+  }
+
+  const referencePrice = finite(analysis.entryPrice);
+
+  if (referencePrice === null || referencePrice <= 0) {
+    return res.status(503).json(
+      buildRejectedConfirmation('INVALID_REFERENCE_PRICE')
+    );
+  }
+
+  const gapValidation = validateBrokerReferenceGap(
+    pair,
+    brokerValidation.brokerPrice,
+    referencePrice
+  );
+
+  if (!gapValidation.valid) {
+    return res.status(409).json(
+      buildRejectedConfirmation(
+        gapValidation.reason,
+        {
+          pair,
+          brokerPrice: brokerValidation.brokerPrice,
+          referencePrice,
+          ...gapValidation
+        }
+      )
+    );
+  }
+
+  // Make sure the quote is still within its allowed age
+  // immediately before final confirmation.
+  const finalBrokerValidation = validateBrokerPriceInput(
+    req.body
+  );
+
+  if (!finalBrokerValidation.valid) {
+    return res.status(400).json(
+      buildRejectedConfirmation(
+        finalBrokerValidation.reason,
+        finalBrokerValidation
+      )
+    );
+  }
+
+  const signalId = (
+    'PO-' +
+    Date.now().toString(36).toUpperCase() +
+    '-' +
+    Math.random().toString(36).slice(2, 8).toUpperCase()
+  );
+
+  const confirmedAt = Date.now();
+
+  const confirmation = {
+    ok: true,
+    version: VERSION,
+    confirmed: true,
+    signalId,
+    pair,
+    signal: analysis.direction,
+    direction: analysis.direction,
+    mode: 'LIVE_FOREX',
+    source: 'USER_ENTERED_POCKET_OPTION_PRICE',
+    brokerPrice: brokerValidation.brokerPrice,
+    brokerPriceCapturedAt: brokerValidation.capturedAt,
+    brokerPriceAgeMs: finalBrokerValidation.ageMs,
+    referencePrice,
+    gapPips: gapValidation.gapPips,
+    entryPrice: brokerValidation.brokerPrice,
+    referenceEntryPrice: referencePrice,
+    expiryMinutes: 1,
+    expiryAt: confirmedAt + 60000,
+    confirmedAt,
+    evidenceScore: analysis.evidenceScore,
+    evidenceLabel: analysis.evidenceLabel,
+    scoreMeaning: 'EVIDENCE_SCORE_NOT_WIN_PROBABILITY',
+    candleTime: analysis.candleTime,
+    marketFetchedAt: providerResult.fetchedAt,
+    indicators: analysis.indicators,
+    evidence: analysis.evidence,
+    warnings: analysis.warnings,
+    outcome: 'PENDING'
+  };
+
+  try {
+    await saveSignal(confirmation);
+  } catch (error) {
+    // A database write failure must not silently change
+    // the market analysis, but the client must be informed.
+    return res.status(503).json(
+      buildRejectedConfirmation(
+        'SIGNAL_STORAGE_FAILED',
+        {
+          detail: error?.message || 'DATABASE_ERROR'
+        }
+      )
+    );
+  }
+
+  return res.json(confirmation);
+}
+
+// Confirmation endpoint.
+app.post('/api/confirm-signal', confirmSignalHandler);
+
+// Compatibility alias for clients using a shorter route.
+app.post('/api/confirm', confirmSignalHandler);
+// ============================================================
+// V10.4.0 — SIGNAL OUTCOME AND EXPIRY TRACKING
+// ============================================================
+
+const pendingSignalCache = new Map();
+
+function normalizeOutcome(value) {
+  const outcome = String(value || '').trim().toUpperCase();
+
+  if (['WIN', 'LOSS', 'TIE', 'INVALID', 'PENDING'].includes(outcome)) {
+    return outcome;
+  }
+
+  return null;
+}
+
+function calculateSignalOutcome(direction, entryPrice, expiryPrice) {
+  const entry = finite(entryPrice);
+  const expiry = finite(expiryPrice);
+  const side = String(direction || '').toUpperCase();
+
+  if (
+    entry === null ||
+    expiry === null ||
+    entry <= 0 ||
+    expiry <= 0 ||
+    !['BUY', 'SELL'].includes(side)
+  ) {
+    return 'INVALID';
+  }
+
+  const difference = expiry - entry;
+
+  // A tie means the expiry price equals the entry price.
+  if (Math.abs(difference) < 1e-10) {
+    return 'TIE';
+  }
+
+  if (side === 'BUY') {
+    return difference > 0 ? 'WIN' : 'LOSS';
+  }
+
+  return difference < 0 ? 'WIN' : 'LOSS';
+}
+
+function validateExpiryPrice(expiryPrice, expiryPriceAt, expiryAt) {
+  const price = finite(expiryPrice);
+  const priceAt = finite(expiryPriceAt);
+  const targetExpiry = finite(expiryAt);
+
+  if (price === null || price <= 0) {
+    return {
+      valid: false,
+      reason: 'EXPIRY_PRICE_MISSING_OR_INVALID'
+    };
+  }
+
+  if (priceAt === null || targetExpiry === null) {
+    return {
+      valid: false,
+      reason: 'EXPIRY_TIMESTAMP_MISSING'
+    };
+  }
+
+  if (priceAt < targetExpiry) {
+    return {
+      valid: false,
+      reason: 'EXPIRY_PRICE_CAPTURED_TOO_EARLY',
+      expiryAt: targetExpiry,
+      expiryPriceAt: priceAt
+    };
+  }
+
+  // Do not accept an expiry observation that is excessively late.
+  if (priceAt - targetExpiry > 120000) {
+    return {
+      valid: false,
+      reason: 'EXPIRY_PRICE_CAPTURED_TOO_LATE',
+      expiryAt: targetExpiry,
+      expiryPriceAt: priceAt
+    };
+  }
+
+  return {
+    valid: true,
+    expiryPrice: price,
+    expiryPriceAt: priceAt
+  };
+}
+
+function rememberPendingSignal(signal) {
+  if (!signal || !signal.signalId) return;
+
+  pendingSignalCache.set(signal.signalId, {
+    ...signal,
+    outcome: 'PENDING'
+  });
+}
+
+function getPendingSignal(signalId) {
+  return pendingSignalCache.get(String(signalId || '')) || null;
+}
+
+async function recordSignalOutcome(signalId, outcome, details = {}) {
+  const normalizedOutcome = normalizeOutcome(outcome);
+
+  if (
+    !signalId ||
+    !normalizedOutcome ||
+    normalizedOutcome === 'PENDING'
+  ) {
+    throw new Error('INVALID_OUTCOME_UPDATE');
+  }
+
+  const signal = getPendingSignal(signalId);
+
+  if (!signal) {
+    throw new Error('SIGNAL_NOT_FOUND_IN_ACTIVE_SESSION');
+  }
+
+  if (signal.outcome !== 'PENDING') {
+    throw new Error('SIGNAL_OUTCOME_ALREADY_RECORDED');
+  }
+
+  const updatedAt = Date.now();
+
+  const update = {
+    signalId,
+    outcome: normalizedOutcome,
+    expiryPrice: finite(details.expiryPrice),
+    expiryPriceAt: finite(details.expiryPriceAt),
+    updatedAt,
+    outcomeReason: details.reason || null
+  };
+
+  await updateSignalOutcome(signalId, normalizedOutcome, update);
+
+  pendingSignalCache.set(signalId, {
+    ...signal,
+    ...update
+  });
+
+  return {
+    ok: true,
+    signalId,
+    outcome: normalizedOutcome,
+    updatedAt
+  };
+}
+
+// Store successfully confirmed signals in the active session cache.
+// This wrapper preserves the existing confirmation handler.
+const originalConfirmSignalHandler = confirmSignalHandler;
+
+confirmSignalHandler = async function (req, res) {
+  const originalJson = res.json.bind(res);
+
+  res.json = function (body) {
+    if (body && body.ok === true && body.confirmed === true) {
+      rememberPendingSignal(body);
+    }
+
+    return originalJson(body);
+  };
+
+  return originalConfirmSignalHandler(req, res);
+};
+
+// ============================================================
+// V10.4.0 — OUTCOME API
+// ============================================================
+
+// Record an expiry outcome when a trustworthy expiry price
+// and timestamp are available.
+app.post('/api/signal/outcome', async (req, res) => {
+  const signalId = String(req.body?.signalId || '').trim();
+
+  if (!signalId) {
+    return res.status(400).json({
+      ok: false,
+      reason: 'SIGNAL_ID_REQUIRED'
+    });
+  }
+
+  const signal = getPendingSignal(signalId);
+
+  if (!signal) {
+    return res.status(404).json({
+      ok: false,
+      reason: 'SIGNAL_NOT_FOUND_IN_ACTIVE_SESSION'
+    });
+  }
+
+  if (signal.outcome !== 'PENDING') {
+    return res.status(409).json({
+      ok: false,
+      reason: 'SIGNAL_OUTCOME_ALREADY_RECORDED',
+      outcome: signal.outcome
+    });
+  }
+
+  const expiryValidation = validateExpiryPrice(
+    req.body?.expiryPrice,
+    req.body?.expiryPriceAt,
+    signal.expiryAt
+  );
+
+  if (!expiryValidation.valid) {
+    return res.status(400).json({
+      ok: false,
+      reason: expiryValidation.reason,
+      ...expiryValidation
+    });
+  }
+
+  const outcome = calculateSignalOutcome(
+    signal.direction,
+    signal.entryPrice,
+    expiryValidation.expiryPrice
+  );
+
+  if (outcome === 'INVALID') {
+    return res.status(400).json({
+      ok: false,
+      reason: 'OUTCOME_CALCULATION_INVALID'
+    });
+  }
+
+  try {
+    const result = await recordSignalOutcome(
+      signalId,
+      outcome,
+      {
+        expiryPrice: expiryValidation.expiryPrice,
+        expiryPriceAt: expiryValidation.expiryPriceAt,
+        reason: 'USER_SUPPLIED_EXPIRY_PRICE'
+      }
+    );
+
+    return res.json({
+      ...result,
+      pair: signal.pair,
+      direction: signal.direction,
+      entryPrice: signal.entryPrice,
+      expiryPrice: expiryValidation.expiryPrice,
+      expiryAt: signal.expiryAt
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      reason: error?.message || 'OUTCOME_SAVE_FAILED'
+    });
+  }
+});
+
+// Mark a signal invalid only when the user or a trusted
+// process has a valid reason for doing so.
+app.post('/api/signal/invalidate', async (req, res) => {
+  const signalId = String(req.body?.signalId || '').trim();
+  const reason = String(req.body?.reason || '').trim();
+
+  if (!signalId || !reason) {
+    return res.status(400).json({
+      ok: false,
+      reason: 'SIGNAL_ID_AND_REASON_REQUIRED'
+    });
+  }
+
+  const signal = getPendingSignal(signalId);
+
+  if (!signal) {
+    return res.status(404).json({
+      ok: false,
+      reason: 'SIGNAL_NOT_FOUND_IN_ACTIVE_SESSION'
+    });
+  }
+
+  if (signal.outcome !== 'PENDING') {
+    return res.status(409).json({
+      ok: false,
+      reason: 'SIGNAL_OUTCOME_ALREADY_RECORDED',
+      outcome: signal.outcome
+    });
+  }
+
+  try {
+    const result = await recordSignalOutcome(
+      signalId,
+      'INVALID',
+      { reason }
+    );
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      reason: error?.message || 'INVALID_OUTCOME_SAVE_FAILED'
+    });
+  }
+});
+
+// ============================================================
+// V10.4.0 — SIGNAL HISTORY
+// ============================================================
+
+app.get('/api/history', async (req, res) => {
+  try {
+    const requestedLimit = Number(req.query.limit || 50);
+    const limit = Math.round(
+      clamp(
+        Number.isFinite(requestedLimit) ? requestedLimit : 50,
+        1,
+        200
+      )
+    );
+
+    const history = await getHistory(limit);
 
     return res.json({
       ok: true,
       version: VERSION,
-      pair,
-      result,
-      source: 'Twelve Data LIVE historical candles',
-      note:
-        'Backtest uses next-candle open entry. It does not model Pocket Option payout, spread, slippage or execution latency.'
+      count: Array.isArray(history) ? history.length : 0,
+      history: Array.isArray(history) ? history : []
     });
   } catch (error) {
-    return res.status(503).json({
+    return res.status(500).json({
       ok: false,
-      version: VERSION,
-      pair,
-      error: String(error.message || error)
+      reason: error?.message || 'HISTORY_LOAD_FAILED',
+      history: []
     });
   }
 });
 
-/* -------------------------------------------------------
-   SERVER START
-------------------------------------------------------- */
+// Single signal lookup from active-session memory.
+app.get('/api/signal/:signalId', (req, res) => {
+  const signal = getPendingSignal(req.params.signalId);
 
-if (require.main === module) {
-  initializeDatabase().finally(() => {
-    app.listen(PORT, () => {
-      console.log(
-        `PO AI Predictor ${VERSION} listening on ${PORT}`
-      );
-
-      console.log('Mode: LIVE FOREX ONLY');
-      console.log(
-        `Twelve Data configured: ${Boolean(API_KEY)}`
-      );
-
-      console.log(
-        `PostgreSQL configured: ${Boolean(DATABASE_URL)}`
-      );
+  if (!signal) {
+    return res.status(404).json({
+      ok: false,
+      reason: 'SIGNAL_NOT_FOUND_IN_ACTIVE_SESSION'
     });
+  }
+
+  return res.json({
+    ok: true,
+    signal
   });
+});
+// ============================================================
+// V10.4.0 — WALK-FORWARD BACKTEST ENGINE
+// ============================================================
+
+function calculateBacktestMetrics(trades) {
+  const completed = trades.filter((trade) =>
+    ['WIN', 'LOSS', 'TIE'].includes(trade.outcome)
+  );
+
+  const wins = completed.filter(
+    (trade) => trade.outcome === 'WIN'
+  ).length;
+
+  const losses = completed.filter(
+    (trade) => trade.outcome === 'LOSS'
+  ).length;
+
+  const ties = completed.filter(
+    (trade) => trade.outcome === 'TIE'
+  ).length;
+
+  const invalid = trades.filter(
+    (trade) => trade.outcome === 'INVALID'
+  ).length;
+
+  const winRate = wins + losses > 0
+    ? (wins / (wins + losses)) * 100
+    : null;
+
+  return {
+    totalSignals: trades.length,
+    completedTrades: completed.length,
+    wins,
+    losses,
+    ties,
+    invalid,
+    winRate: winRate === null ? null : round(winRate, 2),
+    winRateMeaning: 'HISTORICAL_BACKTEST_RESULT_NOT_FUTURE_PROBABILITY'
+  };
 }
 
-module.exports = app;
+function runWalkForwardBacktest(pair, candles, expiryMinutes = 1) {
+  const normalizedPair = normalizePair(pair);
 
+  if (!PAIRS.includes(normalizedPair)) {
+    return {
+      ok: false,
+      reason: 'UNSUPPORTED_PAIR'
+    };
+  }
+
+  if (![1, 2, 3].includes(Number(expiryMinutes))) {
+    return {
+      ok: false,
+      reason: 'INVALID_BACKTEST_EXPIRY',
+      allowedExpiryMinutes: [1, 2, 3]
+    };
+  }
+
+  const expiry = Number(expiryMinutes);
+  const historicalCandles = Array.isArray(candles)
+    ? candles
+    : [];
+
+  const minimumRequired = MIN_CANDLES + expiry + 1;
+
+  if (historicalCandles.length < minimumRequired) {
+    return {
+      ok: false,
+      reason: 'INSUFFICIENT_BACKTEST_HISTORY',
+      candleCount: historicalCandles.length,
+      minimumRequired
+    };
+  }
+
+  const trades = [];
+  const startIndex = MIN_CANDLES - 1;
+  const endIndex = historicalCandles.length - expiry - 1;
+
+  for (
+    let index = startIndex;
+    index <= endIndex;
+    index += 1
+  ) {
+    // Only candles available at this historical point are used
+    // to calculate the signal.
+    const trainingWindow = historicalCandles.slice(
+      0,
+      index + 1
+    );
+
+    const entryCandle = historicalCandles[index];
+    const expiryCandle = historicalCandles[index + expiry];
+
+    if (!entryCandle || !expiryCandle) continue;
+
+    const analysis = scoreMarket(
+      normalizedPair,
+      trainingWindow,
+      entryCandle.timestamp
+    );
+
+    if (!analysis.qualified) continue;
+
+    const entryPrice = entryCandle.close;
+    const expiryPrice = expiryCandle.close;
+
+    const outcome = calculateSignalOutcome(
+      analysis.direction,
+      entryPrice,
+      expiryPrice
+    );
+
+    trades.push({
+      pair: normalizedPair,
+      direction: analysis.direction,
+      entryTime: entryCandle.time,
+      expiryTime: expiryCandle.time,
+      entryPrice,
+      expiryPrice,
+      expiryMinutes: expiry,
+      evidenceScore: analysis.evidenceScore,
+      scoreGap: analysis.scoreGap,
+      outcome
+    });
+  }
+
+  return {
+    ok: true,
+    version: VERSION,
+    pair: normalizedPair,
+    expiryMinutes: expiry,
+    method: 'WALK_FORWARD_NO_LOOKAHEAD',
+    candleCount: historicalCandles.length,
+    firstCandleTime: historicalCandles[0]?.time || null,
+    lastCandleTime:
+      historicalCandles[historicalCandles.length - 1]?.time || null,
+    metrics: calculateBacktestMetrics(trades),
+    trades
+  };
+}
+
+function buildBacktestSummary(results) {
+  const validResults = results.filter(
+    (result) => result && result.ok
+  );
+
+  const allTrades = validResults.flatMap(
+    (result) => result.trades || []
+  );
+
+  return {
+    version: VERSION,
+    method: 'WALK_FORWARD_NO_LOOKAHEAD',
+    expiryResults: validResults.map((result) => ({
+      expiryMinutes: result.expiryMinutes,
+      metrics: result.metrics
+    })),
+    combinedMetrics: calculateBacktestMetrics(allTrades),
+    scoreMeaning: 'EVIDENCE_SCORE_NOT_WIN_PROBABILITY'
+  };
+}
+
+// ============================================================
+// V10.4.0 — BACKTEST API
+// ============================================================
+
+// Backtest a selected pair using cached historical candles.
+// No new provider request is made by this endpoint.
+app.post('/api/backtest', (req, res) => {
+  const pair = normalizePair(req.body?.pair || '');
+
+  if (!pair || !PAIRS.includes(pair)) {
+    return res.status(400).json({
+      ok: false,
+      reason: 'UNSUPPORTED_PAIR'
+    });
+  }
+
+  const entry = getMarketCacheEntry(pair);
+
+  if (!entry || !Array.isArray(entry.candles)) {
+    return res.status(503).json({
+      ok: false,
+      reason: 'NO_CACHED_HISTORICAL_DATA',
+      pair
+    });
+  }
+
+  const expiryMinutes = Number(
+    req.body?.expiryMinutes || 1
+  );
+
+  const result = runWalkForwardBacktest(
+    pair,
+    entry.candles,
+    expiryMinutes
+  );
+
+  if (!result.ok) {
+    return res.status(422).json(result);
+  }
+
+  return res.json({
+    ...result,
+    dataFetchedAt: entry.fetchedAt,
+    dataSource: entry.source
+  });
+});
+
+// Run the same cached history against 1, 2 and 3 minute expiries.
+app.post('/api/backtest/all', (req, res) => {
+  const pair = normalizePair(req.body?.pair || '');
+
+  if (!pair || !PAIRS.includes(pair)) {
+    return res.status(400).json({
+      ok: false,
+      reason: 'UNSUPPORTED_PAIR'
+    });
+  }
+
+  const entry = getMarketCacheEntry(pair);
+
+  if (!entry || !Array.isArray(entry.candles)) {
+    return res.status(503).json({
+      ok: false,
+      reason: 'NO_CACHED_HISTORICAL_DATA',
+      pair
+    });
+  }
+
+  const results = [1, 2, 3].map((expiryMinutes) =>
+    runWalkForwardBacktest(
+      pair,
+      entry.candles,
+      expiryMinutes
+    )
+  );
+
+  const failed = results.filter((result) => !result.ok);
+
+  if (failed.length) {
+    return res.status(422).json({
+      ok: false,
+      pair,
+      reason: 'BACKTEST_COULD_NOT_COMPLETE_ALL_EXPIRIES',
+      results
+    });
+  }
+
+  return res.json({
+    ok: true,
+    pair,
+    dataFetchedAt: entry.fetchedAt,
+    dataSource: entry.source,
+    results,
+    summary: buildBacktestSummary(results)
+  });
+});
+
+/* -------------------------------------------------------
+   V10.4.0 COMPATIBILITY CONSTANTS
+------------------------------------------------------- */
+
+// Part 1 stores these limits in seconds.
+// Other sections use milliseconds.
+
+const DATA_FRESHNESS_MS =
+  FRESHNESS_SECONDS * 1000;
+
+const HARD_STALE_MS =
+  HARD_STALE_SECONDS * 1000;
+
+// Keep the broker-price tolerance consistent
+// with the approved Part 1 configuration.
+
+const BROKER_MAX_GAP_PIPS =
+  DEFAULT_MAX_PRICE_GAP_PIPS;
+
+/* -------------------------------------------------------
+   API ERROR HANDLING
+------------------------------------------------------- */
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    version: VERSION,
+    error: 'API endpoint not found.',
+    path: req.path
+  });
+});
+
+app.use((error, req, res, next) => {
+  console.error(
+    'Unhandled API error:',
+    error.message || error
+  );
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(500).json({
+    success: false,
+    version: VERSION,
+    error: 'Internal server error.'
+  });
+});
+
+/* -------------------------------------------------------
+   BACKGROUND SCANNER SCHEDULER
+------------------------------------------------------- */
+
+function startBackgroundScanner() {
+  if (backgroundScanTimer) {
+    clearInterval(backgroundScanTimer);
+    backgroundScanTimer = null;
+  }
+
+  // Start the first complete scan shortly after startup.
+  setTimeout(() => {
+    if (!scannerRunning) {
+      runBackgroundScan().catch(error => {
+        lastScanError = String(
+          error.message || error
+        );
+
+        console.error(
+          'Initial background scan failed:',
+          lastScanError
+        );
+      });
+    }
+  }, 5000);
+
+  // Continue scanning every hour.
+  backgroundScanTimer = setInterval(() => {
+    if (scannerRunning) return;
+
+    runBackgroundScan().catch(error => {
+      lastScanError = String(
+        error.message || error
+      );
+
+      console.error(
+        'Scheduled background scan failed:',
+        lastScanError
+      );
+    });
+  }, SCAN_INTERVAL_MS);
+}
+
+/* -------------------------------------------------------
+   APPLICATION STARTUP
+------------------------------------------------------- */
+
+async function startServer() {
+  try {
+    await initializeDatabase();
+
+    const server = app.listen(PORT, () => {
+      console.log('----------------------------------');
+      console.log(`PO AI PREDICTOR ${VERSION}`);
+      console.log(`Server listening on port ${PORT}`);
+      console.log('Market mode: LIVE FOREX ONLY');
+      console.log(`Total pairs: ${PAIRS.length}`);
+      console.log(`Priority pairs: ${PRIORITY_PAIRS.length}`);
+      console.log(`Background pairs: ${BACKGROUND_PAIRS.length}`);
+      console.log(
+        `Daily provider budget: ${DAILY_USABLE_LIMIT}`
+      );
+      console.log(
+        `Scanner daily budget: ${SCANNER_DAILY_BUDGET}`
+      );
+      console.log(
+        `Scheduled scan interval: ${
+          SCAN_INTERVAL_MS / 60000
+        } minutes`
+      );
+      console.log(
+        `Database: ${
+          databaseReady ? 'POSTGRESQL' : 'MEMORY_ONLY'
+        }`
+      );
+      console.log('----------------------------------');
+    });
+
+    server.on('error', error => {
+      console.error(
+        'HTTP server error:',
+        error.message || error
+      );
+    });
+
+    startBackgroundScanner();
+
+  } catch (error) {
+    console.error(
+      'Server startup failed:',
+      error.message || error
+    );
+
+    process.exit(1);
+  }
+}
+
+startServer();
