@@ -1,7 +1,8 @@
+
 'use strict';
 
 /*
- * PO AI PREDICTOR — V10.4.0
+ * PO AI PREDICTOR — V10.6.0
  * LIVE FOREX ONLY. OTC is deliberately not supported here.
  * This backend uses a transparent technical-evidence decision engine.
  * It does not claim to contain a trained machine-learning model.
@@ -15,7 +16,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
 
-const VERSION = 'V10.4.0';
+const VERSION = 'V10.6.0';
 const PORT = Number(process.env.PORT || 10000);
 const API_KEY = process.env.TWELVE_DATA_API_KEY || process.env.TWELVE_DATA_KEY || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
@@ -230,18 +231,6 @@ function emaSeries(values, period) {
   return result;
 }
 
-function calculateRsi(values, period = 14) {
-  if (values.length < period + 1) return null;
-  let gain = 0, loss = 0;
-  for (let i = values.length - period; i < values.length; i++) {
-    const change = values[i] - values[i - 1];
-    if (change > 0) gain += change; else loss -= change;
-  }
-  if (loss === 0) return 100;
-  const rs = (gain / period) / (loss / period);
-  return 100 - 100 / (1 + rs);
-}
-
 function calculateMacd(values) {
   if (values.length < 35) return { line: null, signal: null, histogram: null, crossover: 'UNAVAILABLE' };
   const fast = emaSeries(values, 12), slow = emaSeries(values, 26);
@@ -337,7 +326,7 @@ function analyzeMarket(pair, sourceCandles, fetchedAt = now()) {
   const ema9Series = emaSeries(closes, 9), ema21Series = emaSeries(closes, 21);
   const ema9 = ema9Series.at(-1), ema21 = ema21Series.at(-1);
   const cross = detectRecentCross(candles);
-  const macd = calculateMacd(closes), rsi14 = calculateRsi(closes), atr14 = calculateAtr(candles);
+  const macd = calculateMacd(closes), atr14 = calculateAtr(candles);
   const bollinger = calculateBollinger(closes), pattern = detectCandlePattern(candles);
   const levels = supportResistance(candles), volatility = volatilityInfo(atr14, current.close, bollinger);
   const buy = { score: 0, evidence: [] }, sell = { score: 0, evidence: [] };
@@ -345,8 +334,8 @@ function analyzeMarket(pair, sourceCandles, fetchedAt = now()) {
 
   if (cross.direction === 'BUY') add(buy, 24, 'Recent EMA9 crossed above EMA21');
   if (cross.direction === 'SELL') add(sell, 24, 'Recent EMA9 crossed below EMA21');
-  if (followThrough(candles, 'BUY')) add(buy, 22, 'Bullish price-action follow-through confirmed');
-  if (followThrough(candles, 'SELL')) add(sell, 22, 'Bearish price-action follow-through confirmed');
+  if (cross.direction === 'BUY' && cross.barsAgo >= 1 && followThrough(candles, 'BUY')) add(buy, 22, 'Bullish price-action follow-through confirmed after EMA crossover');
+  if (cross.direction === 'SELL' && cross.barsAgo >= 1 && followThrough(candles, 'SELL')) add(sell, 22, 'Bearish price-action follow-through confirmed after EMA crossover');
   if (ema9 > ema21 && current.close > ema9) add(buy, 8, 'Price is holding above aligned EMA9/EMA21');
   if (ema9 < ema21 && current.close < ema9) add(sell, 8, 'Price is holding below aligned EMA9/EMA21');
   if (macd.crossover === 'BULLISH') add(buy, 10, 'MACD momentum supports bullish direction');
@@ -370,22 +359,21 @@ function analyzeMarket(pair, sourceCandles, fetchedAt = now()) {
   if (volatility.regime === 'HIGH') { buy.score -= 8; sell.score -= 8; }
   else if (volatility.regime === 'LOW') { buy.score -= 2; sell.score -= 2; }
 
-  // RSI and five-minute direction are diagnostics only, never hard gates.
   const buyScore = Math.round(clamp(buy.score, 0, 100));
   const sellScore = Math.round(clamp(sell.score, 0, 100));
   const direction = buyScore >= sellScore ? 'BUY' : 'SELL';
   const selectedScore = Math.max(buyScore, sellScore), opposingScore = Math.min(buyScore, sellScore);
   const gap = selectedScore - opposingScore;
   const crossAligned = cross.direction === direction;
-  const priceActionConfirmed = followThrough(candles, direction);
+  const priceActionConfirmed = cross.barsAgo !== null && cross.barsAgo >= 1 && cross.direction === direction && followThrough(candles, direction);
   const rejectedReasons = [];
   if (cross.direction === 'NONE') rejectedReasons.push('EMA_CROSS_NOT_RECENT');
   if (!crossAligned) rejectedReasons.push('EMA_CROSS_DIRECTION_MISMATCH');
-  if (!priceActionConfirmed) rejectedReasons.push('PRICE_ACTION_FOLLOW_THROUGH_MISSING');
+  if (!priceActionConfirmed) rejectedReasons.push(cross.barsAgo === 0 ? 'WAITING_FOR_PRICE_ACTION_AFTER_CROSS' : 'PRICE_ACTION_FOLLOW_THROUGH_MISSING');
   if (selectedScore < CFG.minScore) rejectedReasons.push('EVIDENCE_SCORE_BELOW_MINIMUM');
   if (gap < CFG.minScoreGap) rejectedReasons.push('CONFLICTING_EVIDENCE_SCORE_GAP');
   if (opposingScore >= CFG.maxOpposingScore) rejectedReasons.push('OPPOSING_EVIDENCE_TOO_HIGH');
-  const qualified = crossAligned && priceActionConfirmed && selectedScore >= CFG.minScore && gap >= CFG.minScoreGap && opposingScore < CFG.maxOpposingScore;
+  const qualified = crossAligned && cross.barsAgo !== null && cross.barsAgo >= 1 && priceActionConfirmed && selectedScore >= CFG.minScore && gap >= CFG.minScoreGap && opposingScore < CFG.maxOpposingScore;
   const selectedEvidence = direction === 'BUY' ? buy.evidence : sell.evidence;
   const evidenceScore = qualified ? selectedScore : Math.min(selectedScore, 49);
   const reasons = [...selectedEvidence, ...rejectedReasons];
@@ -400,13 +388,11 @@ function analyzeMarket(pair, sourceCandles, fetchedAt = now()) {
     dataAgeSeconds, freshness: dataAgeSeconds <= CFG.freshnessMs / 1000 ? 'FRESH' : 'STALE',
     insufficientData: false, reasons, evidence: selectedEvidence, rejectedReasons,
     indicators: { ema9, ema21, emaCross: cross.direction, emaCrossBarsAgo: cross.barsAgo,
-      macd, rsi14, atr14, bollinger, rsiDivergence: { type: 'NOT_CALCULATED', description: 'Diagnostic not calculated' } },
+      macd, atr14, bollinger },
     volatility, supportResistance: { ...levels, position: current.close <= levels.support * 1.001 ? 'NEAR_SUPPORT' : current.close >= levels.resistance * 0.999 ? 'NEAR_RESISTANCE' : 'BETWEEN_LEVELS' },
     trendLine: { direction: ema9 > ema21 ? 'UP' : ema9 < ema21 ? 'DOWN' : 'FLAT', description: 'EMA alignment used as a simple trend context' },
     candlePattern: pattern, breakout, marketPsychology: { psychology: current.close > current.open ? 'BUYING_PRESSURE' : current.close < current.open ? 'SELLING_PRESSURE' : 'BALANCED', direction: current.close > current.open ? 'BUY' : current.close < current.open ? 'SELL' : 'NEUTRAL' },
-    confirmation5m: { direction: 'DIAGNOSTIC_ONLY', reason: 'Five-minute trend is not a hard signal gate' },
     oneMinuteTrend: ema9 > ema21 ? 'BULLISH' : ema9 < ema21 ? 'BEARISH' : 'NEUTRAL',
-    fiveMinuteConfirmation: 'DIAGNOSTIC ONLY',
     analysisEngine: 'TECHNICAL_EVIDENCE_FUSION_NO_TRAINED_ML_MODEL'
   };
 }
@@ -454,15 +440,15 @@ function scannerSnapshot() {
 function rankedCandidates() {
   return getFreshAnalyses(PAIRS).sort((a, b) => b.evidenceScore - a.evidenceScore || b.scoreGap - a.scoreGap)
     .map(x => ({ pair: x.pair, currentPrice: x.currentPrice, oneMinuteTrend: x.oneMinuteTrend,
-      fiveMinuteConfirmation: x.fiveMinuteConfirmation, volatility: x.volatility?.regime || 'UNKNOWN',
+      volatility: x.volatility?.regime || 'UNKNOWN',
       confidence: x.confidence, freshness: x.freshness, tradeAllowed: x.tradeAllowed }));
 }
 
 function makeAutoResponse() {
-  const priority = getFreshAnalyses(PRIORITY_PAIRS).filter(x => x.qualified).sort((a, b) => b.evidenceScore - a.evidenceScore || b.scoreGap - a.scoreGap);
-  const selected = priority[0] || null;
+  const eligible = getFreshAnalyses(PAIRS).filter(x => x.qualified).sort((a, b) => b.evidenceScore - a.evidenceScore || b.scoreGap - a.scoreGap);
+  const selected = eligible[0] || null;
   const scanner = scannerSnapshot();
-  if (!selected) return { ok: true, version: VERSION, selectedMarket: noTrade(null, scanner.running ? 'PRIORITY_SCAN_IN_PROGRESS' : 'NO_FRESH_QUALIFIED_PRIORITY_PAIR'), market: noTrade(null, 'NO_FRESH_QUALIFIED_PRIORITY_PAIR'), scanner, rankedCandidates: rankedCandidates(), diagnostic: { lastScanError: scanState.lastError } };
+  if (!selected) return { ok: true, version: VERSION, selectedMarket: noTrade(null, scanner.running ? 'FULL_24_PAIR_SCAN_IN_PROGRESS' : 'NO_FRESH_QUALIFIED_PAIR'), market: noTrade(null, 'NO_FRESH_QUALIFIED_PAIR'), scanner, rankedCandidates: rankedCandidates(), diagnostic: { lastScanError: scanState.lastError } };
   return { ok: true, version: VERSION, selectedPair: selected.pair, selectedMarket: selected, market: selected, scanner, rankedCandidates: rankedCandidates() };
 }
 
@@ -509,7 +495,7 @@ function launchScan(force = false) {
   if (scanState.running) return { started: false, reason: 'SCAN_ALREADY_RUNNING' };
   if (!force && scanState.nextScanAt && now() < scanState.nextScanAt) return { started: false, reason: 'SCAN_INTERVAL_NOT_REACHED', nextScanAt: iso(scanState.nextScanAt) };
   runBackgroundScan(force).catch(error => { scanState.lastError = error.message; scanState.running = false; });
-  return { started: true, accepted: true, message: 'Background scan started; this request returns immediately.' };
+  return { started: true, accepted: true, message: 'Background scan started: six priority pairs first, followed by eighteen background pairs.' };
 }
 
 function parseCapturedAt(value) {
