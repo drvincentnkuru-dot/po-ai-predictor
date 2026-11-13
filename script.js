@@ -2,16 +2,18 @@
 'use strict';
 
 /*
- * PO AI PREDICTOR — V10.4.0
+ * PO AI PREDICTOR — V10.6.0
  * LIVE FOREX ONLY — OTC is not supported.
  *
- * Frontend contract:
- * - Compatible with backend/server.js V10.4.0
- * - Captures Pocket Option price timestamp on every edit
- * - Sends timestamp captured at input time, not confirmation time
- * - Never displays BUY/SELL as confirmed before backend validation
- * - Uses 1-minute live expiry only
- * - Backtests 1, 2 and 3 minutes
+ * Frontend:
+ * - 24-pair scanner: 6 priority + 18 background pairs.
+ * - AUTO SELECT uses eligible results from all 24 pairs.
+ * - EMA / price-action evidence is displayed without RSI or 5m.
+ * - Evidence score is evidence strength, NOT win probability.
+ * - BUY/SELL is displayed only after broker-price validation.
+ * - Pocket Option price timestamp is captured on every input edit.
+ * - Live expiry is fixed at 1 minute.
+ * - Backtest expiry options: 1, 2 and 3 minutes.
  */
 
 (() => {
@@ -20,7 +22,7 @@
     'https://po-ai-predictor-api.onrender.com'
   ).replace(/\/+$/, '');
 
-  const VERSION = 'V10.4.0';
+  const VERSION = 'V10.6.0';
   const AUTO_PAIR = 'AI AUTO SELECT';
 
   const CONFIG = Object.freeze({
@@ -32,21 +34,45 @@
     MAX_BROKER_PRICE_AGE_SECONDS: 30,
     MAX_REASONS: 10,
     LIVE_EXPIRY_MINUTES: 1,
-    MAX_HISTORY: 100
+    MAX_HISTORY: 100,
+    TOTAL_PAIRS: 24,
+    PRIORITY_COUNT: 6,
+    BACKGROUND_COUNT: 18
   });
 
-  const PAIRS = Object.freeze([
-    'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF',
-    'AUD/USD', 'USD/CAD', 'NZD/USD', 'EUR/GBP',
-    'EUR/JPY', 'GBP/JPY', 'EUR/CHF', 'EUR/AUD',
-    'EUR/CAD', 'GBP/CHF', 'GBP/AUD', 'GBP/CAD',
-    'AUD/JPY', 'AUD/CAD', 'AUD/NZD', 'CAD/JPY',
-    'CHF/JPY', 'NZD/JPY', 'NZD/CAD', 'EUR/NZD'
+  const PRIORITY_PAIRS = Object.freeze([
+    'EUR/USD',
+    'GBP/USD',
+    'USD/JPY',
+    'USD/CHF',
+    'AUD/USD',
+    'USD/CAD'
   ]);
 
-  const PRIORITY_PAIRS = Object.freeze([
-    'EUR/USD', 'GBP/USD', 'USD/JPY',
-    'USD/CHF', 'AUD/USD', 'USD/CAD'
+  const BACKGROUND_PAIRS = Object.freeze([
+    'NZD/USD',
+    'EUR/GBP',
+    'EUR/JPY',
+    'GBP/JPY',
+    'EUR/CHF',
+    'EUR/AUD',
+    'EUR/CAD',
+    'GBP/CHF',
+    'GBP/AUD',
+    'GBP/CAD',
+    'AUD/JPY',
+    'AUD/CAD',
+    'AUD/NZD',
+    'CAD/JPY',
+    'CHF/JPY',
+    'NZD/JPY',
+    'NZD/CAD',
+    'EUR/NZD'
+  ]);
+
+  const PAIRS = Object.freeze([
+    ...PRIORITY_PAIRS,
+    ...BACKGROUND_PAIRS
   ]);
 
   const $ = id => document.getElementById(id);
@@ -87,13 +113,12 @@
     brokerPriceCapturedAt: null,
 
     awaitingBrokerPrice: false,
-    autoSelecting: false,
     destroyed: false
   };
 
-  /* -------------------------------------------------------
+  /* =======================================================
      GENERAL HELPERS
-  ------------------------------------------------------- */
+  ======================================================= */
 
   function obj(value) {
     return value &&
@@ -122,9 +147,7 @@
 
     const parsed = Number(value);
 
-    return Number.isFinite(parsed)
-      ? parsed
-      : null;
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   function formatNumber(value, digits = 5) {
@@ -234,24 +257,35 @@
     );
   }
 
-  function validPair(pair) {
-    return PAIRS.includes(String(pair || '').toUpperCase());
-  }
-
   function normalizePair(pair) {
     return String(pair || '').trim().toUpperCase();
   }
 
-  function isFresh(market) {
-    const age = number(market.dataAgeSeconds);
+  function validPair(pair) {
+    return PAIRS.includes(normalizePair(pair));
+  }
+
+  function isAutoSelection(pair) {
+    const value = normalizePair(pair);
 
     return (
-      String(market.freshness || '').toUpperCase() === 'FRESH' &&
+      value === normalizePair(AUTO_PAIR) ||
+      value === 'AUTO'
+    );
+  }
+
+  function isFresh(market) {
+    const data = obj(market);
+    const age = number(data.dataAgeSeconds);
+
+    return (
+      String(data.freshness || '').toUpperCase() === 'FRESH' &&
       age !== null &&
       age >= 0 &&
       age <= CONFIG.MAX_DATA_AGE_SECONDS &&
-      number(market.currentPrice) > 0 &&
-      market.insufficientData !== true
+      number(data.currentPrice) > 0 &&
+      data.insufficientData !== true &&
+      data.noTrade !== true
     );
   }
 
@@ -267,24 +301,25 @@
   }
 
   function getSignal(market) {
-    const signalObject = obj(market.signal);
+    const data = obj(market);
+    const signalObject = obj(data.signal);
 
     const raw = String(
-      typeof market.signal === 'string'
-        ? market.signal
+      typeof data.signal === 'string'
+        ? data.signal
         : first(
             signalObject.action,
             signalObject.direction,
-            market.action,
-            market.direction,
+            data.action,
+            data.direction,
             'NO TRADE'
           )
     ).toUpperCase().trim();
 
     if (
-      market.noTrade === true ||
-      market.tradeAllowed !== true ||
-      market.insufficientData === true ||
+      data.noTrade === true ||
+      data.tradeAllowed !== true ||
+      data.insufficientData === true ||
       signalObject.noTrade === true ||
       signalObject.tradeAllowed === false
     ) {
@@ -302,9 +337,131 @@
     return 'NO TRADE';
   }
 
-  /* -------------------------------------------------------
+  function getEvidenceScore(market) {
+    const data = obj(market);
+
+    return number(first(
+      data.evidenceScore,
+      data.confidence,
+      data.score
+    ));
+  }
+
+  function getAllProgress(progress) {
+    const data = obj(progress);
+
+    const explicitCompleted = number(data.completed);
+    const priorityCompleted = number(data.priorityCompleted) || 0;
+    const backgroundCompleted = number(data.backgroundCompleted) || 0;
+
+    const completed = explicitCompleted !== null
+      ? explicitCompleted
+      : priorityCompleted + backgroundCompleted;
+
+    const explicitTotal = number(data.total);
+
+    const total = explicitTotal !== null
+      ? explicitTotal
+      : CONFIG.TOTAL_PAIRS;
+
+    return {
+      completed: Math.max(0, Math.min(CONFIG.TOTAL_PAIRS, completed)),
+      total: CONFIG.TOTAL_PAIRS,
+      priorityCompleted: Math.max(
+        0,
+        Math.min(CONFIG.PRIORITY_COUNT, priorityCompleted)
+      ),
+      backgroundCompleted: Math.max(
+        0,
+        Math.min(CONFIG.BACKGROUND_COUNT, backgroundCompleted)
+      ),
+      pair: data.pair || null,
+      phase: data.phase || null
+    };
+  }
+
+  /* =======================================================
+     REMOVE OBSOLETE RSI AND 5-MINUTE UI ELEMENTS
+  ======================================================= */
+
+  function hideObsoleteCard(id) {
+    const node = $(id);
+
+    if (!node) return;
+
+    const wrapper = node.closest(
+      '.technical-card, .indicator-card, .metric-card, .stat-card, .card'
+    );
+
+    if (wrapper) {
+      wrapper.hidden = true;
+    } else {
+      node.hidden = true;
+    }
+  }
+
+  function hideObsoleteInterface() {
+    const obsoleteIds = [
+      'rsiValue',
+      'rsiSignal',
+      'rsiDivergence',
+      'rsiDivergenceDetail',
+      'fiveMinuteTrend',
+      'fiveMinuteDetail'
+    ];
+
+    for (const id of obsoleteIds) {
+      hideObsoleteCard(id);
+    }
+
+    const headings = document.querySelectorAll(
+      'th, .timeframe-tag, .timeframe-label'
+    );
+
+    for (const node of headings) {
+      const text = String(node.textContent || '')
+        .trim()
+        .toUpperCase();
+
+      if (
+        text === '5M' ||
+        text === '5 MIN' ||
+        text === '5 MINUTES' ||
+        text.includes('5-MINUTE') ||
+        text.includes('5 MINUTE')
+      ) {
+        node.hidden = true;
+      }
+    }
+
+    const descriptions = document.querySelectorAll(
+      'p, small, .section-description, .scanner-description'
+    );
+
+    for (const node of descriptions) {
+      const text = String(node.textContent || '');
+
+      if (
+        /first six priority pairs/i.test(text) ||
+        /six priority pairs/i.test(text) ||
+        /1-minute and 5-minute/i.test(text) ||
+        /5-minute trend confirmation/i.test(text)
+      ) {
+        node.textContent =
+          'The scanner processes six priority pairs first, then eighteen background pairs. AUTO SELECT ranks fresh eligible results from all 24 pairs.';
+      }
+    }
+
+    const progress = $('scannerProgress');
+
+    if (progress && /priority pairs/i.test(progress.textContent)) {
+      progress.textContent = '0 / 24 pairs';
+    }
+  }
+
+  /* =======================================================
      API REQUESTS
-  ------------------------------------------------------- */
+  ======================================================= */
 
   async function requestJson(path, options = {}) {
     const controller = new AbortController();
@@ -378,23 +535,18 @@
     }
   }
 
-  /* -------------------------------------------------------
-     HEALTH AND PROVIDER STATUS
-  ------------------------------------------------------- */
+  /* =======================================================
+     SCANNER PROGRESS
+  ======================================================= */
 
   function renderScannerProgress(progress, running) {
-    const data = obj(progress);
+    const data = getAllProgress(progress);
 
-    const completed = number(
-      first(data.priorityCompleted, data.completed)
-    ) || 0;
-
-    const total = number(
-      first(data.priorityTotal, data.total)
-    ) || 6;
-
-    const percent = total > 0
-      ? Math.max(0, Math.min(100, completed / total * 100))
+    const percent = data.total > 0
+      ? Math.max(
+          0,
+          Math.min(100, data.completed / data.total * 100)
+        )
       : 0;
 
     const bar = $('scannerProgressBar');
@@ -405,16 +557,35 @@
 
     setText(
       'scannerProgress',
-      `${completed} / ${total} priority pairs`
+      `${data.completed} / ${CONFIG.TOTAL_PAIRS} pairs`
     );
 
-    setText(
-      'scannerStatus',
-      running
-        ? `Scanning ${first(data.pair, 'priority pairs')}...`
-        : first(data.phase, 'Scanner idle')
-    );
+    const priorityText =
+      `${data.priorityCompleted}/${CONFIG.PRIORITY_COUNT} priority`;
+
+    const backgroundText =
+      `${data.backgroundCompleted}/${CONFIG.BACKGROUND_COUNT} background`;
+
+    let status;
+
+    if (running) {
+      status = data.pair
+        ? `Scanning ${data.pair} · ${priorityText} · ${backgroundText}`
+        : `Scanning 24 pairs · ${priorityText} · ${backgroundText}`;
+    } else if (data.completed >= CONFIG.TOTAL_PAIRS) {
+      status = '24-pair scan completed';
+    } else if (data.completed > 0) {
+      status = `${data.phase || 'Scanner paused'} · ${priorityText} · ${backgroundText}`;
+    } else {
+      status = data.phase || 'Waiting for scanner';
+    }
+
+    setText('scannerStatus', status);
   }
+
+  /* =======================================================
+     HEALTH AND PROVIDER STATUS
+  ======================================================= */
 
   function renderHealth(payload) {
     const root = obj(payload);
@@ -446,11 +617,12 @@
         : 'Twelve Data API key not configured'
     );
 
-    setText('pairsTracked', PAIRS.length);
+    setText('pairsTracked', CONFIG.TOTAL_PAIRS);
 
     renderScannerProgress(
-      root.scanProgress,
-      root.scannerRunning === true
+      root.scanProgress || root.scanner?.progress,
+      root.scannerRunning === true ||
+      root.scanner?.running === true
     );
 
     const metadata = obj(root.metadata);
@@ -490,9 +662,9 @@
     }
   }
 
-  /* -------------------------------------------------------
+  /* =======================================================
      SIGNAL DISPLAY
-  ------------------------------------------------------- */
+  ======================================================= */
 
   function renderDirection(direction) {
     const node = $('signalDirection');
@@ -534,8 +706,9 @@
 
     target.replaceChildren();
 
-    const heading = document.createTextNode('Analysis notes: ');
-    target.appendChild(heading);
+    target.appendChild(
+      document.createTextNode('Analysis notes: ')
+    );
 
     if (!items.length) {
       target.appendChild(
@@ -543,6 +716,7 @@
           'No additional decision reasons were supplied.'
         )
       );
+
       return;
     }
 
@@ -558,59 +732,36 @@
     target.appendChild(list);
   }
 
-  /* -------------------------------------------------------
-     TECHNICAL INDICATORS
-  ------------------------------------------------------- */
+  /* =======================================================
+     TECHNICAL INDICATORS — NO RSI / NO 5M
+  ======================================================= */
 
   function renderTechnical(market) {
-    const indicators = obj(market.indicators);
+    const data = obj(market);
+    const indicators = obj(data.indicators);
     const macd = obj(indicators.macd);
     const bollinger = obj(indicators.bollinger);
-    const divergence = obj(indicators.rsiDivergence);
-    const confirmation = obj(market.confirmation5m);
-    const volatility = obj(market.volatility);
-    const levels = obj(market.supportResistance);
-    const trendline = obj(market.trendLine);
-    const breakout = obj(market.breakout);
-    const pattern = obj(market.candlePattern);
-    const psychology = obj(market.marketPsychology);
+    const volatility = obj(data.volatility);
+    const levels = obj(data.supportResistance);
+    const trendline = obj(data.trendLine);
+    const breakout = obj(data.breakout);
+    const pattern = obj(data.candlePattern);
+    const psychology = obj(data.marketPsychology);
+    const ema = obj(data.ema);
 
     setText(
       'emaSignal',
-      first(indicators.emaCross, 'UNAVAILABLE')
+      first(
+        indicators.emaCross,
+        ema.cross,
+        data.emaCross,
+        'UNAVAILABLE'
+      )
     );
 
     setText(
       'emaDetail',
-      `EMA 9: ${formatNumber(indicators.ema9)} · EMA 21: ${formatNumber(indicators.ema21)}`
-    );
-
-    const rsi = number(indicators.rsi14);
-
-    setText('rsiValue', formatNumber(rsi, 2));
-
-    setText(
-      'rsiSignal',
-      rsi === null
-        ? 'RSI 14 unavailable'
-        : rsi > 70
-          ? 'Above 70 · elevated'
-          : rsi < 30
-            ? 'Below 30 · depressed'
-            : 'Between 30 and 70'
-    );
-
-    setText(
-      'rsiDivergence',
-      first(divergence.type, 'UNAVAILABLE')
-    );
-
-    setText(
-      'rsiDivergenceDetail',
-      first(
-        divergence.description,
-        'RSI divergence not available'
-      )
+      `EMA 9: ${formatNumber(first(indicators.ema9, ema.ema9))} · EMA 21: ${formatNumber(first(indicators.ema21, ema.ema21))}`
     );
 
     setText(
@@ -624,20 +775,9 @@
     );
 
     setText(
-      'fiveMinuteTrend',
-      first(confirmation.direction, 'UNAVAILABLE')
+      'atrValue',
+      formatNumber(first(indicators.atr14, data.atr14), 7)
     );
-
-    setText(
-      'fiveMinuteDetail',
-      first(
-        confirmation.reason,
-        confirmation.status,
-        '5-minute diagnostic unavailable'
-      )
-    );
-
-    setText('atrValue', formatNumber(indicators.atr14, 7));
 
     setText(
       'atrDetail',
@@ -692,8 +832,8 @@
 
     setText(
       'marketPsychology',
-      typeof market.marketPsychology === 'string'
-        ? market.marketPsychology
+      typeof data.marketPsychology === 'string'
+        ? data.marketPsychology
         : first(psychology.psychology, 'UNAVAILABLE')
     );
 
@@ -702,14 +842,20 @@
       first(psychology.direction, 'Price pressure interpretation')
     );
 
-    setText('supportLevel', formatNumber(levels.support));
+    setText(
+      'supportLevel',
+      formatNumber(levels.support)
+    );
 
     setText(
       'supportDetail',
       first(levels.position, 'Support assessment unavailable')
     );
 
-    setText('resistanceLevel', formatNumber(levels.resistance));
+    setText(
+      'resistanceLevel',
+      formatNumber(levels.resistance)
+    );
 
     setText(
       'resistanceDetail',
@@ -766,11 +912,13 @@
         ? first(breakout.description, 'False breakout risk')
         : 'No false breakout reported by backend'
     );
+
+    hideObsoleteInterface();
   }
 
-  /* -------------------------------------------------------
-     BROKER PRICE CAPTURE
-  ------------------------------------------------------- */
+  /* =======================================================
+     POCKET OPTION PRICE CAPTURE
+  ======================================================= */
 
   function clearBrokerPrice(options = {}) {
     state.brokerPrice = null;
@@ -798,16 +946,19 @@
   function captureBrokerPrice() {
     if (!dom.brokerPriceInput) return;
 
-    const raw = dom.brokerPriceInput.value;
+    const raw = String(dom.brokerPriceInput.value || '');
     const parsed = number(raw);
 
     /*
      * IMPORTANT:
-     * Timestamp is captured at the moment the user types,
-     * pastes or edits the Pocket Option price.
-     * It is NOT generated when CONFIRM SIGNAL is clicked.
+     * Capture the timestamp when the user types, pastes or edits
+     * the price. Never generate this timestamp on CONFIRM.
      */
-    if (raw.trim() === '' || parsed === null || parsed <= 0) {
+    if (
+      raw.trim() === '' ||
+      parsed === null ||
+      parsed <= 0
+    ) {
       state.brokerPrice = null;
       state.brokerPriceCapturedAt = null;
 
@@ -831,8 +982,15 @@
     state.brokerPrice = parsed;
     state.brokerPriceCapturedAt = capturedAt;
 
-    setText('brokerPriceStatus', 'PRICE CAPTURED — READY TO VALIDATE');
-    setText('brokerPriceTimestamp', formatDate(capturedAt));
+    setText(
+      'brokerPriceStatus',
+      'PRICE CAPTURED — READY TO VALIDATE'
+    );
+
+    setText(
+      'brokerPriceTimestamp',
+      formatDate(capturedAt)
+    );
 
     if (dom.confirmSignalButton) {
       dom.confirmSignalButton.disabled =
@@ -844,10 +1002,6 @@
   function attachBrokerPriceListeners() {
     if (!dom.brokerPriceInput) return;
 
-    /*
-     * input catches keyboard edits, paste, mobile input,
-     * number-spinner changes and most programmatic user edits.
-     */
     dom.brokerPriceInput.addEventListener(
       'input',
       captureBrokerPrice
@@ -866,9 +1020,9 @@
     );
   }
 
-  /* -------------------------------------------------------
+  /* =======================================================
      MARKET ANALYSIS DISPLAY
-  ------------------------------------------------------- */
+  ======================================================= */
 
   function renderMarket(payload, expectedPair = null) {
     const root = obj(payload);
@@ -888,10 +1042,15 @@
     ));
 
     if (pair && !validPair(pair)) {
-      throw new Error('The API returned an unsupported forex pair.');
+      throw new Error(
+        'The API returned an unsupported forex pair.'
+      );
     }
 
-    if (expectedPair && pair !== normalizePair(expectedPair)) {
+    if (
+      expectedPair &&
+      pair !== normalizePair(expectedPair)
+    ) {
       throw new Error(
         `Pair mismatch. Requested ${expectedPair}, received ${pair}.`
       );
@@ -904,27 +1063,41 @@
     }
 
     const fresh = isFresh(market);
+    const evidence = getEvidenceScore(market);
 
     /*
-     * An analysis result is not a confirmed trade.
+     * Research analysis does not confirm a trade.
      * BUY/SELL remains hidden until broker validation succeeds.
      */
     renderDirection('NO TRADE');
 
-    setText('resultPair', pair || 'NO QUALIFIED PAIR');
+    setText(
+      'resultPair',
+      pair || 'NO QUALIFIED PAIR'
+    );
 
     setText(
       'analysisTimestamp',
       formatDate(first(market.fetchedAt, market.lastCandle))
     );
 
-    const evidence = number(
-      first(market.evidenceScore, market.confidence)
-    );
-
     setText(
       'evidenceScore',
       evidence === null ? '—' : Math.round(evidence)
+    );
+
+    setText(
+      'evidenceLabel',
+      first(
+        market.evidenceLabel,
+        evidence === null
+          ? 'INSUFFICIENT'
+          : evidence >= 75
+            ? 'STRONG EVIDENCE'
+            : evidence >= 55
+              ? 'MODERATE EVIDENCE'
+              : 'INSUFFICIENT EVIDENCE'
+      )
     );
 
     const evidenceBar = $('evidenceBar');
@@ -948,7 +1121,11 @@
     setText('expiryTime', 'WAITING FOR CONFIRMATION');
     setText('entryPrice', 'WAITING FOR POCKET OPTION PRICE');
     setText('signalDuration', '1 minute');
-    setText('signalStatus', fresh ? 'WAITING FOR BROKER PRICE' : 'NO TRADE');
+
+    setText(
+      'signalStatus',
+      fresh ? 'WAITING FOR BROKER PRICE' : 'NO TRADE'
+    );
 
     setText(
       'marketFreshness',
@@ -966,7 +1143,7 @@
     setText(
       'signalWarning',
       fresh
-        ? 'Research scan completed. No BUY/SELL is confirmed until Pocket Option price validation passes.'
+        ? 'Evidence score is not win probability. No BUY/SELL is confirmed until Pocket Option price validation passes.'
         : 'NO TRADE: market data is stale, incomplete or unavailable.'
     );
 
@@ -975,10 +1152,20 @@
 
     state.awaitingBrokerPrice = fresh && Boolean(pair);
 
-    setVisible('brokerPriceSection', state.awaitingBrokerPrice);
-    setVisible('confirmSignalButton', state.awaitingBrokerPrice);
+    setVisible(
+      'brokerPriceSection',
+      state.awaitingBrokerPrice
+    );
 
-    setText('brokerSelectedPair', pair || 'NO PAIR SELECTED');
+    setVisible(
+      'confirmSignalButton',
+      state.awaitingBrokerPrice
+    );
+
+    setText(
+      'brokerSelectedPair',
+      pair || 'NO PAIR SELECTED'
+    );
 
     setInputEnabled(
       dom.brokerPriceInput,
@@ -1006,9 +1193,9 @@
     return market;
   }
 
-  /* -------------------------------------------------------
+  /* =======================================================
      CONFIRMED SIGNAL DISPLAY
-  ------------------------------------------------------- */
+  ======================================================= */
 
   function renderConfirmedSignal(payload, expectedPair) {
     const root = obj(payload);
@@ -1028,7 +1215,9 @@
     ));
 
     if (pair !== normalizePair(expectedPair)) {
-      throw new Error('Confirmed pair does not match selected pair.');
+      throw new Error(
+        'Confirmed pair does not match selected pair.'
+      );
     }
 
     const fresh = isFresh(market);
@@ -1075,13 +1264,29 @@
       formatDate(first(market.fetchedAt, market.lastCandle))
     );
 
-    const evidence = number(
-      first(root.evidenceScore, market.evidenceScore, market.confidence)
-    );
+    const evidence = number(first(
+      root.evidenceScore,
+      market.evidenceScore,
+      market.confidence
+    ));
 
     setText(
       'evidenceScore',
       evidence === null ? '—' : Math.round(evidence)
+    );
+
+    setText(
+      'evidenceLabel',
+      first(
+        market.evidenceLabel,
+        evidence === null
+          ? 'INSUFFICIENT'
+          : evidence >= 75
+            ? 'STRONG EVIDENCE'
+            : evidence >= 55
+              ? 'MODERATE EVIDENCE'
+              : 'INSUFFICIENT EVIDENCE'
+      )
     );
 
     const evidenceBar = $('evidenceBar');
@@ -1140,7 +1345,9 @@
 
     setText(
       'brokerPriceStatus',
-      brokerValidated ? 'PRICE VALIDATED' : 'PRICE NOT VALIDATED'
+      brokerValidated
+        ? 'PRICE VALIDATED'
+        : 'PRICE NOT VALIDATED'
     );
 
     setText(
@@ -1199,65 +1406,113 @@
       renderDirection('NO TRADE');
     }
 
-    return { allowed, direction, market };
+    return {
+      allowed,
+      direction,
+      market
+    };
   }
 
-  /* -------------------------------------------------------
-     SCANNER
-  ------------------------------------------------------- */
+  /* =======================================================
+     SCANNER TABLE — NO 5M COLUMN
+  ======================================================= */
 
   function renderScanner(payload) {
     const root = obj(payload);
     const scanner = obj(root.scanner);
-    const progress = obj(scanner.progress);
+    const progress = obj(
+      first(scanner.progress, root.scanProgress, {})
+    );
 
     state.lastScanner = root;
 
+    /*
+     * Backend returns rankedCandidates from the full 24-pair
+     * result set. The frontend does not truncate to six pairs.
+     */
     const candidates = Array.isArray(root.rankedCandidates)
       ? root.rankedCandidates
-      : [];
+      : Array.isArray(scanner.rankedCandidates)
+        ? scanner.rankedCandidates
+        : [];
 
     const body = $('scannerTableBody');
 
-    if (!body) return;
+    if (!body) {
+      renderScannerProgress(progress, scanner.running === true);
+      return;
+    }
 
     body.replaceChildren();
 
-    if (!candidates.length) {
+    const validCandidates = candidates
+      .filter(candidate => validPair(candidate.pair))
+      .sort((a, b) => {
+        const scoreA = number(first(
+          a.evidenceScore,
+          a.confidence,
+          a.score
+        )) || 0;
+
+        const scoreB = number(first(
+          b.evidenceScore,
+          b.confidence,
+          b.score
+        )) || 0;
+
+        return scoreB - scoreA;
+      });
+
+    if (!validCandidates.length) {
       const row = document.createElement('tr');
       const cell = document.createElement('td');
 
-      cell.colSpan = 8;
+      cell.colSpan = 7;
       cell.className = 'empty-state';
 
       cell.textContent = scanner.running
-        ? 'Scanner running. Waiting for priority pair results.'
+        ? 'Scanner running. Waiting for fresh pair results.'
         : 'No fresh scanned pair results are available yet.';
 
       row.appendChild(cell);
       body.appendChild(row);
     } else {
-      for (const candidate of candidates) {
+      for (const candidate of validCandidates) {
         const pair = normalizePair(candidate.pair);
-
-        if (!validPair(pair)) continue;
-
         const row = document.createElement('tr');
 
         const freshness = String(
           first(candidate.freshness, 'UNKNOWN')
         ).toUpperCase();
 
+        const evidence = number(first(
+          candidate.evidenceScore,
+          candidate.confidence,
+          candidate.score
+        ));
+
+        const eligible =
+          freshness === 'FRESH' &&
+          candidate.qualified === true &&
+          candidate.tradeAllowed !== false &&
+          candidate.noTrade !== true;
+
         const values = [
           pair,
           formatNumber(candidate.currentPrice),
-          first(candidate.oneMinuteTrend, '—'),
-          first(candidate.fiveMinuteConfirmation, '—'),
+          first(
+            candidate.oneMinuteTrend,
+            candidate.trend,
+            '—'
+          ),
           first(candidate.volatility, '—'),
-          number(candidate.confidence) === null
+          evidence === null
             ? '—'
-            : `${formatNumber(candidate.confidence, 0)}/100`,
-          freshness === 'FRESH' ? 'WAITING FOR PRICE' : 'NO TRADE'
+            : `${formatNumber(evidence, 0)}/100`,
+          freshness === 'FRESH'
+            ? (eligible ? 'ELIGIBLE' : 'WAITING / NO TRADE')
+            : 'STALE',
+          eligible ? 'READY FOR PRICE CHECK' : 'NO TRADE'
         ];
 
         for (const value of values) {
@@ -1290,6 +1545,12 @@
       }
     }
 
+    /*
+     * Existing HTML may have eight columns because it previously
+     * included 5M confirmation. Hide the obsolete 5M heading.
+     */
+    hideObsoleteInterface();
+
     renderScannerProgress(
       progress,
       scanner.running === true
@@ -1303,22 +1564,28 @@
 
     setText('resultPair', 'AI SELECTING...');
     setText('evidenceScore', '—');
+    setText('evidenceLabel', 'WAITING FOR EVIDENCE');
     setText('signalStatus', 'SCANNING');
 
     setText(
       'signalReason',
-      'AI is scanning the six priority pairs. No signal has been confirmed.'
+      'AUTO SELECT is checking fresh eligible results from the 24-pair scanner.'
     );
 
     setText(
       'signalWarning',
-      'NO TRADE until a fresh, qualified priority pair is selected and broker price validation passes.'
+      'NO TRADE until fresh evidence is sufficient and Pocket Option price validation passes.'
     );
 
     setVisible('brokerPriceSection', false);
     setVisible('confirmSignalButton', false);
+
     clearBrokerPrice({ hide: true });
   }
+
+  /* =======================================================
+     SCANNER REFRESH AND POLLING
+  ======================================================= */
 
   async function refreshScanner(force = false) {
     if (state.scanBusy) return;
@@ -1357,19 +1624,23 @@
 
         try {
           const status = await requestJson('/api/scanner/status');
+
           renderScanner({
             scanner: status.scanner,
-            rankedCandidates: []
+            rankedCandidates: status.rankedCandidates || []
           });
 
           if (status.scanner?.running) {
             startScannerPolling();
           }
         } catch {
-          // The original scanner error remains visible.
+          // Keep the original scanner error visible.
         }
       } else {
-        showMessage(`Scanner error: ${error.message}`, 'error');
+        showMessage(
+          `Scanner error: ${error.message}`,
+          'error'
+        );
       }
     } finally {
       state.scanBusy = false;
@@ -1394,16 +1665,21 @@
       renderScanner(payload);
 
       const market = getMarketFromPayload(payload);
+
       const pair = normalizePair(first(
         payload.selectedPair,
         market.pair,
         ''
       ));
 
-      const selectedIsAuto =
-        String(dom.pairSelect?.value || AUTO_PAIR).toUpperCase() ===
-        AUTO_PAIR.toUpperCase();
+      const selectedIsAuto = isAutoSelection(
+        dom.pairSelect?.value || AUTO_PAIR
+      );
 
+      /*
+       * AUTO SELECT accepts a result only if the backend has
+       * ranked it and marked it qualified and fresh.
+       */
       if (
         selectedIsAuto &&
         pair &&
@@ -1411,22 +1687,30 @@
         isFresh(market) &&
         market.qualified === true
       ) {
-        if (
-          state.selectedPair !== pair ||
-          state.lastMarket?.pair !== pair
-        ) {
+        const sameMarket =
+          state.selectedPair === pair &&
+          state.lastMarket?.pair === pair;
+
+        if (!sameMarket) {
           renderMarket(payload, pair);
+
           showMessage(
-            `AI selected ${pair}. Enter its current Pocket Option price.`
+            `AUTO SELECT chose ${pair} from the available 24-pair results. Enter its current Pocket Option price.`
           );
         }
       } else if (!pair || !validPair(pair)) {
         const scanner = obj(payload.scanner);
 
         if (scanner.running) {
-          setText('scannerStatus', 'Scanning priority pairs...');
+          setText(
+            'scannerStatus',
+            'Scanning priority pairs, then background pairs...'
+          );
         } else if (!state.lastMarket) {
-          setText('scannerStatus', 'No qualified priority pair yet');
+          setText(
+            'scannerStatus',
+            'No fresh qualified pair is available yet'
+          );
         }
       }
 
@@ -1436,7 +1720,10 @@
         stopScannerPolling();
       }
     } catch (error) {
-      setText('scannerStatus', `Scanner update failed: ${error.message}`);
+      setText(
+        'scannerStatus',
+        `Scanner update failed: ${error.message}`
+      );
     }
   }
 
@@ -1458,26 +1745,32 @@
     }
   }
 
-  /* -------------------------------------------------------
-     ANALYZE — AUTO OR MANUAL PAIR
-  ------------------------------------------------------- */
+  /* =======================================================
+     ANALYZE — AUTO SELECT OR MANUAL PAIR
+  ======================================================= */
 
   async function analyzeSelectedPair() {
-    if (state.analysisBusy || state.confirmationBusy) return;
+    if (
+      state.analysisBusy ||
+      state.confirmationBusy
+    ) {
+      return;
+    }
 
     const selected = normalizePair(
       dom.pairSelect?.value || AUTO_PAIR
     );
 
-    const autoMode =
-      selected === normalizePair(AUTO_PAIR) ||
-      selected === 'AUTO';
+    const autoMode = isAutoSelection(selected);
 
     state.selectedMode = autoMode ? 'AUTO' : 'MANUAL';
-    state.autoSelecting = autoMode;
 
     if (!autoMode && !validPair(selected)) {
-      showMessage('Please select a supported live forex pair.', 'error');
+      showMessage(
+        'Please select a supported live forex pair.',
+        'error'
+      );
+
       return;
     }
 
@@ -1494,12 +1787,15 @@
     state.awaitingBrokerPrice = false;
 
     clearBrokerPrice({ hide: true });
-    invalidateCurrentSignal('Analysis is running. No signal is confirmed.');
+
+    invalidateCurrentSignal(
+      'Analysis is running. No signal is confirmed.'
+    );
 
     try {
       if (autoMode) {
         showMessage(
-          'AUTO SELECT is checking fresh priority-pair results...'
+          'AUTO SELECT is evaluating fresh eligible results from all 24 forex pairs.'
         );
 
         const payload = await requestJson('/api/analyze');
@@ -1507,6 +1803,7 @@
         renderScanner(payload);
 
         const market = getMarketFromPayload(payload);
+
         const pair = normalizePair(first(
           payload.selectedPair,
           market.pair,
@@ -1522,17 +1819,18 @@
           renderMarket(payload, pair);
 
           showMessage(
-            `AI selected ${pair}. Enter the current Pocket Option price for validation.`
+            `AUTO SELECT selected ${pair}. Enter the current Pocket Option price for validation.`
           );
         } else {
           showPendingAutoScan(payload);
 
-          const running = payload.scanner?.running === true;
+          const running =
+            payload.scanner?.running === true;
 
           showMessage(
             running
-              ? 'Priority scanner is running. Waiting for a qualified pair.'
-              : 'No fresh qualified priority pair is available yet. Scanner may need to complete.'
+              ? 'The 24-pair scanner is running. Waiting for sufficient fresh evidence.'
+              : 'No fresh qualified pair is available. Wait for the next completed scan.'
           );
 
           if (running) {
@@ -1546,19 +1844,17 @@
           `Fetching fresh live market data for ${selected}...`
         );
 
-        /*
-         * Manual pair selection requests a fresh provider scan.
-         * It does not treat old cached data as a fresh analysis.
-         */
         const payload = await requestJson('/api/scan/pair', {
           method: 'POST',
           body: { pair: selected }
         });
 
-        const market = obj(payload.market);
+        const market = getMarketFromPayload(payload);
 
         if (!Object.keys(market).length) {
-          throw new Error('No market result was returned for this pair.');
+          throw new Error(
+            'No market result was returned for this pair.'
+          );
         }
 
         renderMarket(payload, selected);
@@ -1602,9 +1898,9 @@
     }
   }
 
-  /* -------------------------------------------------------
+  /* =======================================================
      CONFIRM SIGNAL — FRESH BACKEND VALIDATION
-  ------------------------------------------------------- */
+  ======================================================= */
 
   async function confirmSignal() {
     if (state.confirmationBusy) return;
@@ -1614,11 +1910,18 @@
     const capturedAt = state.brokerPriceCapturedAt;
 
     if (!validPair(pair)) {
-      showMessage('No valid pair is selected.', 'error');
+      showMessage(
+        'No valid pair is selected.',
+        'error'
+      );
+
       return;
     }
 
-    if (!state.lastMarket || !isFresh(state.lastMarket)) {
+    if (
+      !state.lastMarket ||
+      !isFresh(state.lastMarket)
+    ) {
       invalidateCurrentSignal(
         'NO TRADE — market data is not fresh.'
       );
@@ -1668,8 +1971,8 @@
     }
 
     /*
-     * Capture these exact values before starting the request.
-     * Never replace capturedAt with Date.now() here.
+     * Preserve the exact price and input timestamp.
+     * Do not replace capturedAt with Date.now() here.
      */
     const capturedPrice = brokerPrice;
     const capturedTimestamp = capturedAt;
@@ -1684,11 +1987,15 @@
     );
 
     renderDirection('NO TRADE');
-    setText('signalStatus', 'VALIDATING BROKER PRICE');
+
+    setText(
+      'signalStatus',
+      'VALIDATING BROKER PRICE'
+    );
 
     setText(
       'brokerPriceStatus',
-      'CHECKING POCKET OPTION PRICE AGAINST FRESH LIVE REFERENCE...'
+      'CHECKING PRICE AGAINST FRESH LIVE REFERENCE...'
     );
 
     setText(
@@ -1707,14 +2014,19 @@
         body: {
           pair,
           brokerPrice: capturedPrice,
-          brokerPriceCapturedAt: new Date(capturedTimestamp).toISOString(),
+          brokerPriceCapturedAt: new Date(
+            capturedTimestamp
+          ).toISOString(),
           expiryMinutes: CONFIG.LIVE_EXPIRY_MINUTES,
           mode: state.selectedMode || 'MANUAL',
           source: 'USER_ENTERED_POCKET_OPTION_PRICE'
         }
       });
 
-      const result = renderConfirmedSignal(payload, pair);
+      const result = renderConfirmedSignal(
+        payload,
+        pair
+      );
 
       if (result.allowed) {
         showMessage(
@@ -1750,10 +2062,8 @@
         error.payload &&
         error.payload.market
       ) {
-        const failedMarket = error.payload.market;
-
-        state.lastMarket = failedMarket;
-        renderTechnical(failedMarket);
+        state.lastMarket = error.payload.market;
+        renderTechnical(error.payload.market);
       }
     } finally {
       state.confirmationBusy = false;
@@ -1764,14 +2074,15 @@
           number(state.brokerPrice) === null ||
           state.brokerPriceCapturedAt === null;
 
-        dom.confirmSignalButton.textContent = 'CONFIRM SIGNAL';
+        dom.confirmSignalButton.textContent =
+          'CONFIRM SIGNAL';
       }
     }
   }
 
-  /* -------------------------------------------------------
-     HISTORY
-  ------------------------------------------------------- */
+  /* =======================================================
+     SIGNAL HISTORY
+  ======================================================= */
 
   function renderHistory(payload) {
     const root = obj(payload);
@@ -1804,7 +2115,9 @@
 
     setText(
       'historySource',
-      root.persistent === true ? 'POSTGRESQL' : 'MEMORY ONLY'
+      root.persistent === true
+        ? 'POSTGRESQL'
+        : 'MEMORY ONLY'
     );
 
     if (!records.length) {
@@ -1881,9 +2194,9 @@
     }
   }
 
-  /* -------------------------------------------------------
-     BACKTEST
-  ------------------------------------------------------- */
+  /* =======================================================
+     WALK-FORWARD BACKTEST
+  ======================================================= */
 
   function renderBacktest(payload) {
     const root = obj(payload);
@@ -1929,7 +2242,12 @@
         : `${formatNumber(holdout.baselinePercent, 2)}%`
     );
 
-    const pair = first(root.pair, dom.backtestPairSelect?.value, '—');
+    const pair = first(
+      root.pair,
+      dom.backtestPairSelect?.value,
+      '—'
+    );
+
     const expiry = first(
       result.expiryMinutes,
       dom.backtestDuration?.value,
@@ -1940,8 +2258,14 @@
       'backtestMessage',
       [
         `${pair} · ${expiry} minute(s).`,
-        first(result.method, 'Walk-forward chronological holdout.'),
-        first(result.conclusion, 'No performance conclusion available.'),
+        first(
+          result.method,
+          'Walk-forward chronological holdout.'
+        ),
+        first(
+          result.conclusion,
+          'No performance conclusion available.'
+        ),
         `Development sample: ${first(development.signals, 0)}.`,
         'Historical results are not a guarantee of future performance.',
         'Backtest does not model Pocket Option spread, payout, slippage or broker-price validation.'
@@ -1967,6 +2291,7 @@
         'backtestMessage',
         'Select a valid live forex pair.'
       );
+
       return;
     }
 
@@ -1975,6 +2300,7 @@
         'backtestMessage',
         'Backtest duration must be 1, 2 or 3 minutes.'
       );
+
       return;
     }
 
@@ -2002,9 +2328,15 @@
         `/api/backtest?${query.toString()}`
       );
 
-      if (payload.ok !== true || !payload.result) {
+      if (
+        payload.ok !== true ||
+        !payload.result
+      ) {
         throw new Error(
-          first(payload.reason, 'Backtest did not return a result.')
+          first(
+            payload.reason,
+            'Backtest did not return a result.'
+          )
         );
       }
 
@@ -2026,19 +2358,18 @@
     }
   }
 
-  /* -------------------------------------------------------
+  /* =======================================================
      PAIR SELECTION
-  ------------------------------------------------------- */
+  ======================================================= */
 
   function handlePairChange() {
     const selected = normalizePair(
       dom.pairSelect?.value || AUTO_PAIR
     );
 
-    state.selectedMode =
-      selected === normalizePair(AUTO_PAIR) || selected === 'AUTO'
-        ? 'AUTO'
-        : 'MANUAL';
+    state.selectedMode = isAutoSelection(selected)
+      ? 'AUTO'
+      : 'MANUAL';
 
     state.lastMarket = null;
     state.lastConfirmedSignal = null;
@@ -2050,10 +2381,25 @@
       'Pair selection changed. Analyze the new selection before entering a broker price.'
     );
 
-    setText('resultPair', 'WAITING FOR ANALYSIS');
-    setText('analysisTimestamp', 'Not analyzed');
-    setText('marketFreshness', 'NOT CHECKED');
-    setText('marketFreshnessDetail', 'Analyze to fetch fresh market data');
+    setText(
+      'resultPair',
+      'WAITING FOR ANALYSIS'
+    );
+
+    setText(
+      'analysisTimestamp',
+      'Not analyzed'
+    );
+
+    setText(
+      'marketFreshness',
+      'NOT CHECKED'
+    );
+
+    setText(
+      'marketFreshnessDetail',
+      'Analyze to fetch fresh market data'
+    );
 
     if (dom.brokerPriceInput) {
       dom.brokerPriceInput.value = '';
@@ -2061,9 +2407,9 @@
     }
   }
 
-  /* -------------------------------------------------------
+  /* =======================================================
      EVENT LISTENERS
-  ------------------------------------------------------- */
+  ======================================================= */
 
   function attachEvents() {
     if (dom.analyzeButton) {
@@ -2128,18 +2474,30 @@
     attachBrokerPriceListeners();
   }
 
-  /* -------------------------------------------------------
+  /* =======================================================
      INITIALIZATION
-  ------------------------------------------------------- */
+  ======================================================= */
 
   async function initialize() {
+    hideObsoleteInterface();
     attachEvents();
 
     renderDirection('NO TRADE');
 
-    setText('signalStatus', 'WAITING FOR ANALYSIS');
-    setText('resultPair', 'WAITING FOR ANALYSIS');
-    setText('signalDuration', '1 minute');
+    setText(
+      'signalStatus',
+      'WAITING FOR ANALYSIS'
+    );
+
+    setText(
+      'resultPair',
+      'WAITING FOR ANALYSIS'
+    );
+
+    setText(
+      'signalDuration',
+      '1 minute'
+    );
 
     setVisible('brokerPriceSection', false);
     setVisible('confirmSignalButton', false);
@@ -2158,8 +2516,8 @@
     await loadHistory();
 
     /*
-     * Initial scanner status is read without forcing another
-     * provider scan. Backend manages its own scan schedule.
+     * Read scanner status without forcing another provider scan.
+     * The backend controls its own full 24-pair scan schedule.
      */
     try {
       const status = await requestJson('/api/status');
@@ -2168,7 +2526,8 @@
 
       renderScanner({
         scanner,
-        rankedCandidates: []
+        rankedCandidates:
+          status.rankedCandidates || []
       });
 
       if (scanner.running) {
@@ -2181,10 +2540,6 @@
       );
     }
 
-    /*
-     * Keep all initial states safe. No automatic BUY/SELL signal
-     * is shown before a user requests analysis and validates price.
-     */
     showMessage(
       'Ready. Select AI AUTO SELECT or a live forex pair, then press ANALYZE.'
     );
@@ -2201,7 +2556,10 @@
     stopScannerPolling();
   }
 
-  window.addEventListener('beforeunload', cleanup);
+  window.addEventListener(
+    'beforeunload',
+    cleanup
+  );
 
   if (document.readyState === 'loading') {
     document.addEventListener(
@@ -2212,5 +2570,4 @@
   } else {
     initialize();
   }
-
 })();
