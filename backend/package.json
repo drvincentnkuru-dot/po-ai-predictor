@@ -1,8 +1,8 @@
 {
   "name": "po-ai-predictor-backend",
-  "version": "10.3.0",
+  "version": "10.5.0",
   "private": true,
-  "description": "PO AI Predictor V10.3.0 - Live Forex research, qualified AUTO SELECT, strict 1m and 5m evidence confirmation, signal history and walk-forward backtesting",
+  "description": "PO AI Predictor V10.5.0 - Live Forex only, 24-pair priority and background scanning, EMA crossover with price-action confirmation, evidence scoring, signal history and walk-forward backtesting",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
