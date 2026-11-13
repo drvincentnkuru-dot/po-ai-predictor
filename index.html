@@ -5,8 +5,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#07111f">
-  <meta name="description" content="PO AI Predictor V10.3.0 — live forex research, evidence-based market analysis and walk-forward evaluation.">
-  <title>PO AI Predictor V10.3.0 | Live Forex Research</title>
+  <meta name="description" content="PO AI Predictor V10.6.0 — live forex research, 24-pair scanning, EMA crossover, price-action confirmation and evidence scoring.">
+  <title>PO AI Predictor V10.6.0 | Live Forex Research</title>
   <link rel="stylesheet" href="style.css">
   <script src="script.js" defer></script>
 </head>
@@ -14,12 +14,13 @@
 <body>
   <div class="app-shell">
 
+    <!-- HEADER -->
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark">PO</div>
         <div class="brand-copy">
           <h1>PO AI PREDICTOR</h1>
-          <p>V10.3.0 · LIVE FOREX RESEARCH</p>
+          <p>V10.6.0 · LIVE FOREX RESEARCH</p>
         </div>
       </div>
 
@@ -29,6 +30,7 @@
       </div>
     </header>
 
+    <!-- RESEARCH NOTICE -->
     <section class="notice-panel">
       <div class="notice-heading">
         <span class="notice-icon">ⓘ</span>
@@ -37,13 +39,16 @@
       </div>
 
       <p>
-        Evidence score, not win probability. BUY and SELL are research
-        directions, not guaranteed outcomes. Use NO TRADE when data is stale,
-        incomplete, insufficient, or conflicting. OTC markets are not included.
+        Evidence score measures the strength of available market evidence;
+        it is not win probability. BUY and SELL directions are not guaranteed
+        outcomes. The system must return NO TRADE when data is stale,
+        incomplete, insufficient or conflicting. OTC markets are not included.
       </p>
     </section>
 
+    <!-- SYSTEM STATUS -->
     <section class="status-grid">
+
       <article class="status-card">
         <span class="status-label">API STATUS</span>
         <strong id="apiStatusCard">CONNECTING</strong>
@@ -67,19 +72,23 @@
         <strong id="pairsTracked">24</strong>
         <small>Live forex currency pairs</small>
       </article>
+
     </section>
 
     <main>
 
       <!-- ANALYSIS CONTROLS -->
       <section class="panel analysis-panel" id="analysisSection">
+
         <div class="section-heading">
           <div>
             <span class="eyebrow">MARKET ANALYSIS</span>
             <h2>Analyze the forex market</h2>
+
             <p>
-              AUTO SELECT scans the first six priority pairs and selects only
-              a fully qualified candidate. You can also choose a pair manually.
+              AUTO SELECT ranks fresh eligible results from all 24 live forex
+              pairs. The scanner processes six priority pairs first, followed
+              by eighteen background pairs. You can also select a pair manually.
             </p>
           </div>
 
@@ -96,33 +105,38 @@
 
             <select id="pairSelect">
               <option value="AI AUTO SELECT" selected>
-                AI AUTO SELECT
+                AI AUTO SELECT — ALL 24 PAIRS
               </option>
 
-              <option value="EUR/USD">EUR/USD</option>
-              <option value="GBP/USD">GBP/USD</option>
-              <option value="USD/JPY">USD/JPY</option>
-              <option value="USD/CHF">USD/CHF</option>
-              <option value="AUD/USD">AUD/USD</option>
-              <option value="USD/CAD">USD/CAD</option>
-              <option value="NZD/USD">NZD/USD</option>
-              <option value="EUR/GBP">EUR/GBP</option>
-              <option value="EUR/JPY">EUR/JPY</option>
-              <option value="GBP/JPY">GBP/JPY</option>
-              <option value="EUR/CHF">EUR/CHF</option>
-              <option value="EUR/AUD">EUR/AUD</option>
-              <option value="EUR/CAD">EUR/CAD</option>
-              <option value="GBP/CHF">GBP/CHF</option>
-              <option value="GBP/AUD">GBP/AUD</option>
-              <option value="GBP/CAD">GBP/CAD</option>
-              <option value="AUD/JPY">AUD/JPY</option>
-              <option value="AUD/CAD">AUD/CAD</option>
-              <option value="AUD/NZD">AUD/NZD</option>
-              <option value="CAD/JPY">CAD/JPY</option>
-              <option value="CHF/JPY">CHF/JPY</option>
-              <option value="NZD/JPY">NZD/JPY</option>
-              <option value="NZD/CAD">NZD/CAD</option>
-              <option value="EUR/NZD">EUR/NZD</option>
+              <optgroup label="Priority pairs">
+                <option value="EUR/USD">EUR/USD</option>
+                <option value="GBP/USD">GBP/USD</option>
+                <option value="USD/JPY">USD/JPY</option>
+                <option value="USD/CHF">USD/CHF</option>
+                <option value="AUD/USD">AUD/USD</option>
+                <option value="USD/CAD">USD/CAD</option>
+              </optgroup>
+
+              <optgroup label="Background pairs">
+                <option value="NZD/USD">NZD/USD</option>
+                <option value="EUR/GBP">EUR/GBP</option>
+                <option value="EUR/JPY">EUR/JPY</option>
+                <option value="GBP/JPY">GBP/JPY</option>
+                <option value="EUR/CHF">EUR/CHF</option>
+                <option value="EUR/AUD">EUR/AUD</option>
+                <option value="EUR/CAD">EUR/CAD</option>
+                <option value="GBP/CHF">GBP/CHF</option>
+                <option value="GBP/AUD">GBP/AUD</option>
+                <option value="GBP/CAD">GBP/CAD</option>
+                <option value="AUD/JPY">AUD/JPY</option>
+                <option value="AUD/CAD">AUD/CAD</option>
+                <option value="AUD/NZD">AUD/NZD</option>
+                <option value="CAD/JPY">CAD/JPY</option>
+                <option value="CHF/JPY">CHF/JPY</option>
+                <option value="NZD/JPY">NZD/JPY</option>
+                <option value="NZD/CAD">NZD/CAD</option>
+                <option value="EUR/NZD">EUR/NZD</option>
+              </optgroup>
             </select>
           </div>
 
@@ -131,12 +145,11 @@
 
             <select id="expirySelect">
               <option value="1" selected>1 minute</option>
-              <option value="2">2 minutes</option>
-              <option value="3">3 minutes</option>
             </select>
 
             <small>
-              Live signals use 1-minute expiry. 2m and 3m are for backtesting.
+              Live signal expiry is fixed at 1 minute.
+              The 2-minute and 3-minute options are for backtesting only.
             </small>
           </div>
 
@@ -146,6 +159,7 @@
             id="analyzeButton">
             ANALYZE
           </button>
+
         </div>
 
         <div
@@ -153,8 +167,9 @@
           id="analysisMessage"
           role="status"
           aria-live="polite">
-          Press Analyze to start the live market assessment.
+          Select AUTO SELECT or a live forex pair, then press ANALYZE.
         </div>
+
       </section>
 
       <!-- SIGNAL OUTPUT -->
@@ -183,7 +198,7 @@
             </div>
 
             <p id="signalReason">
-              Waiting for sufficient market evidence.
+              Waiting for sufficient fresh market evidence.
             </p>
           </div>
 
@@ -196,8 +211,15 @@
             </div>
 
             <div class="evidence-track">
-              <div id="evidenceBar" class="evidence-fill"></div>
+              <div
+                id="evidenceBar"
+                class="evidence-fill">
+              </div>
             </div>
+
+            <strong id="evidenceLabel">
+              WAITING FOR EVIDENCE
+            </strong>
 
             <small>
               Evidence strength, not probability of winning.
@@ -230,7 +252,7 @@
 
           <div class="detail-card">
             <span class="status-label">DURATION</span>
-            <strong id="signalDuration">--</strong>
+            <strong id="signalDuration">1 minute</strong>
           </div>
 
           <div class="detail-card">
@@ -241,9 +263,9 @@
         </div>
 
         <div class="signal-warning" id="signalWarning">
-          No actionable signal has been confirmed. A direction must not be
-          treated as an executable entry without a verified entry price,
-          fresh data and completed 1-minute and 5-minute confirmation.
+          No actionable signal has been confirmed. A BUY or SELL direction
+          must not be treated as an executable entry until the latest market
+          data and manually entered broker price pass backend validation.
         </div>
 
       </section>
@@ -272,9 +294,9 @@
           <strong>Important</strong>
 
           <p>
-            Make sure the pair displayed on Pocket Option is exactly the
-            same as the selected pair below. The price is manually entered
-            by you and is not independently verified by Pocket Option.
+            The pair displayed on Pocket Option must exactly match the
+            selected pair. The price is entered manually by you.
+            The backend compares it with a newly fetched market reference.
           </p>
         </div>
 
@@ -336,40 +358,39 @@
         </div>
 
         <div class="broker-price-actions">
-
           <button
             type="button"
             class="primary-button"
             id="confirmSignalButton"
-            hidden>
+            hidden
+            disabled>
             CONFIRM SIGNAL
           </button>
-
         </div>
 
         <div class="broker-disclaimer">
           <p>
-            The backend must validate the broker price against the latest
-            reference price, pair-specific pip tolerance, quote age,
-            market freshness, technical evidence and 5-minute trend
-            confirmation. If any required check fails, the result must
-            remain NO TRADE.
+            The backend must fetch fresh market data and validate the broker
+            price, quote age, pair-specific pip tolerance, data freshness,
+            EMA crossover, subsequent price action and evidence quality.
+            If a required check fails, the result must remain NO TRADE.
           </p>
         </div>
 
       </section>
 
-      <!-- PAIR SCANNER -->
+      <!-- 24-PAIR SCANNER -->
       <section class="panel">
 
         <div class="section-heading">
           <div>
-            <span class="eyebrow">PAIR SCANNER</span>
+            <span class="eyebrow">24-PAIR LIVE SCANNER</span>
             <h2>Market opportunities</h2>
 
             <p>
-              AUTO SELECT initially assesses six priority pairs from the
-              24-pair live forex universe.
+              Six priority pairs are scanned first, followed by eighteen
+              background pairs. AUTO SELECT ranks fresh eligible results
+              from the complete 24-pair universe.
             </p>
           </div>
 
@@ -383,7 +404,7 @@
 
         <div class="scanner-status">
           <span id="scannerStatus">Scanner waiting</span>
-          <span id="scannerProgress">0 / 6 priority pairs</span>
+          <span id="scannerProgress">0 / 24 pairs</span>
         </div>
 
         <div class="progress-track">
@@ -401,9 +422,9 @@
                 <th>PAIR</th>
                 <th>PRICE</th>
                 <th>1M TREND</th>
-                <th>5M CONFIRMATION</th>
                 <th>VOLATILITY</th>
                 <th>EVIDENCE</th>
+                <th>DATA STATUS</th>
                 <th>ASSESSMENT</th>
                 <th>ACTION</th>
               </tr>
@@ -420,6 +441,13 @@
           </table>
         </div>
 
+        <div class="backtest-note">
+          Scanner progress represents completed pair checks in the current
+          scan cycle. A full scan may take time because provider requests
+          are rate-limited. It does not mean all 24 pairs are refreshed
+          simultaneously.
+        </div>
+
       </section>
 
       <!-- TECHNICAL ANALYSIS -->
@@ -429,10 +457,14 @@
           <div>
             <span class="eyebrow">TECHNICAL ANALYSIS</span>
             <h2>Indicator readings</h2>
-            <p>Technical evidence from completed live candles.</p>
+
+            <p>
+              Technical evidence based on completed live forex candles.
+              No RSI or 5-minute confirmation is used in this interface.
+            </p>
           </div>
 
-          <span class="timeframe-tag">1M + 5M</span>
+          <span class="timeframe-tag">1M</span>
         </div>
 
         <div class="technical-grid">
@@ -441,21 +473,7 @@
             <span class="status-label">EMA 9 / EMA 21</span>
             <strong id="emaSignal">--</strong>
             <small id="emaDetail">
-              Crossover and trend direction
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">RSI 14</span>
-            <strong id="rsiValue">--</strong>
-            <small id="rsiSignal">Momentum condition</small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">RSI DIVERGENCE</span>
-            <strong id="rsiDivergence">--</strong>
-            <small id="rsiDivergenceDetail">
-              Bullish / bearish divergence
+              Recent crossover and trend direction
             </small>
           </article>
 
@@ -468,17 +486,11 @@
           </article>
 
           <article class="technical-card">
-            <span class="status-label">5-MINUTE TREND</span>
-            <strong id="fiveMinuteTrend">--</strong>
-            <small id="fiveMinuteDetail">
-              Higher timeframe confirmation
-            </small>
-          </article>
-
-          <article class="technical-card">
             <span class="status-label">ATR VOLATILITY</span>
             <strong id="atrValue">--</strong>
-            <small id="atrDetail">Average true range</small>
+            <small id="atrDetail">
+              Average true range
+            </small>
           </article>
 
           <article class="technical-card">
@@ -516,6 +528,11 @@
           <div>
             <span class="eyebrow">PRICE ACTION & MARKET STRUCTURE</span>
             <h2>Market behaviour</h2>
+
+            <p>
+              EMA crossover must be supported by subsequent price action.
+              A crossover alone is not enough to approve a trade.
+            </p>
           </div>
         </div>
 
@@ -598,8 +615,8 @@
             <h2>Historical signal records</h2>
 
             <p>
-              Qualified signals are stored for later evaluation.
-              Unverified outcomes remain pending.
+              Confirmed signals are stored for later evaluation.
+              Outcomes that have not yet been evaluated remain pending.
             </p>
           </div>
 
@@ -640,13 +657,13 @@
 
             <thead>
               <tr>
-                <th>TIME</th>
                 <th>PAIR</th>
                 <th>DIRECTION</th>
-                <th>EVIDENCE</th>
                 <th>ENTRY PRICE</th>
-                <th>DURATION</th>
+                <th>ENTRY TIME</th>
+                <th>EXPIRY TIME</th>
                 <th>OUTCOME</th>
+                <th>EVIDENCE</th>
               </tr>
             </thead>
 
@@ -767,7 +784,8 @@
         <div
           class="backtest-message"
           id="backtestMessage"
-          role="status">
+          role="status"
+          aria-live="polite">
           Backtest has not been run.
         </div>
 
@@ -781,10 +799,11 @@
 
     </main>
 
+    <!-- FOOTER -->
     <footer class="footer">
 
       <div class="footer-brand">
-        PO AI PREDICTOR · V10.3.0
+        PO AI PREDICTOR · V10.6.0
       </div>
 
       <p>
@@ -794,7 +813,7 @@
       </p>
 
       <p class="footer-meta">
-        LIVE FOREX ONLY · TWELVE DATA · OTC NOT INCLUDED
+        LIVE FOREX ONLY · TWELVE DATA · 24 PAIRS · OTC NOT INCLUDED
       </p>
 
     </footer>
