@@ -4,9 +4,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="theme-color" content="#07111f">
-  <meta name="description" content="PO AI Predictor V10.6.0 — live forex research, 24-pair scanning, EMA crossover, price-action confirmation and evidence scoring.">
-  <title>PO AI Predictor V10.6.0 | Live Forex Research</title>
+  <meta name="theme-color" content="#081326">
+  <meta name="description" content="PO AI Predictor V9.6.0 — live forex research using one-minute candles, priority pair scanning and evidence-gated signals.">
+  <title>PO AI Predictor V9.6.0</title>
   <link rel="stylesheet" href="style.css">
   <script src="script.js" defer></script>
 </head>
@@ -14,700 +14,58 @@
 <body>
   <div class="app-shell">
 
-    <!-- HEADER -->
-    <header class="topbar">
+    <header class="app-header">
       <div class="brand">
-        <div class="brand-mark">PO</div>
+        <div class="brand-mark" aria-hidden="true">PO</div>
         <div class="brand-copy">
           <h1>PO AI PREDICTOR</h1>
-          <p>V10.6.0 · LIVE FOREX RESEARCH</p>
+          <p class="version">V9.6.0 · LIVE FOREX RESEARCH</p>
+          <p class="muted-text">
+            1-minute candles · 6 priority pairs · 18 background pairs
+          </p>
         </div>
       </div>
 
       <div class="header-status">
-        <span class="status-indicator" id="apiStatusDot"></span>
-        <span id="apiStatusText">CONNECTING TO API</span>
+        <span id="backendStatus" class="status-badge status-unknown">
+          Checking API…
+        </span>
+        <span id="marketStatus" class="status-badge status-unknown">
+          Market status: checking
+        </span>
       </div>
     </header>
 
-    <!-- RESEARCH NOTICE -->
-    <section class="notice-panel">
-      <div class="notice-heading">
-        <span class="notice-icon">ⓘ</span>
-        <strong>RESEARCH AND ANALYSIS TOOL</strong>
-        <span class="version-tag">LIVE FOREX ONLY</span>
-      </div>
-
-      <p>
-        Evidence score measures the strength of available market evidence;
-        it is not win probability. BUY and SELL directions are not guaranteed
-        outcomes. The system must return NO TRADE when data is stale,
-        incomplete, insufficient or conflicting. OTC markets are not included.
-      </p>
-    </section>
-
-    <!-- SYSTEM STATUS -->
-    <section class="status-grid">
-
-      <article class="status-card">
-        <span class="status-label">API STATUS</span>
-        <strong id="apiStatusCard">CONNECTING</strong>
-        <small id="apiStatusDetail">Checking backend connection</small>
-      </article>
-
-      <article class="status-card">
-        <span class="status-label">DATA PROVIDER</span>
-        <strong id="providerStatus">TWELVE DATA</strong>
-        <small id="providerDetail">Waiting for provider data</small>
-      </article>
-
-      <article class="status-card">
-        <span class="status-label">MARKET DATA</span>
-        <strong id="marketFreshness">CHECKING</strong>
-        <small id="marketFreshnessDetail">Freshness not yet verified</small>
-      </article>
-
-      <article class="status-card">
-        <span class="status-label">PAIRS TRACKED</span>
-        <strong id="pairsTracked">24</strong>
-        <small>Live forex currency pairs</small>
-      </article>
-
-    </section>
-
     <main>
 
-      <!-- ANALYSIS CONTROLS -->
-      <section class="panel analysis-panel" id="analysisSection">
+      <!-- MAIN ANALYSIS CONTROL -->
+      <section class="control-panel panel">
 
-        <div class="section-heading">
+        <div class="dashboard-eyebrow">
+          <span class="live-dot"></span>
+          LIVE MARKET RESEARCH
+        </div>
+
+        <div class="section-heading control-heading">
           <div>
-            <span class="eyebrow">MARKET ANALYSIS</span>
-            <h2>Analyze the forex market</h2>
-
+            <h2>Market Analysis</h2>
             <p>
-              AUTO SELECT ranks fresh eligible results from all 24 live forex
-              pairs. The scanner processes six priority pairs first, followed
-              by eighteen background pairs. You can also select a pair manually.
-            </p>
-          </div>
-
-          <span class="live-label">
-            <span class="live-dot"></span>
-            LIVE FOREX
-          </span>
-        </div>
-
-        <div class="analysis-controls">
-
-          <div class="field-group">
-            <label for="pairSelect">CURRENCY PAIR</label>
-
-            <select id="pairSelect">
-              <option value="AI AUTO SELECT" selected>
-                AI AUTO SELECT — ALL 24 PAIRS
-              </option>
-
-              <optgroup label="Priority pairs">
-                <option value="EUR/USD">EUR/USD</option>
-                <option value="GBP/USD">GBP/USD</option>
-                <option value="USD/JPY">USD/JPY</option>
-                <option value="USD/CHF">USD/CHF</option>
-                <option value="AUD/USD">AUD/USD</option>
-                <option value="USD/CAD">USD/CAD</option>
-              </optgroup>
-
-              <optgroup label="Background pairs">
-                <option value="NZD/USD">NZD/USD</option>
-                <option value="EUR/GBP">EUR/GBP</option>
-                <option value="EUR/JPY">EUR/JPY</option>
-                <option value="GBP/JPY">GBP/JPY</option>
-                <option value="EUR/CHF">EUR/CHF</option>
-                <option value="EUR/AUD">EUR/AUD</option>
-                <option value="EUR/CAD">EUR/CAD</option>
-                <option value="GBP/CHF">GBP/CHF</option>
-                <option value="GBP/AUD">GBP/AUD</option>
-                <option value="GBP/CAD">GBP/CAD</option>
-                <option value="AUD/JPY">AUD/JPY</option>
-                <option value="AUD/CAD">AUD/CAD</option>
-                <option value="AUD/NZD">AUD/NZD</option>
-                <option value="CAD/JPY">CAD/JPY</option>
-                <option value="CHF/JPY">CHF/JPY</option>
-                <option value="NZD/JPY">NZD/JPY</option>
-                <option value="NZD/CAD">NZD/CAD</option>
-                <option value="EUR/NZD">EUR/NZD</option>
-              </optgroup>
-            </select>
-          </div>
-
-          <div class="field-group">
-            <label for="expirySelect">LIVE SIGNAL DURATION</label>
-
-            <select id="expirySelect">
-              <option value="1" selected>1 minute</option>
-            </select>
-
-            <small>
-              Live signal expiry is fixed at 1 minute.
-              The 2-minute and 3-minute options are for backtesting only.
-            </small>
-          </div>
-
-          <button
-            type="button"
-            class="primary-button"
-            id="analyzeButton">
-            ANALYZE
-          </button>
-
-        </div>
-
-        <div
-          class="analysis-message"
-          id="analysisMessage"
-          role="status"
-          aria-live="polite">
-          Select AUTO SELECT or a live forex pair, then press ANALYZE.
-        </div>
-
-      </section>
-
-      <!-- SIGNAL OUTPUT -->
-      <section class="panel signal-panel" id="signalPanel">
-
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">RESEARCH OUTPUT</span>
-            <h2>Current signal assessment</h2>
-          </div>
-
-          <span class="signal-time" id="analysisTimestamp">
-            Not analyzed
-          </span>
-        </div>
-
-        <div class="signal-overview">
-
-          <div class="signal-direction-block">
-            <span class="status-label">RESEARCH DIRECTION</span>
-
-            <div
-              id="signalDirection"
-              class="signal-direction no-trade">
-              NO TRADE
-            </div>
-
-            <p id="signalReason">
-              Waiting for sufficient fresh market evidence.
-            </p>
-          </div>
-
-          <div class="evidence-block">
-            <span class="status-label">EVIDENCE SCORE</span>
-
-            <div class="evidence-number">
-              <strong id="evidenceScore">--</strong>
-              <span>/ 100</span>
-            </div>
-
-            <div class="evidence-track">
-              <div
-                id="evidenceBar"
-                class="evidence-fill">
-              </div>
-            </div>
-
-            <strong id="evidenceLabel">
-              WAITING FOR EVIDENCE
-            </strong>
-
-            <small>
-              Evidence strength, not probability of winning.
-            </small>
-          </div>
-
-        </div>
-
-        <div class="signal-details-grid">
-
-          <div class="detail-card">
-            <span class="status-label">SELECTED PAIR</span>
-            <strong id="resultPair">--</strong>
-          </div>
-
-          <div class="detail-card">
-            <span class="status-label">ENTRY TIME</span>
-            <strong id="entryTime">--</strong>
-          </div>
-
-          <div class="detail-card">
-            <span class="status-label">ENTRY PRICE</span>
-            <strong id="entryPrice">WAITING</strong>
-          </div>
-
-          <div class="detail-card">
-            <span class="status-label">EXPIRY TIME</span>
-            <strong id="expiryTime">--</strong>
-          </div>
-
-          <div class="detail-card">
-            <span class="status-label">DURATION</span>
-            <strong id="signalDuration">1 minute</strong>
-          </div>
-
-          <div class="detail-card">
-            <span class="status-label">SIGNAL STATUS</span>
-            <strong id="signalStatus">WAITING</strong>
-          </div>
-
-        </div>
-
-        <div class="signal-warning" id="signalWarning">
-          No actionable signal has been confirmed. A BUY or SELL direction
-          must not be treated as an executable entry until the latest market
-          data and manually entered broker price pass backend validation.
-        </div>
-
-      </section>
-
-      <!-- POCKET OPTION PRICE VALIDATION -->
-      <section
-        class="panel broker-price-panel"
-        id="brokerPriceSection"
-        hidden>
-
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">BROKER PRICE VALIDATION</span>
-            <h2>Pocket Option entry price</h2>
-
-            <p>
-              Enter the current price displayed on your Pocket Option
-              platform for the selected currency pair.
-            </p>
-          </div>
-
-          <span class="version-tag">MANUAL PRICE</span>
-        </div>
-
-        <div class="broker-instructions">
-          <strong>Important</strong>
-
-          <p>
-            The pair displayed on Pocket Option must exactly match the
-            selected pair. The price is entered manually by you.
-            The backend compares it with a newly fetched market reference.
-          </p>
-        </div>
-
-        <div class="broker-selected-pair">
-          <span class="status-label">PAIR TO ENTER PRICE FOR</span>
-          <strong id="brokerSelectedPair">SELECTED PAIR</strong>
-        </div>
-
-        <div class="broker-price-input-area">
-
-          <div class="field-group">
-            <label for="brokerPriceInput">
-              POCKET OPTION CURRENT PRICE
-            </label>
-
-            <input
-              type="number"
-              id="brokerPriceInput"
-              name="brokerPrice"
-              inputmode="decimal"
-              step="any"
-              min="0"
-              placeholder="Enter current Pocket Option price"
-              autocomplete="off"
-              disabled>
-
-            <small>
-              Enter the visible market price. Do not enter your investment
-              amount or payout.
-            </small>
-          </div>
-
-        </div>
-
-        <div class="broker-validation-grid">
-
-          <article class="detail-card">
-            <span class="status-label">PRICE VALIDATION</span>
-            <strong id="brokerPriceStatus">
-              WAITING FOR PRICE
-            </strong>
-          </article>
-
-          <article class="detail-card">
-            <span class="status-label">TWELVE DATA REFERENCE</span>
-            <strong id="brokerPriceReference">--</strong>
-          </article>
-
-          <article class="detail-card">
-            <span class="status-label">PRICE DIFFERENCE</span>
-            <strong id="brokerPriceDifference">--</strong>
-          </article>
-
-          <article class="detail-card">
-            <span class="status-label">PRICE CAPTURE TIME</span>
-            <strong id="brokerPriceTimestamp">--</strong>
-          </article>
-
-        </div>
-
-        <div class="broker-price-actions">
-          <button
-            type="button"
-            class="primary-button"
-            id="confirmSignalButton"
-            hidden
-            disabled>
-            CONFIRM SIGNAL
-          </button>
-        </div>
-
-        <div class="broker-disclaimer">
-          <p>
-            The backend must fetch fresh market data and validate the broker
-            price, quote age, pair-specific pip tolerance, data freshness,
-            EMA crossover, subsequent price action and evidence quality.
-            If a required check fails, the result must remain NO TRADE.
-          </p>
-        </div>
-
-      </section>
-
-      <!-- 24-PAIR SCANNER -->
-      <section class="panel">
-
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">24-PAIR LIVE SCANNER</span>
-            <h2>Market opportunities</h2>
-
-            <p>
-              Six priority pairs are scanned first, followed by eighteen
-              background pairs. AUTO SELECT ranks fresh eligible results
-              from the complete 24-pair universe.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            class="secondary-button"
-            id="refreshScannerButton">
-            REFRESH SCANNER
-          </button>
-        </div>
-
-        <div class="scanner-status">
-          <span id="scannerStatus">Scanner waiting</span>
-          <span id="scannerProgress">0 / 24 pairs</span>
-        </div>
-
-        <div class="progress-track">
-          <div
-            class="progress-fill"
-            id="scannerProgressBar">
-          </div>
-        </div>
-
-        <div class="table-wrap">
-          <table class="data-table">
-
-            <thead>
-              <tr>
-                <th>PAIR</th>
-                <th>PRICE</th>
-                <th>1M TREND</th>
-                <th>VOLATILITY</th>
-                <th>EVIDENCE</th>
-                <th>DATA STATUS</th>
-                <th>ASSESSMENT</th>
-                <th>ACTION</th>
-              </tr>
-            </thead>
-
-            <tbody id="scannerTableBody">
-              <tr>
-                <td colspan="8" class="empty-state">
-                  Waiting for scanner data.
-                </td>
-              </tr>
-            </tbody>
-
-          </table>
-        </div>
-
-        <div class="backtest-note">
-          Scanner progress represents completed pair checks in the current
-          scan cycle. A full scan may take time because provider requests
-          are rate-limited. It does not mean all 24 pairs are refreshed
-          simultaneously.
-        </div>
-
-      </section>
-
-      <!-- TECHNICAL ANALYSIS -->
-      <section class="panel">
-
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">TECHNICAL ANALYSIS</span>
-            <h2>Indicator readings</h2>
-
-            <p>
-              Technical evidence based on completed live forex candles.
-              No RSI or 5-minute confirmation is used in this interface.
-            </p>
-          </div>
-
-          <span class="timeframe-tag">1M</span>
-        </div>
-
-        <div class="technical-grid">
-
-          <article class="technical-card">
-            <span class="status-label">EMA 9 / EMA 21</span>
-            <strong id="emaSignal">--</strong>
-            <small id="emaDetail">
-              Recent crossover and trend direction
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">MACD</span>
-            <strong id="macdSignal">--</strong>
-            <small id="macdDetail">
-              MACD direction and momentum
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">ATR VOLATILITY</span>
-            <strong id="atrValue">--</strong>
-            <small id="atrDetail">
-              Average true range
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">BOLLINGER BANDS</span>
-            <strong id="bollingerSignal">--</strong>
-            <small id="bollingerDetail">
-              Price position within bands
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">BOLLINGER WIDTH</span>
-            <strong id="bollingerWidth">--</strong>
-            <small id="bollingerWidthDetail">
-              Band expansion / contraction
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">VOLATILITY REGIME</span>
-            <strong id="volatilityRegime">--</strong>
-            <small id="volatilityDetail">
-              LOW / NORMAL / HIGH
-            </small>
-          </article>
-
-        </div>
-
-      </section>
-
-      <!-- PRICE ACTION -->
-      <section class="panel">
-
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">PRICE ACTION & MARKET STRUCTURE</span>
-            <h2>Market behaviour</h2>
-
-            <p>
-              EMA crossover must be supported by subsequent price action.
-              A crossover alone is not enough to approve a trade.
+              Analyze fresh market results and review the strongest
+              available evidence.
             </p>
           </div>
         </div>
 
-        <div class="technical-grid">
+        <button id="analyzeBtn" type="button">
+          <span class="analyze-icon" aria-hidden="true">↻</span>
+          ANALYZE MARKET
+        </button>
 
-          <article class="technical-card">
-            <span class="status-label">CANDLESTICK PATTERNS</span>
-            <strong id="candlestickPatterns">--</strong>
-            <small id="candlestickDetail">
-              Detected candle patterns and context
-            </small>
-          </article>
+        <div class="control-grid">
 
-          <article class="technical-card">
-            <span class="status-label">MARKET PSYCHOLOGY</span>
-            <strong id="marketPsychology">--</strong>
-            <small id="psychologyDetail">
-              Buying and selling pressure
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">SUPPORT</span>
-            <strong id="supportLevel">--</strong>
-            <small id="supportDetail">
-              Nearest relevant support level
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">RESISTANCE</span>
-            <strong id="resistanceLevel">--</strong>
-            <small id="resistanceDetail">
-              Nearest relevant resistance level
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">TRENDLINE ANALYSIS</span>
-            <strong id="trendlineSignal">--</strong>
-            <small id="trendlineDetail">
-              Trendline direction and interaction
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">BREAKOUT DETECTION</span>
-            <strong id="breakoutSignal">--</strong>
-            <small id="breakoutDetail">
-              Confirmed or unconfirmed breakout
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">RETEST DETECTION</span>
-            <strong id="retestSignal">--</strong>
-            <small id="retestDetail">
-              Retest and level validation
-            </small>
-          </article>
-
-          <article class="technical-card">
-            <span class="status-label">FALSE BREAKOUT</span>
-            <strong id="falseBreakoutSignal">--</strong>
-            <small id="falseBreakoutDetail">
-              Potential failed breakout warning
-            </small>
-          </article>
-
-        </div>
-
-      </section>
-
-      <!-- SIGNAL HISTORY -->
-      <section class="panel">
-
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">SIGNAL TRACKING</span>
-            <h2>Historical signal records</h2>
-
-            <p>
-              Confirmed signals are stored for later evaluation.
-              Outcomes that have not yet been evaluated remain pending.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            class="secondary-button"
-            id="refreshHistoryButton">
-            REFRESH HISTORY
-          </button>
-        </div>
-
-        <div class="summary-grid">
-
-          <article class="summary-card">
-            <span class="status-label">TOTAL SIGNALS</span>
-            <strong id="historyTotal">0</strong>
-          </article>
-
-          <article class="summary-card">
-            <span class="status-label">EVALUATED</span>
-            <strong id="historyEvaluated">0</strong>
-          </article>
-
-          <article class="summary-card">
-            <span class="status-label">PENDING</span>
-            <strong id="historyPending">0</strong>
-          </article>
-
-          <article class="summary-card">
-            <span class="status-label">DATA SOURCE</span>
-            <strong id="historySource">--</strong>
-          </article>
-
-        </div>
-
-        <div class="table-wrap">
-          <table class="data-table">
-
-            <thead>
-              <tr>
-                <th>PAIR</th>
-                <th>DIRECTION</th>
-                <th>ENTRY PRICE</th>
-                <th>ENTRY TIME</th>
-                <th>EXPIRY TIME</th>
-                <th>OUTCOME</th>
-                <th>EVIDENCE</th>
-              </tr>
-            </thead>
-
-            <tbody id="historyTableBody">
-              <tr>
-                <td colspan="7" class="empty-state">
-                  No signal history loaded.
-                </td>
-              </tr>
-            </tbody>
-
-          </table>
-        </div>
-
-      </section>
-
-      <!-- BACKTEST -->
-      <section class="panel">
-
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">HISTORICAL VALIDATION</span>
-            <h2>Walk-forward backtesting</h2>
-
-            <p>
-              Chronological development and holdout evaluation.
-              Backtesting supports 1, 2 and 3-minute expiry.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            class="primary-button"
-            id="runBacktestButton">
-            RUN BACKTEST
-          </button>
-        </div>
-
-        <div class="backtest-controls">
-
-          <div class="field-group">
-            <label for="backtestPairSelect">BACKTEST PAIR</label>
-
-            <select id="backtestPairSelect">
+          <div class="field">
+            <label for="selectedPair">Reference currency pair</label>
+            <select id="selectedPair">
               <option value="EUR/USD">EUR/USD</option>
               <option value="GBP/USD">GBP/USD</option>
               <option value="USD/JPY">USD/JPY</option>
@@ -718,106 +76,445 @@
               <option value="EUR/GBP">EUR/GBP</option>
               <option value="EUR/JPY">EUR/JPY</option>
               <option value="GBP/JPY">GBP/JPY</option>
-              <option value="EUR/CHF">EUR/CHF</option>
-              <option value="EUR/AUD">EUR/AUD</option>
-              <option value="EUR/CAD">EUR/CAD</option>
-              <option value="GBP/CHF">GBP/CHF</option>
-              <option value="GBP/AUD">GBP/AUD</option>
-              <option value="GBP/CAD">GBP/CAD</option>
               <option value="AUD/JPY">AUD/JPY</option>
-              <option value="AUD/CAD">AUD/CAD</option>
-              <option value="AUD/NZD">AUD/NZD</option>
               <option value="CAD/JPY">CAD/JPY</option>
               <option value="CHF/JPY">CHF/JPY</option>
+              <option value="EUR/AUD">EUR/AUD</option>
+              <option value="EUR/CAD">EUR/CAD</option>
+              <option value="EUR/CHF">EUR/CHF</option>
+              <option value="GBP/AUD">GBP/AUD</option>
+              <option value="GBP/CAD">GBP/CAD</option>
+              <option value="GBP/CHF">GBP/CHF</option>
               <option value="NZD/JPY">NZD/JPY</option>
               <option value="NZD/CAD">NZD/CAD</option>
-              <option value="EUR/NZD">EUR/NZD</option>
+              <option value="AUD/CAD">AUD/CAD</option>
+              <option value="AUD/CHF">AUD/CHF</option>
+              <option value="CAD/CHF">CAD/CHF</option>
             </select>
           </div>
 
-          <div class="field-group">
-            <label for="backtestDuration">EXPIRY DURATION</label>
-
-            <select id="backtestDuration">
-              <option value="1">1 minute</option>
-              <option value="2">2 minutes</option>
-              <option value="3">3 minutes</option>
+          <div class="field">
+            <label for="timeframe">Candle interval</label>
+            <select id="timeframe" disabled>
+              <option value="1" selected>1 minute only</option>
             </select>
           </div>
 
         </div>
 
-        <div class="summary-grid backtest-results">
+        <div id="errorBox" class="error-box" role="alert" hidden></div>
 
-          <article class="summary-card">
-            <span class="status-label">SAMPLES</span>
-            <strong id="backtestSamples">--</strong>
+        <p id="scanInfo" class="muted-text" aria-live="polite">
+          Checking API and available market results…
+        </p>
+
+      </section>
+
+      <!-- MAIN SIGNAL DISPLAY -->
+      <section class="signal-panel panel" aria-label="Current analysis">
+
+        <div class="signal-topline">
+          <div>
+            <span class="dashboard-eyebrow">CURRENT MARKET DECISION</span>
+            <h2>Trading Signal</h2>
+            <p id="provider">Provider: Twelve Data LIVE</p>
+          </div>
+
+          <span id="signalBadge" class="signal-badge signal-wait">
+            NO TRADE
+          </span>
+        </div>
+
+        <div class="signal-hero">
+          <span class="signal-caption">CURRENT RESEARCH DIRECTION</span>
+          <div class="signal-display" aria-live="polite">
+            <span id="signalHeroText">NO TRADE</span>
+          </div>
+          <p class="signal-subtitle">
+            Evidence-gated decision · 1-minute market data
+          </p>
+        </div>
+
+        <div class="signal-summary">
+
+          <div class="score-card">
+            <span class="metric-label">Evidence score</span>
+            <div class="score-value">
+              <span id="confidence">—</span>
+              <span class="score-out-of">/100</span>
+            </div>
+            <p>Not a probability of winning</p>
+          </div>
+
+          <div class="summary-card">
+            <span class="metric-label">Selected candidate</span>
+            <strong id="summaryPair">—</strong>
+            <span id="trendBadge" class="trend-badge">
+              Trend: UNKNOWN
+            </span>
+          </div>
+
+          <div class="summary-card">
+            <span class="metric-label">Data freshness</span>
+            <strong id="freshness">Checking…</strong>
+            <span id="dataAge">Age: unavailable</span>
+          </div>
+
+        </div>
+
+        <div class="score-comparison">
+
+          <div class="direction-score">
+            <span>BUY evidence</span>
+            <strong id="callScore">—</strong>
+          </div>
+
+          <div class="direction-score">
+            <span>SELL evidence</span>
+            <strong id="putScore">—</strong>
+          </div>
+
+          <div class="direction-score">
+            <span>Evidence gap</span>
+            <strong id="gap">—</strong>
+          </div>
+
+        </div>
+
+        <p id="signalReason" class="signal-reason">
+          Waiting for sufficient, fresh and consistent evidence.
+        </p>
+
+        <div class="decision-details">
+
+          <div class="detail-item">
+            <span class="metric-label">Reference time</span>
+            <strong id="entryTime">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Expiry time</span>
+            <strong id="expiryTime">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Current price</span>
+            <strong id="currentPrice">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Reference price</span>
+            <strong id="entryPrice">—</strong>
+          </div>
+
+        </div>
+
+      </section>
+
+      <!-- RESEARCH DISCLAIMER -->
+      <section class="notice-panel" aria-label="Research disclaimer">
+        <strong>Research and analysis tool</strong>
+        <p>
+          Evidence score, not win probability. No guaranteed outcomes.
+          Signals can be wrong. BUY and SELL are research directions, not
+          guarantees. Use NO TRADE when data is stale, incomplete,
+          insufficient, or conflicting.
+        </p>
+      </section>
+
+      <!-- SCANNER CONFIGURATION -->
+      <section class="panel">
+
+        <div class="section-heading">
+          <div>
+            <h2>Scanner Configuration</h2>
+            <p>
+              Priority pairs are reviewed first. The remaining pairs are
+              evaluated in the background.
+            </p>
+          </div>
+        </div>
+
+        <div class="analysis-grid">
+
+          <article class="analysis-card">
+            <h3>Priority group · 6 pairs</h3>
+            <strong>First evaluation</strong>
+            <ul>
+              <li>EUR/USD</li>
+              <li>GBP/USD</li>
+              <li>USD/JPY</li>
+              <li>USD/CHF</li>
+              <li>AUD/USD</li>
+              <li>USD/CAD</li>
+            </ul>
           </article>
 
-          <article class="summary-card">
-            <span class="status-label">WINS</span>
-            <strong id="backtestWins">--</strong>
-          </article>
-
-          <article class="summary-card">
-            <span class="status-label">LOSSES</span>
-            <strong id="backtestLosses">--</strong>
-          </article>
-
-          <article class="summary-card">
-            <span class="status-label">COVERAGE</span>
-            <strong id="backtestCoverage">--</strong>
-          </article>
-
-          <article class="summary-card">
-            <span class="status-label">WIN RATE</span>
-            <strong id="backtestWinRate">--</strong>
-          </article>
-
-          <article class="summary-card">
-            <span class="status-label">BASELINE</span>
-            <strong id="backtestBaseline">--</strong>
+          <article class="analysis-card">
+            <h3>Background group · 18 pairs</h3>
+            <strong>Continuous research</strong>
+            <ul>
+              <li>NZD/USD</li>
+              <li>EUR/GBP</li>
+              <li>EUR/JPY</li>
+              <li>GBP/JPY</li>
+              <li>AUD/JPY</li>
+              <li>CAD/JPY</li>
+              <li>CHF/JPY</li>
+              <li>EUR/AUD</li>
+              <li>EUR/CAD</li>
+              <li>EUR/CHF</li>
+              <li>GBP/AUD</li>
+              <li>GBP/CAD</li>
+              <li>GBP/CHF</li>
+              <li>NZD/JPY</li>
+              <li>NZD/CAD</li>
+              <li>AUD/CAD</li>
+              <li>AUD/CHF</li>
+              <li>CAD/CHF</li>
+            </ul>
           </article>
 
         </div>
 
-        <div
-          class="backtest-message"
-          id="backtestMessage"
-          role="status"
-          aria-live="polite">
-          Backtest has not been run.
+        <p class="muted-text">
+          Scanner groups describe the backend configuration.
+          Actual scan speed depends on fresh cached data and provider
+          request limits.
+        </p>
+
+      </section>
+
+      <!-- PRIMARY EVIDENCE -->
+      <section class="panel">
+
+        <div class="section-heading">
+          <div>
+            <h2>Primary Evidence</h2>
+            <p>
+              Candlestick patterns, market psychology, support/resistance
+              and trend-line analysis receive priority in the research model.
+            </p>
+          </div>
         </div>
 
-        <div class="backtest-note">
-          Backtest results are historical research, not a promise of future
-          performance. Results do not model broker spread, payout, slippage
-          or execution latency unless those costs are separately supplied.
+        <div class="analysis-grid">
+
+          <article class="analysis-card">
+            <h3>Candlestick pattern</h3>
+            <strong id="candlePattern">—</strong>
+            <p id="lastCandle">Latest completed candle: —</p>
+          </article>
+
+          <article class="analysis-card">
+            <h3>Trend line and price action</h3>
+            <p id="priceAction">
+              Waiting for completed-candle analysis.
+            </p>
+          </article>
+
+          <article class="analysis-card">
+            <h3>Market psychology</h3>
+            <p id="psychology">
+              Waiting for observable price behaviour.
+            </p>
+          </article>
+
         </div>
+
+        <div class="metrics-grid">
+
+          <article class="metric-card">
+            <span class="metric-label">Support</span>
+            <strong id="support">—</strong>
+            <small>Prior completed candles</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Resistance</span>
+            <strong id="resistance">—</strong>
+            <small>Prior completed candles</small>
+          </article>
+
+        </div>
+
+        <div class="reasons-panel">
+          <h3>Evidence and decision reasons</h3>
+          <ul id="reasons">
+            <li>Waiting for analysis.</li>
+          </ul>
+        </div>
+
+      </section>
+
+      <!-- SECONDARY INDICATORS -->
+      <section class="panel">
+
+        <div class="section-heading">
+          <div>
+            <h2>Secondary Technical Indicators</h2>
+            <p>
+              EMA 9/21, RSI 14, MACD and Stochastic provide supporting
+              evidence. They do not independently guarantee a direction.
+            </p>
+          </div>
+        </div>
+
+        <div class="metrics-grid">
+
+          <article class="metric-card">
+            <span class="metric-label">EMA 9</span>
+            <strong id="ema9">—</strong>
+            <small id="emaCross">EMA crossover: —</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">EMA 21</span>
+            <strong id="ema21">—</strong>
+            <small>1-minute candles</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">RSI 14</span>
+            <strong id="rsi">—</strong>
+            <small id="rsiCross">RSI 14: —</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">MACD line</span>
+            <strong id="macdLine">—</strong>
+            <small id="macdCross">MACD: —</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">MACD signal</span>
+            <strong id="macdSignal">—</strong>
+            <small id="macdHistogram">Histogram: —</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Stochastic %K</span>
+            <strong id="stochK">—</strong>
+            <small id="stochasticCross">Stochastic: —</small>
+          </article>
+
+          <article class="metric-card">
+            <span class="metric-label">Stochastic %D</span>
+            <strong id="stochD">—</strong>
+            <small>Signal line</small>
+          </article>
+
+        </div>
+
+      </section>
+
+      <!-- BACKGROUND SCANNER -->
+      <section class="panel scanner-panel" hidden>
+
+        <div class="section-heading">
+          <div>
+            <h2>Priority and Background Scanner</h2>
+            <p>
+              Fresh candidates are ranked using available evidence.
+              Only sufficiently fresh and qualified candidates receive
+              a directional research signal.
+            </p>
+          </div>
+
+          <span id="scannerStatus" class="status-badge status-unknown">
+            Waiting
+          </span>
+        </div>
+
+        <div class="scanner-stats">
+
+          <div class="mini-stat">
+            <span>Pairs cached</span>
+            <strong id="cachedPairs">0</strong>
+          </div>
+
+          <div class="mini-stat">
+            <span>Qualified candidates</span>
+            <strong id="candidateCount">0</strong>
+          </div>
+
+          <div class="mini-stat">
+            <span>Last scan</span>
+            <strong id="lastScanAt">—</strong>
+          </div>
+
+        </div>
+
+        <div id="scanner" class="scanner" aria-live="polite">
+          <p class="muted-text">
+            Waiting for the backend scanner.
+          </p>
+        </div>
+
+      </section>
+
+      <!-- PROVIDER USAGE -->
+      <section class="panel provider-panel">
+
+        <div class="section-heading">
+          <div>
+            <h2>Provider and API Usage</h2>
+            <p>Usage information reported by the backend.</p>
+          </div>
+        </div>
+
+        <div class="provider-grid">
+
+          <div class="detail-item">
+            <span class="metric-label">Provider</span>
+            <strong id="providerName">Twelve Data LIVE</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Provider requests</span>
+            <strong id="providerRequests">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Daily credits used</span>
+            <strong id="dailyCreditsUsed">—</strong>
+          </div>
+
+          <div class="detail-item">
+            <span class="metric-label">Daily credits remaining</span>
+            <strong id="dailyCreditsRemaining">—</strong>
+          </div>
+
+        </div>
+
+        <p class="muted-text">
+          Twelve Data request limits may prevent all 24 pairs from receiving
+          fresh candles simultaneously. Cached results are not automatically
+          fresh. Stale or insufficient data must never produce a confirmed
+          BUY or SELL signal.
+        </p>
 
       </section>
 
     </main>
 
-    <!-- FOOTER -->
-    <footer class="footer">
-
-      <div class="footer-brand">
-        PO AI PREDICTOR · V10.6.0
-      </div>
-
+    <footer class="app-footer">
+      <p>PO AI Predictor V9.6.0 · Live forex research</p>
       <p>
-        Historical evidence and walk-forward analysis only.
-        No guaranteed outcomes. This tool does not provide financial advice.
-        Trading involves risk.
+        Evidence score, not win probability. No guaranteed outcomes.
+        NO TRADE when evidence is insufficient.
       </p>
-
-      <p class="footer-meta">
-        LIVE FOREX ONLY · TWELVE DATA · 24 PAIRS · OTC NOT INCLUDED
-      </p>
-
     </footer>
 
   </div>
+
+  <noscript>
+    <p>
+      JavaScript is required to load live market data and analyze signals.
+    </p>
+  </noscript>
+
 </body>
+
 </html>
+
